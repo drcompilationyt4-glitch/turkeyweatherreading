@@ -1,0 +1,357 @@
+name: "runner1"
+
+on:
+  schedule:
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      simulate_schedule:
+        description: 'Set to true to simulate schedule behaviour (enable jitter) for manual runs)'
+        required: false
+        default: 'false'
+
+jobs:
+  run-rewards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      NODE_VERSION: '20'
+      SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
+      JOB_INDEX: '0'
+      GROUP_SIZES: '3,2,2'
+      TARGET_HOUR_TORONTO: '9'
+      MAX_JITTER_SECONDS: '1500'
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Decide whether this scheduled run should continue (Toronto gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVENT_NAME="${GITHUB_EVENT_NAME:-}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
+            echo "Manual run requested (no hour check)."
+          else
+            LOCAL_HOUR=$(TZ='America/Toronto' date +%H | sed 's/^0//')
+            echo "Toronto local hour: ${LOCAL_HOUR}"
+            if [ "$LOCAL_HOUR" -ne "${TARGET_HOUR_TORONTO}" ]; then
+              echo "Local hour is not ${TARGET_HOUR_TORONTO} — exiting."
+              exit 0
+            fi
+            echo "Local hour matches target (${TARGET_HOUR_TORONTO}) — continuing."
+          fi
+
+      - name: Compute random jitter (0..MAX_JITTER_SECONDS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
+            echo "Manual run — skipping jitter."
+            JITTER_SEC=0
+          else
+            MAX=${MAX_JITTER_SECONDS:-1500}
+            JITTER_SEC=$(( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % (MAX + 1) ))
+            echo "Sleeping $JITTER_SEC seconds (jitter up to $MAX)."
+            sleep "$JITTER_SEC"
+          fi
+
+      - name: Write src/accounts.json from secret (robust + debug)
+        shell: bash
+        env:
+          ACCOUNTS_JSON_B64: ${{ secrets.ACCOUNTS_JSON_B64 || '' }}
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          echo "=== repo root listing ==="
+          ls -la
+
+          if [ -n "${ACCOUNTS_JSON_B64:-}" ]; then
+            echo "Decoding ACCOUNTS_JSON_B64"
+            if printf '%s' "$ACCOUNTS_JSON_B64" | base64 --decode > src/accounts.json 2>/dev/null; then
+              echo "Decoded to src/accounts.json"
+            else
+              echo "ERROR decoding ACCOUNTS_JSON_B64" >&2
+              exit 1
+            fi
+          elif [ -n "${ACCOUNTS_JSON:-}" ]; then
+            RAW="${ACCOUNTS_JSON}"
+            case "$RAW" in
+              \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
+              \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
+            esac
+            case "$RAW" in
+              [\{[]* )
+                printf '%s' "$RAW" > src/accounts.json
+                echo "Wrote raw JSON to src/accounts.json"
+                ;;
+              * )
+                TMP=$(mktemp)
+                if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
+                  if command -v jq >/dev/null 2>&1; then
+                    if jq . "$TMP" >/dev/null 2>&1; then
+                      mv "$TMP" src/accounts.json
+                      echo "Decoded base64 -> src/accounts.json (validated jq)"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: decoded content not valid JSON" >&2
+                      exit 1
+                    fi
+                  else
+                    if node -e "try{JSON.parse(require('fs').readFileSync('$TMP','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
+                      mv "$TMP" src/accounts.json
+                      echo "Decoded base64 -> src/accounts.json (validated node)"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: decoded content not valid JSON (node)" >&2
+                      exit 1
+                    fi
+                  fi
+                else
+                  echo "ERROR: ACCOUNTS_JSON not raw JSON and not valid base64" >&2
+                  rm -f "$TMP" 2>/dev/null || true
+                  exit 1
+                fi
+                ;;
+            esac
+          else
+            echo "No ACCOUNTS_JSON provided; attempting example fallback"
+            if [ -f src/accounts.example.json ]; then
+              cp src/accounts.example.json src/accounts.json
+            elif [ -f accounts.example.json ]; then
+              cp accounts.example.json src/accounts.json
+            else
+              echo "ERROR: No accounts secret and no example file" >&2
+              ls -la || true
+              exit 1
+            fi
+          fi
+
+          if command -v jq >/dev/null 2>&1; then
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            echo "src/accounts.json validated by jq"
+          else
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
+          fi
+
+      - name: Trim accounts.json to this job's partition (seeded shuffle by Toronto date)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat > dist/slice.js <<'JS'
+          const fs = require('fs');
+          const path = 'src/accounts.json';
+          if (!fs.existsSync(path)) { console.error('src/accounts.json not found'); process.exit(1); }
+          const all = JSON.parse(fs.readFileSync(path,'utf8') || '[]');
+          const jobIndex = Number(process.env.JOB_INDEX || '0');
+          const groupSizes = (process.env.GROUP_SIZES || '3,2,2').split(',').map(Number);
+          const seedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+          function seedFromString(s){
+            let h = 2166136261 >>> 0;
+            for (let i = 0; i < s.length; i++) {
+              h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+            }
+            return h >>> 0;
+          }
+          function mulberry32(a){
+            return function(){
+              let t = a += 0x6D2B79F5;
+              t = Math.imul(t ^ (t >>> 15), t | 1);
+              t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+              return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            }
+          }
+          const rng = mulberry32(seedFromString(seedDate));
+          const arr = all.slice();
+          for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(rng() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+          }
+          let start = 0;
+          for (let i = 0; i < jobIndex; i++) start += (groupSizes[i] || 0);
+          const mySize = groupSizes[jobIndex] || 0;
+          const slice = arr.slice(start, start + mySize);
+          fs.writeFileSync('dist/accounts.json', JSON.stringify(slice, null, 2));
+          console.log('SeedDate:', seedDate, 'jobIndex:', jobIndex, 'groupSizes:', groupSizes, 'start:', start, 'mySize:', mySize, 'totalAccounts:', all.length, 'Assigned', slice.length, 'accounts to job', jobIndex);
+          JS
+          node dist/slice.js
+
+      - name: Propagate slice, mask summary (so build & runtime use the same accounts but we never print secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > dist/mask_and_copy.js <<'NODE'
+          const fs = require('fs');
+          const src = 'dist/accounts.json';
+          if (!fs.existsSync(src)) { console.error('dist/accounts.json not found'); process.exit(1); }
+          const arr = JSON.parse(fs.readFileSync(src,'utf8') || '[]');
+
+          // copy slice to src for build/runtime
+          fs.writeFileSync('src/accounts.json', JSON.stringify(arr, null, 2));
+
+          function maskEmail(email){
+            if(!email || typeof email !== 'string') return '(no-email)';
+            const [local, domain] = email.split('@');
+            if(!domain) return '***REDACTED***';
+            const first = local.slice(0,2);
+            const last = local.slice(-1);
+            const middleMask = local.length <= 3 ? '***' : '****';
+            return `${first}${middleMask}${last}@${domain}`;
+          }
+
+          const summary = arr.map((a, idx) => {
+            // try some common fields for a light identifier
+            const email = a.email || a.username || a.user || '';
+            const id = a.id || a.name || a.username || null;
+            return { index: idx, id: id || null, email: email ? maskEmail(email) : '(no-email)' };
+          });
+
+          // Print only counts + masked small summary (no secrets)
+          console.log('Assigned account count:', summary.length);
+          console.log('Masked accounts (first 10):', JSON.stringify(summary.slice(0,10), null, 2));
+
+          // also write an artifact for audit (masked)
+          fs.writeFileSync('dist/assigned_masked_summary.json', JSON.stringify(summary, null, 2));
+          NODE
+
+          node dist/mask_and_copy.js
+
+      - name: Upload assigned masked summary for debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assigned-accounts-masked-job${{ env.JOB_INDEX }}-${{ github.run_id }}
+          path: dist/assigned_masked_summary.json
+
+      - name: Install Node dependencies (npm ci)
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browser binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browser-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-browser-cache-${{ runner.os }}-
+
+      - name: Install Playwright Chromium + OS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes playwright install --with-deps chromium
+
+      - name: Install xvfb (virtual X server)
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          dpkg -l | head -n 20
+
+      - name: Build the project
+        run: npm run build
+
+      - name: Ensure dist/accounts.json exists (copy after build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ -f dist/accounts.json ]; then
+            echo "dist/accounts.json present"
+          elif [ -f src/accounts.json ]; then
+            cp src/accounts.json dist/accounts.json
+            echo "Copied src/accounts.json -> dist/accounts.json"
+          else
+            echo "WARNING: src/accounts.json missing — job may fail." >&2
+            ls -la src || true
+          fi
+
+      - name: Create runtime File polyfill (fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat > dist/polyfill-file.js <<'EOF'
+          if (typeof globalThis.File === 'undefined') {
+            globalThis.File = class File extends Blob {
+              constructor(parts = [], name = '', options = {}) {
+                super(parts, options);
+                this.name = String(name);
+                this.lastModified = options && options.lastModified ? Number(options.lastModified) : Date.now();
+              }
+            };
+          }
+          EOF
+
+      - name: Run the built script under Xvfb and save logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
+            sh -c "stdbuf -oL -eL node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee -a logs/script.log" || true
+          ps auxww > logs/ps-auxww.txt || true
+          ls -laR > logs/ls-laR.txt || true
+          env > logs/env.raw || true
+
+      - name: Sanitize logs (mask emails, redact tokens & passwords) before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat > dist/sanitize_logs.js <<'NODE'
+          const fs = require('fs');
+          const logPath = 'logs/script.log';
+          const envPath = 'logs/env.raw';
+          function maskEmailStr(s){
+            return s.replace(/([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g, (m, local, domain) => {
+              const first = local.slice(0,2);
+              const last = local.slice(-1);
+              const middleMask = local.length <= 3 ? '***' : '****';
+              return `${first}${middleMask}${last}@${domain}`;
+            });
+          }
+          function sanitizeContent(content){
+            if(!content) return content;
+            // mask emails
+            content = maskEmailStr(content);
+            // redact JSON-style password fields: "password": "..."
+            content = content.replace(/("(?:(?:P|p)assword|pwd|pass)\"?\s*:\s*\")([^"]+)\"/g, '$1***REDACTED***"');
+            // redact password=... or Pass= ...
+            content = content.replace(/(\b(?:(?:P|p)ass(?:word)?|pwd)\b\s*[:=]\s*)([^\\s,;]+)/g, '$1***REDACTED***');
+            // redact Authorization Bearer/Basic tokens
+            content = content.replace(/(Authorization[:=]\s*)(Bearer|Basic)?\s*[A-Za-z0-9\-_.=]+/gi, '$1$2 ***REDACTED***');
+            content = content.replace(/(Bearer|Basic)\s+[A-Za-z0-9\-_.=]+/gi, '$1 ***REDACTED***');
+            // redact long base64/blobs
+            content = content.replace(/\b[A-Za-z0-9+\/]{40,}={0,2}\b/g, '***REDACTED_BASE64***');
+            return content;
+          }
+
+          if (fs.existsSync(logPath)) {
+            const raw = fs.readFileSync(logPath, 'utf8');
+            fs.writeFileSync(logPath, sanitizeContent(raw), 'utf8');
+          }
+          if (fs.existsSync(envPath)) {
+            const rawEnv = fs.readFileSync(envPath, 'utf8');
+            fs.writeFileSync(envPath, sanitizeContent(rawEnv), 'utf8');
+          }
+          console.log('Logs sanitized (emails masked, tokens/passwords redacted).');
+          NODE
+
+          node dist/sanitize_logs.js || true
+
+          # additionally keep existing sanitization fallback (non-destructive)
+          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log || true
+          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log || true
+
