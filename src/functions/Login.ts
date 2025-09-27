@@ -963,6 +963,7 @@ export class Login {
         this.bot.log(this.bot.isMobile, 'LOGIN', '2FA code entered successfully')
     }
 
+
     async getMobileAccessToken(page: Page, email: string) {
         const maxRetries = 3;
 
@@ -970,66 +971,101 @@ export class Login {
             try {
                 this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Mobile token attempt ${attempt}/${maxRetries}`);
 
-                // Clear any existing authentication state before starting
-                await this.clearAuthState(page);
+                // Use the simpler approach - disable FIDO first
+                await this.disableFido(page);
 
-                const authorizeUrl = new URL(this.authBaseUrl);
-                authorizeUrl.searchParams.append('response_type', 'code');
-                authorizeUrl.searchParams.append('client_id', this.clientId);
-                authorizeUrl.searchParams.append('redirect_uri', this.redirectUrl);
-                authorizeUrl.searchParams.append('scope', this.scope);
-                authorizeUrl.searchParams.append('state', crypto.randomBytes(16).toString('hex'));
-                authorizeUrl.searchParams.append('access_type', 'offline_access');
-                authorizeUrl.searchParams.append('login_hint', email);
+                const url = new URL(this.authBaseUrl);
+                url.searchParams.set('response_type', 'code');
+                url.searchParams.set('client_id', this.clientId);
+                url.searchParams.set('redirect_uri', this.redirectUrl);
+                url.searchParams.set('scope', this.scope);
+                url.searchParams.set('state', crypto.randomBytes(16).toString('hex'));
+                url.searchParams.set('access_type', 'offline_access');
+                url.searchParams.set('login_hint', email);
 
-                // Add unique parameters to make each request appear as a different device
-                authorizeUrl.searchParams.append('client-request-id', crypto.randomUUID());
-                authorizeUrl.searchParams.append('x-client-SKU', 'MSAL.JS');
-                authorizeUrl.searchParams.append('x-client-Ver', '1.0.0');
-                authorizeUrl.searchParams.append('x-client-OS', await this.getFakeUserAgent(page));
-                authorizeUrl.searchParams.append('x-client-CPU', 'x64');
-                authorizeUrl.searchParams.append('client_info', '1');
+                // Add a unique parameter to avoid caching
+                url.searchParams.set('client-request-id', crypto.randomUUID());
 
                 this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Navigating to authorization URL');
-                await page.goto(authorizeUrl.href, {
-                    waitUntil: 'networkidle',
+
+                // Use a simpler navigation approach
+                await page.goto(url.href, {
+                    waitUntil: 'domcontentloaded',
                     timeout: 30000
                 });
 
-                // Wait for any redirects to complete
-                await page.waitForTimeout(2000);
+                const start = Date.now();
+                this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Authorizing mobile scope...');
 
-                let currentUrl = new URL(page.url());
-                this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Current URL after navigation: ${currentUrl.hostname}${currentUrl.pathname}`);
+                let code = '';
+                const timeoutMs = 45000; // 45 seconds
 
-                // Check if we're already on the redirect URL with a code
-                if (currentUrl.hostname === 'login.live.com' && currentUrl.pathname === '/oauth20_desktop.srf') {
-                    const code = currentUrl.searchParams.get('code');
-                    if (code) {
-                        this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Already have authorization code from redirect');
-                        return await this.exchangeCodeForToken(code);
+                while (Date.now() - start < timeoutMs) {
+                    // Handle any passkey prompts that might appear
+                    await this.handlePasskeyPrompts(page, 'oauth');
+
+                    const currentUrl = page.url();
+                    const urlObj = new URL(currentUrl);
+
+                    if (urlObj.hostname === 'login.live.com' && urlObj.pathname === '/oauth20_desktop.srf') {
+                        code = urlObj.searchParams.get('code') || '';
+                        if (code) {
+                            this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Authorization code received successfully');
+                            break;
+                        }
                     }
+
+                    // Check if we've been redirected to an Office or other Microsoft service
+                    if (urlObj.searchParams.get('client_id') && urlObj.searchParams.get('client_id') !== this.clientId) {
+                        this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Detected redirect to different client: ${urlObj.searchParams.get('client_id')}`, 'warn');
+
+                        // Try to go back and restart
+                        if (attempt < maxRetries) {
+                            this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Going back and retrying...');
+                            await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+                            await this.bot.utils.wait(2000);
+                            break; // Break out of while loop to retry
+                        }
+                    }
+
+                    await this.bot.utils.wait(1000);
                 }
 
-                this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Waiting for authorization redirect...');
-
-                // Use multiple strategies to detect the authorization completion
-                const code = await this.waitForAuthorizationCode(page, 45000); // 45 second timeout
-
-                if (code) {
-                    this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Authorization code received successfully');
-                    return await this.exchangeCodeForToken(code);
-                } else {
+                if (!code) {
                     this.bot.log(this.bot.isMobile, 'LOGIN-APP', `No authorization code received on attempt ${attempt}`, 'warn');
 
                     if (attempt < maxRetries) {
-                        // Wait with exponential backoff before retry
                         const backoffMs = Math.min(1000 * Math.pow(2, attempt), 10000);
                         this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Waiting ${backoffMs}ms before retry...`);
                         await this.bot.utils.wait(backoffMs);
                         continue;
+                    } else {
+                        throw new Error('OAuth code not received in time');
                     }
                 }
+
+                // Exchange code for token
+                const form = new URLSearchParams();
+                form.append('grant_type', 'authorization_code');
+                form.append('client_id', this.clientId);
+                form.append('code', code);
+                form.append('redirect_uri', this.redirectUrl);
+
+                const req: AxiosRequestConfig = {
+                    url: this.tokenUrl,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    },
+                    data: form.toString(),
+                    timeout: 10000
+                };
+
+                const resp = await this.bot.axios.request(req);
+                const data: OAuth = resp.data;
+                this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Authorized in ${Math.round((Date.now()-start)/1000)}s`);
+                return data.access_token;
 
             } catch (error) {
                 this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Attempt ${attempt} failed: ${error}`, 'warn');
@@ -1050,260 +1086,128 @@ export class Login {
                     });
 
                     this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'All authorization attempts failed', 'error');
+
+                    // Final fallback - try to continue without token
+                    this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Using fallback - continuing without mobile token');
+                    try {
+                        await page.goto('https://rewards.bing.com/', {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 15000
+                        });
+                    } catch (e) {
+                        // Ignore navigation errors in fallback
+                    }
+                    return null;
                 }
             }
         }
 
-        // Final fallback - try to continue without token
-        this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Using fallback - continuing without mobile token');
-        await this.ensureRewardsPage(page);
         return null;
     }
 
-    /**
-     * Clear authentication state to prevent conflicts between workers
-     */
-    // inside src/functions/Login.ts (or wherever this method lives)
-    private async clearAuthState(page: Page): Promise<void> {
-        try {
-            const authDomains = [
-                'login.live.com',
-                'login.microsoftonline.com',
-                'account.live.com'
-            ];
-
-            // Try to visit the auth domains to ensure any domain-scoped storage is reachable.
-            // We silently catch navigation errors because some endpoints may block headless or time out.
-            for (const domain of authDomains) {
-                try {
-                    // Navigate to a benign path on the domain; timeout short to avoid hanging.
-                    await page.goto(`https://${domain}/`, { timeout: 5000 }).catch(() => {});
-                } catch (e) {
-                    // ignore per-domain navigation errors
-                }
-            }
-
-            const context = page.context();
-
-            // Optional: gather cookies before clearing for debug/logging (non-blocking)
-            try {
-                const cookies = await context.cookies();
-                const authCookies = cookies.filter(c => {
-                    // cookie.domain may be like ".login.live.com" or "login.live.com"
-                    return authDomains.some(d => c.domain.includes(d));
-                });
-
-                if (authCookies.length > 0) {
-                    // Log names/domains of cookies found (don't log values)
-                    const cookieSummary = authCookies.map(c => `${c.name}@${c.domain}${c.path}`).join(', ');
-                    this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Found auth cookies before clearing: ${cookieSummary}`);
-                } else {
-                    this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'No auth cookies found before clearing');
-                }
-            } catch (e) {
-                // Non-fatal: proceed to clear cookies even if listing fails
-                this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Failed to list cookies: ${e}`, 'warn');
-            }
-
-            // Clear all cookies in the context (Playwright API does not support deleting specific cookies)
-            await context.clearCookies();
-
-            // Also clear storage (localStorage and sessionStorage) in the current page
-            // Use a short try/catch inside evaluate to be defensive against cross-origin frames, etc.
-            try {
-                await page.evaluate(() => {
-                    try { localStorage.clear(); } catch (e) {}
-                    try { sessionStorage.clear(); } catch (e) {}
-                    // If you want to remove indexedDB and service workers as well, add those here.
-                });
-            } catch (e) {
-                // If page.evaluate fails (cross-origin/navigation race), just log and continue.
-                this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Failed to clear web storage via page.evaluate: ${e}`, 'warn');
-            }
-
-            // As an extra measure, clear storage state file if your code uses storageState snapshots
-            // (uncomment / adapt if you keep a storageState file per account)
-            // try {
-            //     await context.clearPermissions(); // clears granted permissions if desired
-            // } catch (e) {
-            //     // optional
-            // }
-
-            this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Cleared authentication state (cookies + storage)');
-        } catch (error) {
-            this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Error clearing auth state: ${error}`, 'warn');
-        }
-    }
-
+// Add these missing methods that are referenced in the code above:
 
     /**
-     * Wait for authorization code with multiple detection strategies
+     * Disable FIDO support in login requests
      */
-    private async waitForAuthorizationCode(page: Page, timeoutMs: number): Promise<string | null> {
-        return new Promise(async (resolve) => {
-            let resolved = false;
-            const timeoutId = setTimeout(() => {
-                if (!resolved) {
-                    resolved = true;
-                    this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Authorization timeout reached');
-                    resolve(null);
-                }
-            }, timeoutMs);
-
+    private async disableFido(page: Page) {
+        await page.route('**/GetCredentialType.srf*', (route) => {
+            const postData = route.request().postData() || '{}';
+            let body: any = {};
             try {
-                // Strategy 1: Wait for URL redirect
-                try {
-                    await page.waitForURL('**/oauth20_desktop.srf**', { timeout: timeoutMs });
-                    const currentUrl = new URL(page.url());
-                    const code = currentUrl.searchParams.get('code');
-                    if (code && !resolved) {
-                        resolved = true;
-                        clearTimeout(timeoutId);
-                        resolve(code);
-                        return;
-                    }
-                } catch (e) {
-                    // URL wait failed, try other strategies
-                }
-
-                // Strategy 2: Poll for URL changes
-                let lastUrl = page.url();
-                const pollInterval = setInterval(async () => {
-                    if (resolved) {
-                        clearInterval(pollInterval);
-                        return;
-                    }
-
-                    try {
-                        const currentUrl = page.url();
-                        if (currentUrl !== lastUrl) {
-                            lastUrl = currentUrl;
-                            const urlObj = new URL(currentUrl);
-
-                            if (urlObj.hostname === 'login.live.com' && urlObj.pathname === '/oauth20_desktop.srf') {
-                                const code = urlObj.searchParams.get('code');
-                                if (code && !resolved) {
-                                    resolved = true;
-                                    clearInterval(pollInterval);
-                                    clearTimeout(timeoutId);
-                                    resolve(code);
-                                    return;
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        // Ignore polling errors
-                    }
-                }, 1000);
-
-                // Strategy 3: Check all pages in context
-                const checkPages = async () => {
-                    if (resolved) return;
-
-                    try {
-                        const pages = page.context().pages();
-                        for (const p of pages) {
-                            try {
-                                const url = p.url();
-                                const urlObj = new URL(url);
-                                if (urlObj.hostname === 'login.live.com' && urlObj.pathname === '/oauth20_desktop.srf') {
-                                    const code = urlObj.searchParams.get('code');
-                                    if (code && !resolved) {
-                                        resolved = true;
-                                        clearTimeout(timeoutId);
-                                        resolve(code);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                // Ignore page errors
-                            }
-                        }
-                    } catch (e) {
-                        // Ignore context errors
-                    }
-
-                    if (!resolved) {
-                        setTimeout(checkPages, 1000);
-                    }
-                };
-
-                // Start checking pages
-                checkPages();
-
-            } catch (error) {
-                if (!resolved) {
-                    resolved = true;
-                    clearTimeout(timeoutId);
-                    resolve(null);
-                }
+                body = JSON.parse(postData);
+            } catch {
+                body = {};
             }
+            body.isFidoSupported = false;
+            route.continue({ postData: JSON.stringify(body) });
         });
     }
 
     /**
-     * Exchange authorization code for access token
+     * Handle passkey prompts during OAuth flow
      */
-    private async exchangeCodeForToken(code: string): Promise<string> {
-        const body = new URLSearchParams();
-        body.append('grant_type', 'authorization_code');
-        body.append('client_id', this.clientId);
-        body.append('code', code);
-        body.append('redirect_uri', this.redirectUrl);
-
-        const tokenRequest: AxiosRequestConfig = {
-            url: this.tokenUrl,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            data: body.toString(),
-            timeout: 10000
-        };
-
+    private async handlePasskeyPrompts(page: Page, context: string) {
         try {
-            const tokenResponse = await this.bot.axios.request(tokenRequest);
-            const tokenData: OAuth = await tokenResponse.data;
-            this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Successfully exchanged code for token');
-            return tokenData.access_token;
-        } catch (error) {
-            this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Token exchange failed: ${error}`, 'error');
-            throw error;
-        }
-    }
+            // Common passkey prompt selectors
+            const passkeySelectors = [
+                'button:has-text("Use your passkey")',
+                'button:has-text("Use Windows Hello")',
+                'button:has-text("Use security key")',
+                'button:has-text("Use a different method")',
+                'text=Use your password',
+                'button[data-testid="secondaryButton"]' // Skip/back button
+            ];
 
-    /**
-     * Ensure we're on the rewards page as fallback
-     */
-    private async ensureRewardsPage(page: Page) {
-        try {
-            const currentUrl = new URL(page.url());
-            if (!currentUrl.hostname.includes('rewards.bing.com')) {
-                this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Navigating back to rewards page as fallback');
-                await page.goto('https://rewards.bing.com/', {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 15000
-                });
+            for (const selector of passkeySelectors) {
+                try {
+                    const element = await page.$(selector);
+                    if (element) {
+                        await element.click();
+                        this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Handled passkey prompt (${context}) with selector: ${selector}`);
+                        await this.bot.utils.wait(1000);
+                        return;
+                    }
+                } catch (error) {
+                    // Ignore errors for individual selectors
+                }
             }
         } catch (error) {
-            this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Error ensuring rewards page: ${error}`, 'warn');
+            // Ignore overall errors in passkey handling
         }
     }
 
-    /**
-     * Generate a fake user agent to make each request appear unique
-     */
-    private async getFakeUserAgent(page: Page): Promise<string> {
-        // Generate a random but realistic user agent
-        const platforms = ['Windows NT 10.0', 'Windows NT 6.1', 'Macintosh; Intel Mac OS X 10_15'];
-        const webkitVersions = ['537.36', '605.1.15', '537.36'];
-        const chromeVersions = ['91.0.4472.124', '92.0.4515.107', '93.0.4577.63'];
 
-        const randomIndex = Math.floor(Math.random() * platforms.length);
+    // /**
+    //  * Exchange authorization code for access token
+    //  */
+    // private async exchangeCodeForToken(code: string): Promise<string> {
+    //     const body = new URLSearchParams();
+    //     body.append('grant_type', 'authorization_code');
+    //     body.append('client_id', this.clientId);
+    //     body.append('code', code);
+    //     body.append('redirect_uri', this.redirectUrl);
+    //
+    //     const tokenRequest: AxiosRequestConfig = {
+    //         url: this.tokenUrl,
+    //         method: 'POST',
+    //         headers: {
+    //             'Content-Type': 'application/x-www-form-urlencoded',
+    //             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    //         },
+    //         data: body.toString(),
+    //         timeout: 10000
+    //     };
+    //
+    //     try {
+    //         const tokenResponse = await this.bot.axios.request(tokenRequest);
+    //         const tokenData: OAuth = await tokenResponse.data;
+    //         this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Successfully exchanged code for token');
+    //         return tokenData.access_token;
+    //     } catch (error) {
+    //         this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Token exchange failed: ${error}`, 'error');
+    //         throw error;
+    //     }
+    // }
+    //
+    // /**
+    //  * Ensure we're on the rewards page as fallback
+    //  */
+    // private async ensureRewardsPage(page: Page) {
+    //     try {
+    //         const currentUrl = new URL(page.url());
+    //         if (!currentUrl.hostname.includes('rewards.bing.com')) {
+    //             this.bot.log(this.bot.isMobile, 'LOGIN-APP', 'Navigating back to rewards page as fallback');
+    //             await page.goto('https://rewards.bing.com/', {
+    //                 waitUntil: 'domcontentloaded',
+    //                 timeout: 15000
+    //             });
+    //         }
+    //     } catch (error) {
+    //         this.bot.log(this.bot.isMobile, 'LOGIN-APP', `Error ensuring rewards page: ${error}`, 'warn');
+    //     }
+    // }
 
-        return `Mozilla/5.0 (${platforms[randomIndex]}; Win64; x64) AppleWebKit/${webkitVersions[randomIndex]} (KHTML, like Gecko) Chrome/${chromeVersions[randomIndex]} Safari/${webkitVersions[randomIndex]}`;
-    }
 
     private async checkLoggedIn(page: Page) {
         const targetHostname = 'rewards.bing.com'
@@ -1325,69 +1229,74 @@ export class Login {
     }
 
     private async dismissLoginMessages(page: Page) {
-        // Passkey / Windows Hello prompt ("Sign in faster"), click "Skip for now"
-        // Primary heuristics: presence of biometric video OR title mentions passkey/sign in faster
-        const passkeyVideo = await page.waitForSelector('[data-testid="biometricVideo"]', { timeout: 2000 }).catch(() => null)
-        let handledPasskey = false
-        if (passkeyVideo) {
-            const skipButton = await page.$('[data-testid="secondaryButton"]')
-            if (skipButton) {
-                await skipButton.click()
-                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Use Passkey" modal via data-testid=secondaryButton')
-                await page.waitForTimeout(500)
-                handledPasskey = true
+        try {
+            // Only proceed if we're on a Microsoft login page
+            const currentUrl = page.url();
+            if (!currentUrl.includes('login.live.com') && !currentUrl.includes('account.microsoft.com')) {
+                return;
             }
-        }
 
-        if (!handledPasskey) {
-            // Fallback heuristics: title text or presence of primary+secondary buttons typical of the passkey screen
-            const titleEl = await page.waitForSelector('[data-testid="title"]', { timeout: 1000 }).catch(() => null)
-            const titleText = (titleEl ? (await titleEl.textContent()) : '')?.trim() || ''
-            const looksLikePasskeyTitle = /sign in faster|passkey/i.test(titleText)
+            // 1. Handle Passkey prompt with more precise detection
+            const passkeyPromptDetected = await page.evaluate(() => {
+                // Check for passkey-specific indicators
+                const titleEl = document.querySelector('[data-testid="title"]');
+                const titleText = titleEl ? titleEl.textContent || '' : '';
+                const hasBiometricVideo = document.querySelector('[data-testid="biometricVideo"]') !== null;
+                const hasPasskeyIndicators = /sign in faster|passkey|biometric|fingerprint|face id|windows hello/i.test(titleText);
 
-            const secondaryBtn = await page.waitForSelector('button[data-testid="secondaryButton"]', { timeout: 1000 }).catch(() => null)
-            const primaryBtn = await page.waitForSelector('button[data-testid="primaryButton"]', { timeout: 1000 }).catch(() => null)
+                return hasBiometricVideo || hasPasskeyIndicators;
+            });
 
-            if (looksLikePasskeyTitle && secondaryBtn) {
-                await secondaryBtn.click()
-                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen by title + secondaryButton')
-                await page.waitForTimeout(500)
-                handledPasskey = true
-            } else if (secondaryBtn && primaryBtn) {
-                // If both buttons are visible (Next + Skip for now), prefer the secondary (Skip for now)
-                await secondaryBtn.click()
-                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen by button pair heuristic')
-                await page.waitForTimeout(500)
-                handledPasskey = true
-            } else if (!handledPasskey) {
-                // Last-resort fallbacks by text and close icon
-                const skipByText = await page.locator('xpath=//button[contains(normalize-space(.), "Skip for now")]').first()
-                if (await skipByText.isVisible().catch(() => false)) {
-                    await skipByText.click()
-                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen via text fallback')
-                    await page.waitForTimeout(500)
-                    handledPasskey = true
-                } else {
-                    const closeBtn = await page.$('#close-button')
-                    if (closeBtn) {
-                        await closeBtn.click().catch(() => { })
-                        this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Attempted to close Passkey screen via close button')
-                        await page.waitForTimeout(500)
-                    }
+            if (passkeyPromptDetected) {
+                // Only click "Skip for now" if it's clearly a passkey prompt
+                const skipButton = await page.$('button[data-testid="secondaryButton"]:has-text("Skip for now")');
+                if (skipButton) {
+                    await skipButton.click({ delay: 50 });
+                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Safely dismissed "Use Passkey" prompt with "Skip for now" button');
+                    await page.waitForTimeout(1000);
+                    return;
+                }
+
+                // Alternative: look for "No" or "Not now" buttons specifically for passkey
+                const noButton = await page.$('button:has-text("No")');
+                if (noButton) {
+                    await noButton.click({ delay: 50 });
+                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Safely dismissed "Use Passkey" prompt with "No" button');
+                    await page.waitForTimeout(1000);
+                    return;
                 }
             }
-        }
 
-        // Use Keep me signed in
-        if (await page.waitForSelector('[data-testid="kmsiVideo"]', { timeout: 2000 }).catch(() => null)) {
-            const yesButton = await page.$('[data-testid="primaryButton"]')
-            if (yesButton) {
-                await yesButton.click()
-                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Keep me signed in" modal')
-                await page.waitForTimeout(500)
+            // 2. Handle "Keep me signed in" with more precision
+            const kmsiPromptDetected = await page.evaluate(() => {
+                const titleEl = document.querySelector('[data-testid="title"]');
+                const titleText = titleEl ? titleEl.textContent || '' : '';
+                return /keep me signed in|stay signed in/i.test(titleText);
+            });
+
+            if (kmsiPromptDetected) {
+                const yesButton = await page.$('button[data-testid="primaryButton"]:has-text("Yes")');
+                if (yesButton) {
+                    await yesButton.click({ delay: 50 });
+                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Safely confirmed "Keep me signed in" prompt');
+                    await page.waitForTimeout(1000);
+                }
             }
-        }
 
+            // 3. Only handle the main login page prompt if needed
+            if (currentUrl.includes('login.live.com') && currentUrl.includes('oauth20_authorize')) {
+                const nextButton = await page.$('button[type="submit"]:has-text("Next")');
+                const signInButton = await page.$('button[type="submit"]:has-text("Sign in")');
+
+                if (nextButton || signInButton) {
+                    // This is likely the main login flow, not a dismissible prompt
+                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Detected main login flow, not dismissing');
+                    return;
+                }
+            }
+        } catch (error) {
+            this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', `Error dismissing login messages: ${error}`, 'warn');
+        }
     }
 
 
