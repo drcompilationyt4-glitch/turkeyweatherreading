@@ -1,0 +1,195 @@
+{
+  "baseURL": "https://rewards.bing.com",
+  "sessionPath": "sessions",
+
+  "headless": true,
+  "globalTimeout": "30s",
+  "parallel": false,
+  "runOnZeroPoints": false,
+  "clusters": 3,
+  "passesPerRun": 1,
+
+  "saveFingerprint": {
+    "mobile": false,
+    "desktop": false
+  },
+
+  "browser": {
+    "headless": true,
+    "globalTimeout": "30s"
+  },
+
+  "execution": {
+    "parallel": false,
+    "runOnZeroPoints": false,
+    "clusters": 3,
+    "passesPerRun": 1
+  },
+
+  "buyMode": {
+    "maxMinutes": 45
+  },
+
+  "fingerprinting": {
+    "saveFingerprint": {
+      "mobile": false,
+      "desktop": false
+    }
+  },
+
+  "workers": {
+    "doDailySet": true,
+    "doMorePromotions": true,
+    "doPunchCards": true,
+    "doDesktopSearch": true,
+    "doMobileSearch": true,
+    "doDailyCheckIn": true,
+    "doReadToEarn": true,
+    "bundleDailySetWithSearch": false
+  },
+
+  "searchOnBingLocalQueries": false,
+
+  "searchSettings": {
+    "useGeoLocaleQueries": false,
+    "scrollRandomResults": true,
+    "clickRandomResults": true,
+    "searchDelay": {
+      "min": "3min",
+      "max": "5min"
+    },
+    "retryMobileSearchAmount": 2
+  },
+
+  "search": {
+    "useLocalQueries": false,
+    "settings": {
+      "useGeoLocaleQueries": false,
+      "scrollRandomResults": true,
+      "clickRandomResults": true,
+      "retryMobileSearchAmount": 2,
+      "delay": {
+        "min": "3min",
+        "max": "5min"
+      }
+    }
+  },
+
+  "proxy": {
+    "proxyGoogleTrends": true,
+    "proxyBingTerms": true
+  },
+
+  "webhook": {
+    "enabled": false,
+    "url": ""
+  },
+
+  "notifications": {
+    "webhook": {
+      "enabled": false,
+      "url": ""
+    },
+    "conclusionWebhook": {
+      "enabled": false,
+      "url": ""
+    },
+    "ntfy": {
+      "enabled": false,
+      "url": "",
+      "topic": "rewards",
+      "authToken": ""
+    }
+  },
+
+  "logExcludeFunc": [
+    "SEARCH-CLOSE-TABS"
+  ],
+  "webhookLogExcludeFunc": [
+    "SEARCH-CLOSE-TABS"
+  ],
+
+  "logging": {
+    "excludeFunc": [
+      "SEARCH-CLOSE-TABS",
+      "LOGIN-NO-PROMPT",
+      "FLOW"
+    ],
+    "webhookExcludeFunc": [
+      "SEARCH-CLOSE-TABS",
+      "LOGIN-NO-PROMPT",
+      "FLOW"
+    ],
+    "live": {
+      "enabled": false,
+      "redactEmails": true
+    }
+  },
+
+  "diagnostics": {
+    "enabled": true,
+    "saveScreenshot": true,
+    "saveHtml": true,
+    "maxPerRun": 2,
+    "retentionDays": 7
+  },
+
+  "jobState": {
+    "enabled": false,
+    "dir": ""
+  },
+
+  "retryPolicy": {
+    "maxAttempts": 3,
+    "baseDelay": 1000,
+    "maxDelay": "30s",
+    "multiplier": 2,
+    "jitter": 0.2
+  },
+
+  "humanization": {
+    "enabled": true,
+    "stopOnBan": true,
+    "immediateBanAlert": true,
+    "actionDelay": {
+      "min": 150,
+      "max": 450
+    },
+    "gestureMoveProb": 0.4,
+    "gestureScrollProb": 0.2,
+    "allowedWindows": []
+  },
+
+  "vacation": {
+    "enabled": false,
+    "minDays": 3,
+    "maxDays": 5
+  },
+
+  "schedule": {
+    "enabled": false,
+    "useAmPm": false,
+    "time12": "9:00 AM",
+    "time24": "09:00",
+    "timeZone": "America/New_York",
+    "runImmediatelyOnStart": false
+  },
+
+  "update": {
+    "git": true,
+    "docker": false,
+    "scriptPath": "setup/update/update.mjs"
+  },
+
+  "shuffleAccounts": true,
+  "accountStartDelayMinMs": 2000,
+  "accountStartDelayMaxMs": 6000,
+  "accountFinishDelayMinMs": 1000,
+  "accountFinishDelayMaxMs": 3000,
+  "perAccountPageDelayMs": 300,
+
+  "gmailNavWaitMs": 2500,
+  "gmailSearchRetries": 3,
+  "gmailSearchDelayMs": 1200,
+  "passwordFillDelayMs": 600
+}
