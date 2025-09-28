@@ -65,19 +65,26 @@ jobs:
             sleep "$JITTER_SEC"
           fi
 
-      - name: Write src/accounts.json from secret (robust + debug)
+      - name: Write src/accounts.json from secret (robust + locked perms)
         shell: bash
         env:
           ACCOUNTS_JSON_B64: ${{ secrets.ACCOUNTS_JSON_B64 || '' }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON || '' }}
         run: |
           set -euo pipefail
-          mkdir -p src
-          echo "=== repo root listing ==="
-          ls -la
+          # strict permissions for any created files
+          umask 077
+          mkdir -p src dist
+
+          echo "=== repo root listing (masked) ==="
+          # show repo listing but hide any accounts.json to avoid accidental exposure
+          ls -la | sed '/src\/accounts.json/d' || true
+
+          TMP=""
+          trap '[[ -n "$TMP" && -f "$TMP" ]] && rm -f "$TMP" || true' EXIT
 
           if [ -n "${ACCOUNTS_JSON_B64:-}" ]; then
-            echo "Decoding ACCOUNTS_JSON_B64"
+            echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
             if printf '%s' "$ACCOUNTS_JSON_B64" | base64 --decode > src/accounts.json 2>/dev/null; then
               echo "Decoded to src/accounts.json"
             else
@@ -88,7 +95,7 @@ jobs:
             RAW="${ACCOUNTS_JSON}"
             case "$RAW" in
               \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
-              '\''*'\'' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
+              \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
             esac
             case "$RAW" in
               [\{[]* )
@@ -101,25 +108,30 @@ jobs:
                   if command -v jq >/dev/null 2>&1; then
                     if jq . "$TMP" >/dev/null 2>&1; then
                       mv "$TMP" src/accounts.json
+                      TMP=""
                       echo "Decoded base64 -> src/accounts.json (validated jq)"
                     else
                       rm -f "$TMP"
+                      TMP=""
                       echo "ERROR: decoded content not valid JSON" >&2
                       exit 1
                     fi
                   else
                     if node -e "try{JSON.parse(require('fs').readFileSync('$TMP','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
                       mv "$TMP" src/accounts.json
+                      TMP=""
                       echo "Decoded base64 -> src/accounts.json (validated node)"
                     else
                       rm -f "$TMP"
+                      TMP=""
                       echo "ERROR: decoded content not valid JSON (node)" >&2
                       exit 1
                     fi
                   fi
                 else
-                  echo "ERROR: ACCOUNTS_JSON not raw JSON and not valid base64" >&2
                   rm -f "$TMP" 2>/dev/null || true
+                  TMP=""
+                  echo "ERROR: ACCOUNTS_JSON not raw JSON and not valid base64" >&2
                   exit 1
                 fi
                 ;;
@@ -137,6 +149,7 @@ jobs:
             fi
           fi
 
+          # Validate JSON without printing contents
           if command -v jq >/dev/null 2>&1; then
             jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
@@ -144,17 +157,23 @@ jobs:
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
           fi
 
+          # copy to dist immediately (build/runtime needs it) and lock permissions
+          cp src/accounts.json dist/accounts.json
+          chmod 600 src/accounts.json dist/accounts.json || true
+          echo "Wrote and locked src/accounts.json and dist/accounts.json (owner-only)."
+
       - name: Propagate slice, mask summary (so build & runtime use the same accounts but we never print secrets)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p dist
           cat > dist/mask_and_copy.js <<'NODE'
           const fs = require('fs');
           const src = 'src/accounts.json';
           if (!fs.existsSync(src)) { console.error('src/accounts.json not found'); process.exit(1); }
           const arr = JSON.parse(fs.readFileSync(src,'utf8') || '[]');
 
-          // copy slice to src for build/runtime
+          // normalize/write back to src (no-op) to ensure consistent formatting
           fs.writeFileSync('src/accounts.json', JSON.stringify(arr, null, 2));
 
           function maskEmail(email){
@@ -168,22 +187,20 @@ jobs:
           }
 
           const summary = arr.map((a, idx) => {
-            // try some common fields for a light identifier
             const email = a.email || a.username || a.user || '';
             const id = a.id || a.name || a.username || null;
             return { index: idx, id: id || null, email: email ? maskEmail(email) : '(no-email)' };
           });
 
-          // Print only counts + masked small summary (no secrets)
           console.log('Assigned account count:', summary.length);
           console.log('Masked accounts (first 10):', JSON.stringify(summary.slice(0,10), null, 2));
 
-          // also write an artifact for audit (masked)
           if (!fs.existsSync('dist')) fs.mkdirSync('dist', { recursive: true });
           fs.writeFileSync('dist/assigned_masked_summary.json', JSON.stringify(summary, null, 2));
           NODE
 
           node dist/mask_and_copy.js
+          chmod 600 dist/assigned_masked_summary.json || true
 
       - name: Upload assigned masked summary for debug
         if: always()
@@ -229,6 +246,7 @@ jobs:
             echo "dist/accounts.json present"
           elif [ -f src/accounts.json ]; then
             cp src/accounts.json dist/accounts.json
+            chmod 600 dist/accounts.json || true
             echo "Copied src/accounts.json -> dist/accounts.json"
           else
             echo "WARNING: src/accounts.json missing — job may fail." >&2
@@ -257,21 +275,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs
+          # run under Xvfb; capture stdout/stderr into logs/script.log
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
             sh -c "stdbuf -oL -eL node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee -a logs/script.log" || true
           ps auxww > logs/ps-auxww.txt || true
           ls -laR > logs/ls-laR.txt || true
-          env > logs/env.raw || true
+          # IMPORTANT: do NOT dump the entire environment to a file (would leak secrets)
+          # env > logs/env.raw || true   <-- removed to prevent secret leakage
 
       - name: Sanitize logs (mask emails, redact tokens & passwords) before upload
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist logs
           cat > dist/sanitize_logs.js <<'NODE'
           const fs = require('fs');
+          const { execSync } = require('child_process');
+
           const logPath = 'logs/script.log';
-          const envPath = 'logs/env.raw';
+          const filesToSanitize = [logPath].filter(p => fs.existsSync(p));
+
           function maskEmailStr(s){
             return s.replace(/([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g, (m, local, domain) => {
               const first = local.slice(0,2);
@@ -280,35 +303,57 @@ jobs:
               return `${first}${middleMask}${last}@${domain}`;
             });
           }
+
           function sanitizeContent(content){
             if(!content) return content;
+            // Truncate extremely long lines (protect against huge tokens)
+            content = content.split('\\n').map(line => line.length > 1000 ? line.slice(0,1000) + '...[TRUNCATED]' : line).join('\\n');
+
             // mask emails
             content = maskEmailStr(content);
-            // redact JSON-style password fields: "password": "..."
-            content = content.replace(/("(?:(?:P|p)assword|pwd|pass)\"?\s*:\s*\")([^"]+)\"/g, '$1***REDACTED***"');
-            // redact password=... or Pass= ...
-            content = content.replace(/(\b(?:(?:P|p)ass(?:word)?|pwd)\b\s*[:=]\s*)([^\\s,;]+)/g, '$1***REDACTED***');
+
+            // redact JSON-style secret fields: "password": "...", "token": "...", "secret": "..."
+            content = content.replace(/("(?:(?:P|p)assword|pwd|pass|token|secret|api[_-]?key|apikey)\"?\\s*:\\s*\")([^"]+)\"/g, '$1***REDACTED***"');
+
+            // redact shell-style assignments like PASSWORD=..., TOKEN=...
+            content = content.replace(/(\\b(?:(?:P|p)ass(?:word)?|pwd|token|secret|api[_-]?key|apikey|auth|key|credential)\\b\\s*[:=]\\s*)([^\\s,;]+)/gi, '$1***REDACTED***');
+
             // redact Authorization Bearer/Basic tokens
-            content = content.replace(/(Authorization[:=]\s*)(Bearer|Basic)?\s*[A-Za-z0-9\-_.=]+/gi, '$1$2 ***REDACTED***');
-            content = content.replace(/(Bearer|Basic)\s+[A-Za-z0-9\-_.=]+/gi, '$1 ***REDACTED***');
-            // redact long base64/blobs
-            content = content.replace(/\b[A-Za-z0-9+\/]{40,}={0,2}\b/g, '***REDACTED_BASE64***');
+            content = content.replace(/(Authorization[:=]?\\s*)(Bearer|Basic)?\\s*[A-Za-z0-9\\-_.=]+/gi, '$1$2 ***REDACTED***');
+
+            // redact long base64/hex/blobs
+            content = content.replace(/\\b[A-Za-z0-9+\\/]{40,}={0,2}\\b/g, '***REDACTED_BASE64***');
+            content = content.replace(/\\b[0-9a-fA-F]{40,}\\b/g, '***REDACTED_HEX***');
+
+            // collapse sequences that look like JWTs
+            content = content.replace(/[A-Za-z0-9-_]{10,}\\.[A-Za-z0-9-_]{10,}\\.[A-Za-z0-9-_]{10,}/g, '***REDACTED_JWT***');
+
             return content;
           }
 
-          if (fs.existsSync(logPath)) {
-            const raw = fs.readFileSync(logPath, 'utf8');
-            fs.writeFileSync(logPath, sanitizeContent(raw), 'utf8');
+          for (const p of filesToSanitize) {
+            try {
+              const raw = fs.readFileSync(p, 'utf8');
+              fs.writeFileSync(p, sanitizeContent(raw), 'utf8');
+            } catch (e) {
+              // ignore read/write errors
+            }
           }
-          if (fs.existsSync(envPath)) {
-            const rawEnv = fs.readFileSync(envPath, 'utf8');
-            fs.writeFileSync(envPath, sanitizeContent(rawEnv), 'utf8');
-          }
-          console.log('Logs sanitized (emails masked, tokens/passwords redacted).');
+
+          // lock down logs and dist to owner-only where possible
+          try { execSync('chmod -R 600 logs || true'); } catch(e) {}
+          try { execSync('chmod -R 600 dist || true'); } catch(e) {}
+
+          // create a sanitized tarball for upload (contains sanitized logs)
+          try { execSync('tar -czf logs-full-sanitized.tar.gz logs || true'); } catch(e) {}
+
+          console.log('Sanitization complete. Files locked to owner-only where possible.');
           NODE
 
           node dist/sanitize_logs.js || true
 
-          # additionally keep existing sanitization fallback (non-destructive)
-          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*")[^\"]*"/\1"***REDACTED***"/Ig' logs/script.log || true
-          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log || true
+          # additional fallback redaction (defensive)
+          sed -E -i 's/("(?:(?:P|p)assword|pwd|pass|token|secret)\"?\\s*:\\s*\")[^\"]+\"/\\1***REDACTED***\"/Ig' logs/script.log || true
+          sed -E -i 's/([Pp]ass(word)?|pwd|token|secret|api[_-]?key|apikey|auth|key|credential)[[:space:]]*[:=][[:space:]]*[^[:space:],;]+/\\1=***REDACTED***/g' logs/script.log || true
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log || true
+          chmod -R 600 logs dist || true
