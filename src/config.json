@@ -166,6 +166,10 @@
     "maxDays": 5
   },
 
+  "humanSkip": {
+    "enabled": false
+  },
+
   "schedule": {
     "enabled": false,
     "useAmPm": false,
