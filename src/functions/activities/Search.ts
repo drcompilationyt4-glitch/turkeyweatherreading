@@ -36,11 +36,11 @@ export class Search extends Workers {
             return
         }
 
-        // Generate search queries (primary: Google Trends)
+        // Generate search queries (probabilistic: 60% LLM -> OpenRouter, 40% original Google Trends)
         const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
-        let googleSearchQueries = await this.getGoogleTrends(geo)
+        let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo)
 
-        // Fallback: if trends failed or insufficient, sample from local queries file
+        // Fallback: if trends/LLM failed or insufficient, sample from local queries file
         if (!googleSearchQueries.length || googleSearchQueries.length < 10) {
             this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Primary trends source insufficient, falling back to local queries.json', 'warn')
             try {
@@ -256,6 +256,131 @@ export class Search extends Workers {
 
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search failed after 5 retries, ending', 'error')
         return await this.bot.browser.func.getSearchPoints()
+    }
+
+    /**
+     * Decide whether to use LLM-based generator (60%) or original Google Trends (40%).
+     * If LLM is chosen but fails, fall back to Google Trends for this run.
+     */
+    private async getSearchQueries(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
+        // 60% chance to attempt LLM generation
+        const useLLM = Math.random() < 0.6
+
+        if (useLLM) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting LLM-based query generation (60% path)')
+            try {
+                const llmResult = await this.generateQueriesWithLLM(geoLocale)
+
+                if (Array.isArray(llmResult) && llmResult.length > 0) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmResult.length} queries`)
+                    return llmResult
+                } else {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM returned empty/invalid result, falling back to Google Trends', 'warn')
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM generation failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
+            }
+
+            // Fall-through: LLM failed or returned invalid -> use original Google Trends for this run
+            try {
+                return await this.getGoogleTrends(geoLocale)
+            } catch (e) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Fallback Google Trends also failed: ' + (e instanceof Error ? e.message : String(e)), 'error')
+                return []
+            }
+        } else {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Using original Google Trends (40% path)')
+            return this.getGoogleTrends(geoLocale)
+        }
+    }
+
+    /**
+     * Use OpenRouter (chat completions) to ask for a JSON array of "university-student-like" search queries.
+     * Expected output: [{ topic: "example topic", related: ["r1","r2", ...] }, ...]
+     *
+     * Requires configuration either in this.bot.config.openRouter.apiKey or process.env.OPENROUTER_API_KEY.
+     * The call is best-effort: if it errors or returns unparsable content we throw so caller can fallback.
+     */
+    private async generateQueriesWithLLM(geoLocale: string): Promise<GoogleSearch[]> {
+        const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
+        const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
+        const apiKey = envKey || cfgKey
+        if (!apiKey) {
+            throw new Error('OpenRouter API key not configured')
+        }
+
+        // Prompt: ask explicitly for pure JSON output
+        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
+- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).
+- "related": an array of 0..6 related searches (short strings).
+
+Return at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`
+
+        const userPrompt = `Generate a diverse list of short search queries a typical university student (undergrad) would use. Include games, course queries (e.g., "econ midterm study guide"), campus services, cheap food spots, debugging/programming help, and popular non-suspicious entertainment. Output only JSON.`
+
+        const body = {
+            model: 'meta-llama/llama-3.3-70b-instruct:free',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            // keep completions small-ish
+            max_tokens: 1200,
+            temperature: 0.7
+        }
+
+        const requestConfig: AxiosRequestConfig = {
+            url: 'https://openrouter.ai/api/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                // Optional hints if you have them in config
+                ...(this.bot.config?.openRouter?.referer ? { 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
+                ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {}),
+            },
+            data: body,
+            timeout: (this.bot.config?.openRouter?.timeoutMs) || 10000
+        }
+
+        // Send request
+        const response = await this.bot.axios.request(requestConfig)
+
+        // Parse response: try common response shapes
+        const choices = response?.data?.choices
+        let content: string | undefined
+
+        if (Array.isArray(choices) && choices.length) {
+            // OpenRouter / chat completions often place message in choices[0].message.content
+            content = choices[0]?.message?.content || choices[0]?.text
+        } else if (typeof response?.data === 'string') {
+            content = response.data
+        } else if (response?.data?.result?.content) {
+            content = response.data.result.content
+        }
+
+        if (!content) throw new Error('No content returned from OpenRouter')
+
+        // Try to parse content as JSON. The model was instructed to return pure JSON.
+        let parsed: any
+        try {
+            parsed = JSON.parse(content)
+        } catch (e) {
+            // Some models wrap JSON in code fences — attempt to strip fences and parse
+            const trimmed = String(content).replace(/```json|```/g, '').trim()
+            parsed = JSON.parse(trimmed)
+        }
+
+        // Validate shape and normalize
+        if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+
+        const normalized: GoogleSearch[] = parsed.map((item: any) => {
+            const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
+            const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
+            return { topic, related }
+        }).filter(x => x.topic && x.topic.length > 1)
+
+        return normalized
     }
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
