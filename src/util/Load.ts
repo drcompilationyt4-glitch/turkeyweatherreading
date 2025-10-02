@@ -3,7 +3,6 @@ import { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
 import fs from 'fs'
 import path from 'path'
 
-
 import { Account } from '../interface/Account'
 import { Config, ConfigSaveFingerprint } from '../interface/Config'
 
@@ -19,14 +18,81 @@ export function loadAccounts(): Account[] {
         }
 
         const accountDir = path.join(__dirname, '../', file)
-        const accounts = fs.readFileSync(accountDir, 'utf-8')
+        const accountsRaw = fs.readFileSync(accountDir, 'utf-8')
 
-        return JSON.parse(accounts)
+        const parsed = JSON.parse(accountsRaw) as Account[]
+
+        // Apply humanSkip logic (may remove one random account based on config)
+        const finalAccounts = applyHumanSkip(parsed)
+
+        console.log(`[DEBUG] Loaded ${finalAccounts.length} account(s) (source=${file})`)
+        return finalAccounts
     } catch (error) {
-        throw new Error(error as string)
+        // preserve stack if it's an Error
+        if (error instanceof Error) {
+            throw error
+        }
+        throw new Error(String(error))
     }
 }
 
+/**
+ * Reads config and — if humanSkip.enabled is true — performs a probability roll
+ * to possibly remove a single random account.
+ *
+ * Config shape supported:
+ * "humanSkip": {
+ *   "enabled": true,
+ *   "percentage": 15
+ * }
+ *
+ * Or:
+ * "humanSkip": {
+ *   "enabled": true,
+ *   "probability": 15
+ * }
+ */
+function applyHumanSkip(accounts: Account[]): Account[] {
+    try {
+        if (!accounts || accounts.length === 0) return accounts
+
+        // load config (will use cached config if already loaded)
+        const cfg = loadConfig()
+
+        const hs = (cfg && (cfg as any).humanSkip) ?? null
+        if (!hs || !hs.enabled) {
+            console.log('[DEBUG] humanSkip disabled or not configured; returning all accounts')
+            return accounts
+        }
+
+        // Determine percentage (default 15)
+        let percentage = Number(hs.percentage ?? hs.probability ?? 15)
+        if (Number.isNaN(percentage)) percentage = 15
+        percentage = Math.max(0, Math.min(100, Math.floor(percentage)))
+
+        const roll = Math.random() * 100
+        console.log(`[DEBUG] humanSkip enabled: percentage=${percentage} roll=${roll.toFixed(2)}`)
+
+        if (roll < percentage) {
+            // remove a single random account
+            const idx = Math.floor(Math.random() * accounts.length)
+            const removed = accounts.splice(idx, 1)
+            console.log(`[INFO] humanSkip triggered: removed 1 account at index ${idx}`)
+
+            // Optionally log identifying info if available
+            const id = (removed[0] as any)?.email ?? (removed[0] as any)?.username ?? `index:${idx}`
+            console.log(`[INFO] Removed account identifier: ${id}`)
+        } else {
+            console.log('[INFO] humanSkip not triggered; all accounts kept')
+        }
+
+        return accounts
+    } catch (err) {
+        console.error('[ERROR] applyHumanSkip failed:', err)
+        // On failure, be conservative and return original accounts
+        return accounts
+    }
+}
 
 export function loadConfig(): Config {
     try {
