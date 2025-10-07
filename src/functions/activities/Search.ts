@@ -1,5 +1,6 @@
 import { Page } from 'rebrowser-playwright'
 import { platform } from 'os'
+import https from 'https'
 
 import { Workers } from '../Workers'
 
@@ -298,8 +299,8 @@ export class Search extends Workers {
      * Use OpenRouter (chat completions) to ask for a JSON array of "university-student-like" search queries.
      * Expected output: [{ topic: "example topic", related: ["r1","r2", ...] }, ...]
      *
-     * Requires configuration either in this.bot.config.openRouter.apiKey or process.env.OPENROUTER_API_KEY.
-     * The call is best-effort: if it errors or returns unparsable content we throw so caller can fallback.
+     * IMPORTANT: This implementation uses native `https.request` with `agent: false` to bypass any
+     * axios/global proxy or agent configuration. Behaves like previous function in terms of parsing and errors.
      */
     private async generateQueriesWithLLM(geoLocale: string): Promise<GoogleSearch[]> {
         const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
@@ -310,11 +311,7 @@ export class Search extends Workers {
         }
 
         // Prompt: ask explicitly for pure JSON output
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
-- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).
-- "related": an array of 0..6 related searches (short strings).
-
-Return at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`
+        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:\n- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).\n- "related": an array of 0..6 related searches (short strings).\n\nReturn at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`
 
         const userPrompt = `Generate a diverse list of short search queries a typical university student (undergrad) would use. Include games, course queries (e.g., "econ midterm study guide"), campus services, cheap food spots, debugging/programming help, and popular non-suspicious entertainment. Output only JSON.`
 
@@ -329,37 +326,85 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
             temperature: 0.7
         }
 
-        const requestConfig: AxiosRequestConfig = {
-            url: 'https://openrouter.ai/api/v1/chat/completions',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-                // Optional hints if you have them in config
-                ...(this.bot.config?.openRouter?.referer ? { 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
-                ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {}),
-            },
-            data: body,
-            timeout: (this.bot.config?.openRouter?.timeoutMs) || 10000
+        const url = new URL('https://openrouter.ai/api/v1/chat/completions')
+        const payload = JSON.stringify(body)
+
+        // Timeout in ms
+        const timeoutMs = (this.bot.config?.openRouter?.timeoutMs) || 10000
+
+        // Build headers
+        const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload).toString(),
+            'Authorization': `Bearer ${apiKey}`,
+            ...(this.bot.config?.openRouter?.referer ? { 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
+            ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {}),
         }
 
-        // Send request
-        const response = await this.bot.axios.request(requestConfig)
+        // Do the request with native https so we bypass axios and any axios/global proxy settings
+        let rawResponse: string
+        try {
+            rawResponse = await new Promise<string>((resolve, reject) => {
+                const req = https.request({
+                    hostname: url.hostname,
+                    port: url.port || 443,
+                    path: url.pathname + url.search,
+                    method: 'POST',
+                    headers,
+                    // explicit: do not use an agent (no proxy/pooling)
+                    agent: false as any
+                }, (res) => {
+                    let data = ''
+                    res.on('data', (chunk) => { data += chunk })
+                    res.on('end', () => {
+                        resolve(data)
+                    })
+                })
 
-        // Parse response: try common response shapes
-        const choices = response?.data?.choices
+                req.on('error', (err) => {
+                    reject(err)
+                })
+
+                req.setTimeout(timeoutMs, () => {
+                    req.destroy(new Error('OpenRouter request timeout'))
+                })
+
+                req.write(payload)
+                req.end()
+            })
+        } catch (err) {
+            const status = (err as any)?.status
+            const details = (err as Error).message || JSON.stringify(err || {})
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${status || ''} ${details}`, 'error')
+            throw err
+        }
+
+        // The rest follows your original parsing logic (try multiple shapes)
+        let responseData: any
+        try {
+            responseData = JSON.parse(rawResponse)
+        } catch {
+            // keep as string if not JSON (later parsing can handle)
+            responseData = rawResponse
+        }
+
+        const choices = responseData?.choices
         let content: string | undefined
 
         if (Array.isArray(choices) && choices.length) {
-            // OpenRouter / chat completions often place message in choices[0].message.content
             content = choices[0]?.message?.content || choices[0]?.text
-        } else if (typeof response?.data === 'string') {
-            content = response.data
-        } else if (response?.data?.result?.content) {
-            content = response.data.result.content
+        } else if (typeof responseData === 'string') {
+            content = responseData
+        } else if (responseData?.result?.content) {
+            content = responseData.result.content
+        } else if (responseData?.output_text) {
+            content = responseData.output_text
         }
 
-        if (!content) throw new Error('No content returned from OpenRouter')
+        if (!content) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'No content returned from OpenRouter', 'error')
+            throw new Error('No content returned from OpenRouter')
+        }
 
         // Try to parse content as JSON. The model was instructed to return pure JSON.
         let parsed: any
@@ -368,7 +413,12 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
         } catch (e) {
             // Some models wrap JSON in code fences — attempt to strip fences and parse
             const trimmed = String(content).replace(/```json|```/g, '').trim()
-            parsed = JSON.parse(trimmed)
+            try {
+                parsed = JSON.parse(trimmed)
+            } catch (e2) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Failed to parse LLM JSON output', 'error')
+                throw new Error('Failed to parse LLM JSON output')
+            }
         }
 
         // Validate shape and normalize
