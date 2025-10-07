@@ -79,7 +79,7 @@ export class SearchOnBing extends Workers {
      * Flow:
      *  - If config.searchOnBingLocalQueries is true, read local queries.json.
      *  - Otherwise attempt to fetch the repository raw queries.json.
-     *  - If not found, optionally call OpenRouter for a generated query and optionally cache it.
+     *  - If not found, attempt the LLM (OpenRouter) fallback when an API key exists (runs even if enableOpenRouterForQueries is false).
      */
     private async getSearchQuery(title: string): Promise<string> {
         // Human-like delay before fetching query (0.5-1.5s)
@@ -96,7 +96,14 @@ export class SearchOnBing extends Workers {
             if (this.bot.config && this.bot.config.searchOnBingLocalQueries) {
                 // Read local queries.json shipped with the code
                 const data = fs.readFileSync(path.join(__dirname, '../queries.json'), 'utf8')
-                queries = JSON.parse(data)
+                try {
+                    const parsed = JSON.parse(data)
+                    if (Array.isArray(parsed)) queries = parsed
+                    else queries = []
+                } catch (err) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'Failed to parse local queries.json: ' + String(err), 'warn')
+                    queries = []
+                }
             } else {
                 // Fetch from GitHub raw so users don't need to pull updates manually
                 // small human-like delay before web request
@@ -108,28 +115,47 @@ export class SearchOnBing extends Workers {
                     timeout: 8000
                 }).catch(() => ({ data: null }))
 
-                if (response && response.data) {
-                    queries = response.data
+                let remoteData: any = response && response.data ? response.data : null
+
+                // The raw response can be a string (JSON string) or already an object.
+                if (typeof remoteData === 'string') {
+                    try {
+                        remoteData = JSON.parse(remoteData)
+                    } catch (parseErr) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'Failed to JSON.parse remote queries.json; falling back to empty array', 'warn')
+                        remoteData = null
+                    }
+                }
+
+                if (Array.isArray(remoteData)) {
+                    queries = remoteData
+                } else if (remoteData && typeof remoteData === 'object') {
+                    // Some repos may wrap the array; try common keys
+                    if (Array.isArray((remoteData as any).queries)) queries = (remoteData as any).queries
+                    else if (Array.isArray((remoteData as any).default)) queries = (remoteData as any).default
+                    else queries = []
                 } else {
                     queries = []
                 }
             }
 
             // Try to find an exact / normalized match
-            const answers = queries.find(x => this.normalizeString(x.title) === this.normalizeString(title))
+            const answers = Array.isArray(queries) ? queries.find(x => this.normalizeString(x.title) === this.normalizeString(title)) : undefined
             if (answers && Array.isArray(answers.queries) && answers.queries.length > 0) {
                 const answer = this.bot.utils.shuffleArray(answers.queries)[0] as string
                 this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Found local/remote answer: ${answer} | question: ${title}`)
                 return answer
             }
 
-            // No pre-defined query found -> optionally ask LLM (OpenRouter) if configured
-            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `No local/remote query found for: ${title}. Attempting LLM fallback if configured...`)
+            // No pre-defined query found -> attempt LLM fallback when an API key exists. This now runs regardless of enableOpenRouterForQueries flag.
+            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `No local/remote query found for: ${title}. Attempting LLM fallback if API key present...`)
 
-            // Only call LLM if enabled in config (defensive)
-            const allowLLM = !!(this.bot.config && this.bot.config.enableOpenRouterForQueries)
-            if (allowLLM) {
-                const llmQuery = await this.callOpenRouterForQuery(title)
+            const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
+            const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
+            const apiKey = envKey || cfgKey
+
+            if (apiKey) {
+                const llmQuery = await this.callOpenRouterForQuery(title, apiKey)
                 if (llmQuery) {
                     this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `LLM answer: ${llmQuery} | question: ${title}`)
 
@@ -154,7 +180,7 @@ export class SearchOnBing extends Workers {
                     this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'LLM fallback failed or returned empty', 'warn')
                 }
             } else {
-                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'LLM fallback disabled by configuration', 'log')
+                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'No OpenRouter API key found (process.env.OPENROUTER_API_KEY or bot.config.openRouterApiKey). Skipping LLM fallback.', 'log')
             }
 
             // Final fallback: use the title itself as the query
@@ -168,20 +194,21 @@ export class SearchOnBing extends Workers {
     }
 
     private normalizeString(input: string): string {
-        return input.normalize('NFD').trim().toLowerCase().replace(/[^\x20-\x7E]/g, '').replace(/[?!]/g, '')
+        return input.normalize('NFD').trim().toLowerCase().replace(/[^         return input.normalize('NFD').trim().toLowerCase().replace(/[^\x20-\x7E]/g, '').replace(/[?!]/g, '')
     }
 
     /**
      * Calls OpenRouter's chat completions endpoint to generate a short query.
      * Reads API key from environment variable OPENROUTER_API_KEY or from bot.config.openRouterApiKey.
-     * This is optional and only used when bot.config.enableOpenRouterForQueries is true.
+     * This will be attempted whenever an API key exists (see getSearchQuery).
+     * NOTE: request is sent with `proxy: false` to bypass any axios-level proxy settings.
      */
-    private async callOpenRouterForQuery(title: string): Promise<string | null> {
+    private async callOpenRouterForQuery(title: string, providedApiKey?: string): Promise<string | null> {
         try {
             // small delay to appear human-like
             await this.bot.utils.wait(this.bot.utils.randomNumber(300, 800))
 
-            const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
+            const envKey = providedApiKey || (process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined)
             const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
             const apiKey = envKey || cfgKey
 
@@ -212,6 +239,7 @@ export class SearchOnBing extends Workers {
                 payload.zdr = true
             }
 
+            // Force bypass of proxy by setting proxy: false on this request. This overrides axios proxy behavior
             const resp = await this.bot.axios.request({
                 method: 'POST',
                 url: 'https://openrouter.ai/api/v1/chat/completions',
@@ -220,7 +248,8 @@ export class SearchOnBing extends Workers {
                     'Content-Type': 'application/json'
                 },
                 data: payload,
-                timeout: 15000
+                timeout: 15000,
+                proxy: false
             })
 
             let llmText: string | undefined
