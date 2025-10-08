@@ -599,7 +599,7 @@ export class MicrosoftRewardsBot {
             this.currentAccountEmail = account.email
             this.currentAccountRecoveryEmail = account.recoveryEmail
             rlog('main', 'MAIN-WORKER', `Preparing tasks for account ${account.email}`)
-            // Reset per-account mobile retry counter (kept for compatibility; mobile disabled)
+            // Reset per-account mobile retry counter
             this.mobileRetryAttempts = 0
             // Random pre-start delay
             const preDelay = randomInt(startMin, startMax)
@@ -612,7 +612,6 @@ export class MicrosoftRewardsBot {
             this.axios = new Axios(account.proxy)
             const accountStart = Date.now()
             let desktopInitial = 0
-            // mobileInitial/mobileCollected kept but will remain 0 because mobile flow is disabled
             let mobileInitial = 0
             let desktopCollected = 0
             let mobileCollected = 0
@@ -629,14 +628,13 @@ export class MicrosoftRewardsBot {
 
             try {
                 if (this.config.parallel) {
-                    // PARALLEL MODE: Mobile flow has been intentionally DISABLED (commented out).
-                    // We run Desktop only in parallel configuration to avoid mobile login/actions.
+                    // Run Desktop and Mobile in parallel but isolate failures so one side can't abort the other
                     const desktopPromise = (async () => {
                         try {
                             const desktopResult = await this.DesktopWithSmallDelay(account, perAccountPageDelay)
                             return desktopResult
                         } catch (err) {
-                            rlog(false, 'PARALLEL', `Desktop error for ${account.email}: ${err}`, 'error')
+                            rlog(this.isMobile, 'PARALLEL', `Desktop error for ${account.email}: ${err}`, 'error')
                             const bd = detectBanReason(err)
                             if (bd.status) {
                                 banned.status = true; banned.reason = bd.reason.substring(0,200)
@@ -646,19 +644,46 @@ export class MicrosoftRewardsBot {
                             return null
                         }
                     })()
-
-                    // Await only the desktop result (mobile intentionally removed/commented)
-                    const desktopResult = await desktopPromise
-                    if (desktopResult) {
-                        desktopInitial = desktopResult.initialPoints || 0
-                        desktopCollected = desktopResult.collectedPoints || 0
-                    }
-
-                    // NOTE: previously mobilePromise ran here in parallel. Mobile login & tasks are commented out.
-                    // If you want to re-enable mobile, reintroduce the mobilePromise block that creates a
-                    // MicrosoftRewardsBot(true) instance and calls MobileWithSmallDelay(account, perAccountPageDelay).
+                    const mobilePromise = (async () => {
+                        try {
+                            const mobileInstance = new MicrosoftRewardsBot(true)
+                            // reuse axios/proxy for mobile instance
+                            mobileInstance.axios = this.axios
+                            // ensure config/accounts available
+                            mobileInstance.config = this.config
+                            mobileInstance.utils = this.utils
+                            // initialize minimal things needed by Mobile (constructor did most)
+                            const mobileResult = await mobileInstance.MobileWithSmallDelay(account, perAccountPageDelay)
+                            return mobileResult
+                        } catch (err) {
+                            rlog(this.isMobile, 'PARALLEL', `Mobile error for ${account.email}: ${err}`, 'error')
+                            const bd = detectBanReason(err)
+                            if (bd.status) {
+                                banned.status = true; banned.reason = bd.reason.substring(0,200)
+                                void this.handleImmediateBanAlert(account.email, banned.reason)
+                            }
+                            errors.push(formatFullErr('mobile', err))
+                            return null
+                        }
+                    })()
+                    const settled = await Promise.allSettled([desktopPromise, mobilePromise])
+                    // Log summary for visibility (but don't throw)
+                    settled.forEach((res, idx) => {
+                        if (res.status === 'fulfilled') {
+                            const r = res.value
+                            if (idx === 0 && r) {
+                                desktopInitial = r.initialPoints || 0
+                                desktopCollected = r.collectedPoints || 0
+                            } else if (idx === 1 && r) {
+                                mobileInitial = r.initialPoints || 0
+                                mobileCollected = r.collectedPoints || 0
+                            }
+                        } else {
+                            rlog(this.isMobile, 'PARALLEL', `Task ${idx === 0 ? 'Desktop' : 'Mobile'} rejected unexpectedly for ${account.email}: ${res.reason}`, 'warn')
+                        }
+                    })
                 } else {
-                    // SEQUENTIAL MODE — run Desktop then SKIP Mobile (mobile disabled)
+                    // Sequential mode — run Desktop then Mobile, both wrapped individually
                     try {
                         this.isMobile = false
                         const desktopResult = await this.DesktopWithSmallDelay(account, perAccountPageDelay)
@@ -675,10 +700,28 @@ export class MicrosoftRewardsBot {
                         }
                         errors.push(formatFullErr('desktop', err))
                     }
-
-                    // === MOBILE FLOW DISABLED ===
-                    rlog('main', 'MAIN-WORKER', `Mobile flow DISABLED by configuration. Skipping mobile tasks for ${account.email}`, 'warn')
-                    // If you want to re-enable mobile, restore the MobileWithSmallDelay call here.
+                    // If banned or compromised detected, skip mobile to save time
+                    if (!banned.status && !this.compromisedModeActive) {
+                        try {
+                            this.isMobile = true
+                            const mobileResult = await this.MobileWithSmallDelay(account, perAccountPageDelay)
+                            if (mobileResult) {
+                                mobileInitial = mobileResult.initialPoints
+                                mobileCollected = mobileResult.collectedPoints
+                            }
+                        } catch (err) {
+                            rlog(this.isMobile, 'SEQUENTIAL', `Mobile failed for ${account.email}: ${err}`, 'error')
+                            const bd = detectBanReason(err)
+                            if (bd.status) {
+                                banned.status = true; banned.reason = bd.reason.substring(0,200)
+                                void this.handleImmediateBanAlert(account.email, banned.reason)
+                            }
+                            errors.push(formatFullErr('mobile', err))
+                        }
+                    } else {
+                        const why = banned.status ? 'banned status' : 'compromised status'
+                        rlog(this.isMobile, 'MAIN', `Skipping mobile flow for ${account.email} due to ${why}`, 'warn')
+                    }
                 }
                 rlog('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green')
             } catch (err) {
@@ -698,6 +741,8 @@ export class MicrosoftRewardsBot {
 
             // Correct initial points (previous version double counted desktop+mobile baselines)
             // Strategy: pick the lowest non-zero baseline (desktopInitial or mobileInitial) as true start.
+            // Sequential flow: desktopInitial < mobileInitial after gain -> min = original baseline.
+            // Parallel flow: both baselines equal -> min is fine.
             const baselines: number[] = []
             if (desktopInitial) baselines.push(desktopInitial)
             if (mobileInitial) baselines.push(mobileInitial)
@@ -741,16 +786,27 @@ export class MicrosoftRewardsBot {
                 rlog('main', 'MAIN-RETRY', `Retrying account ${acc.email}`)
                 try {
                     if (this.config.parallel) {
-                        // PARALLEL RETRY: only desktop retry is executed (mobile retry disabled)
                         const desktopPromise = (async () => {
                             try {
                                 return await this.DesktopWithSmallDelay(acc, perAccountPageDelay)
                             } catch (err) {
-                                rlog(false, 'RETRY', `Desktop retry error for ${acc.email}: ${err}`, 'warn')
+                                rlog(this.isMobile, 'RETRY', `Desktop retry error for ${acc.email}: ${err}`, 'warn')
                                 return null
                             }
                         })()
-                        await Promise.allSettled([desktopPromise])
+                        const mobilePromise = (async () => {
+                            try {
+                                const mobileInstance = new MicrosoftRewardsBot(true)
+                                mobileInstance.axios = this.axios
+                                mobileInstance.config = this.config
+                                mobileInstance.utils = this.utils
+                                return await mobileInstance.MobileWithSmallDelay(acc, perAccountPageDelay)
+                            } catch (err) {
+                                rlog(this.isMobile, 'RETRY', `Mobile retry error for ${acc.email}: ${err}`, 'warn')
+                                return null
+                            }
+                        })()
+                        await Promise.allSettled([desktopPromise, mobilePromise])
                     } else {
                         try {
                             this.isMobile = false
@@ -758,8 +814,12 @@ export class MicrosoftRewardsBot {
                         } catch (err) {
                             rlog(this.isMobile, 'MAIN-RETRY', `Desktop retry failed for ${acc.email}: ${err}`, 'warn')
                         }
-                        // Mobile retry intentionally skipped
-                        rlog('main', 'MAIN-RETRY', `Mobile retry DISABLED. Skipping mobile retry for ${acc.email}`, 'warn')
+                        try {
+                            this.isMobile = true
+                            await this.MobileWithSmallDelay(acc, perAccountPageDelay)
+                        } catch (err) {
+                            rlog(this.isMobile, 'MAIN-RETRY', `Mobile retry failed for ${acc.email}: ${err}`, 'warn')
+                        }
                     }
                 } catch (err) {
                     rlog('main', 'MAIN-RETRY', `Retry failed for ${acc.email}: ${err}`, 'warn')
@@ -821,16 +881,16 @@ export class MicrosoftRewardsBot {
         return result
     }
 
-    // private async MobileWithSmallDelay(account: Account, pageDelayMs: number): Promise<{ initialPoints: number; collectedPoints: number }> {
-    //     if (pageDelayMs && pageDelayMs > 0) {
-    //         await (this.utils && (this.utils as any).wait ? (this.utils as any).wait(pageDelayMs) : sleep(pageDelayMs))
-    //     }
-    //     const result = await this.Mobile(account)
-    //     if (pageDelayMs && pageDelayMs > 0) {
-    //         await (this.utils && (this.utils as any).wait ? (this.utils as any).wait(pageDelayMs) : sleep(pageDelayMs))
-    //     }
-    //     return result
-    // }
+    private async MobileWithSmallDelay(account: Account, pageDelayMs: number): Promise<{ initialPoints: number; collectedPoints: number }> {
+        if (pageDelayMs && pageDelayMs > 0) {
+            await (this.utils && (this.utils as any).wait ? (this.utils as any).wait(pageDelayMs) : sleep(pageDelayMs))
+        }
+        const result = await this.Mobile(account)
+        if (pageDelayMs && pageDelayMs > 0) {
+            await (this.utils && (this.utils as any).wait ? (this.utils as any).wait(pageDelayMs) : sleep(pageDelayMs))
+        }
+        return result
+    }
 
     // Desktop
 // Assumes sleep(ms) exists and this.utils.wait(ms) may exist.
@@ -851,7 +911,7 @@ export class MicrosoftRewardsBot {
             if (typeof this.browser.func.goHome === 'function') {
                 await this.browser.func.goHome(this.homePage);
             } else {
-                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 200});
+                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000});
             }
 
             // Fast checks (2s timeout) to ensure page isn't completely blank
@@ -921,7 +981,7 @@ export class MicrosoftRewardsBot {
             if (typeof this.browser.func.goHome === 'function') {
                 await this.browser.func.goHome(workerPage);
             } else {
-                await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 200});
+                await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
             }
             await workerPage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
             await workerPage.waitForFunction(() => document.readyState === 'complete', { timeout: 100 }).catch(() => {});
@@ -976,7 +1036,7 @@ export class MicrosoftRewardsBot {
             if (typeof this.browser.func.goHome === 'function') {
                 await this.browser.func.goHome(this.homePage);
             } else {
-                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 200 });
+                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000  });
             }
             await this.homePage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
             await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 300 }).catch(() => {});
@@ -1041,7 +1101,7 @@ export class MicrosoftRewardsBot {
                     if (typeof this.browser.func.goHome === 'function') {
                         await this.browser.func.goHome(this.homePage);
                     } else {
-                        await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 200});
+                        await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
                     }
                     await this.homePage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
                     await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 100 }).catch(() => {});
@@ -1124,7 +1184,7 @@ export class MicrosoftRewardsBot {
                     if (typeof this.browser.func.goHome === 'function') {
                         await this.browser.func.goHome(workerPage);
                     } else {
-                        await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 200});
+                        await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
                     }
                     await workerPage.waitForLoadState('domcontentloaded', { timeout: 200}).catch(() => {});
                     await workerPage.waitForFunction(() => document.readyState === 'complete', { timeout: 200}).catch(() => {});

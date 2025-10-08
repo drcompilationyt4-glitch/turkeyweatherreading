@@ -2,8 +2,8 @@
   "baseURL": "https://rewards.bing.com",
   "sessionPath": "sessions",
 
-  "headless": true,
-  "globalTimeout": "30s",
+  "headless": false,
+  "globalTimeout": "100s",
   "parallel": false,
   "runOnZeroPoints": false,
   "clusters": 3,
@@ -15,8 +15,8 @@
   },
 
   "browser": {
-    "headless": true,
-    "globalTimeout": "30s"
+    "headless": false,
+    "globalTimeout": "100s"
   },
 
   "execution": {

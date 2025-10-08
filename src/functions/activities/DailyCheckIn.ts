@@ -18,7 +18,7 @@ export class DailyCheckIn extends Workers {
     private static readonly DEFAULT_MAX_DELAY_MS = 2200
     private static readonly DEFAULT_RETRIES = 3
     private static readonly DEFAULT_BASE_BACKOFF_MS = 800
-    private static readonly DEFAULT_AXIOS_TIMEOUT_MS = 15000
+    private static readonly DEFAULT_AXIOS_TIMEOUT_MS = 180000
 
     /**
      * Main API claim method — preserved logic but more defensive.
@@ -193,7 +193,7 @@ export class DailyCheckIn extends Workers {
         // quick presence pre-check (fast, small timeout)
         let foundAny = false
         for (const sel of candidates) {
-            const ok = await page.waitForSelector(sel, { state: 'attached', timeout: 700 }).then(() => true).catch(() => false)
+            const ok = await page.waitForSelector(sel, { state: 'attached', timeout: 50000 }).then(() => true).catch(() => false)
             if (ok) { foundAny = true; break }
         }
         if (!foundAny) {
@@ -213,7 +213,7 @@ export class DailyCheckIn extends Workers {
                     if (typeof handle.scrollIntoViewIfNeeded === 'function') {
                         // some Playwright versions expose this on elementHandle
                         // @ts-ignore
-                        await handle.scrollIntoViewIfNeeded({ timeout: 1000 })
+                        await handle.scrollIntoViewIfNeeded({ timeout: 10000 })
                     } else {
                         // fallback to page.evaluate scrollIntoView
                         await page.evaluate((s) => {
@@ -282,15 +282,15 @@ export class DailyCheckIn extends Workers {
                 // prepare popup/nav detection before click
                 let popupPromise: Promise<Page | null> | null = null
                 try {
-                    if (context) popupPromise = context.waitForEvent('page', { timeout: 1200 }).catch(() => null)
+                    if (context) popupPromise = context.waitForEvent('page', { timeout: 30000 }).catch(() => null)
                 } catch { popupPromise = null }
 
-                const navPromise = page.waitForNavigation({ timeout: 1200 }).catch(() => null)
+                const navPromise = page.waitForNavigation({ timeout: 30000 }).catch(() => null)
 
                 // attempt native click first (short timeout)
                 let clicked = false
                 try {
-                    await page.click(sel, { timeout: 5000 })
+                    await page.click(sel, { timeout: 30000 })
                     clicked = true
                 } catch (clickErr) {
                     this.bot.log(this.bot.isMobile, 'DAILY-CHECK-IN', `DailySet: native click failed for "${sel}" (attempt ${attempt}), trying DOM click fallback`, 'warn')
@@ -320,7 +320,7 @@ export class DailyCheckIn extends Workers {
                 const navResult = await navPromise
 
                 if (popup) {
-                    try { await popup.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null) } catch { /* ignore */ }
+                    try { await popup.waitForLoadState('domcontentloaded', { timeout: 120000 }).catch(() => null) } catch { /* ignore */ }
                     this.bot.log(this.bot.isMobile, 'DAILY-CHECK-IN', `DailySet: clicked selector "${sel}" and opened popup`, 'log')
                     return { success: true, popup }
                 }

@@ -32,7 +32,7 @@ export class SearchOnBing extends Workers {
             const searchBar = '#sb_form_q'
             // prefer locator + attached state for robustness
             const box = page.locator(searchBar)
-            await box.waitFor({ state: 'attached', timeout: 15000 }).catch(() => {
+            await box.waitFor({ state: 'attached', timeout: 50000 }).catch(() => {
                 // If the search bar never attached, we'll try direct navigation fallback below
             })
 
@@ -43,7 +43,7 @@ export class SearchOnBing extends Workers {
                 await this.bot.utils.wait(200)
 
                 // Focus / fill / type aggressively but human-like
-                await box.focus({ timeout: 2000 }).catch(() => { /* ignore focus errors */ })
+                await box.focus({ timeout: 60000 }).catch(() => { /* ignore focus errors */ })
                 await box.fill('')
                 await this.bot.utils.wait(200)
                 // Type with a slight delay between keystrokes to appear human

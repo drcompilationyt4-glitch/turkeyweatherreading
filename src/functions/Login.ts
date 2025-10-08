@@ -148,7 +148,9 @@ export class Login {
             this.currentTotpSecret = (totpSecret && totpSecret.trim()) || undefined;
 
             // Navigate to the Bing login page
-            await page.goto('https://rewards.bing.com/signin')
+            await page.goto('https://rewards.bing.com/signin', {
+                timeout: 120000, // 2 minutes (in milliseconds)
+            })
 
             // Disable FIDO support in login request
             await page.route('**/GetCredentialType.srf*', (route) => {
@@ -165,7 +167,7 @@ export class Login {
             // Check if account is locked
             await this.checkAccountLocked(page)
 
-            const isLoggedIn = await page.waitForSelector('html[data-role-name="RewardsPortal"]', { timeout: 10000 }).then(() => true).catch(() => false)
+            const isLoggedIn = await page.waitForSelector('html[data-role-name="RewardsPortal"]', { timeout: 120000 }).then(() => true).catch(() => false)
 
             if (!isLoggedIn) {
                 const execResult = await this.execLogin(page, email, password)
@@ -236,7 +238,7 @@ export class Login {
 
                 // On every attempt, navigate to the sign-in page to ensure a fresh start
                 try {
-                    await currentPage.goto('https://rewards.bing.com/signin', { waitUntil: 'domcontentloaded' })
+                    await currentPage.goto('https://rewards.bing.com/signin', { waitUntil: 'domcontentloaded', timeout: 120000 })
                     await this.bot.utils.wait(1000)
                     await this.bot.browser.utils.reloadBadPage(currentPage)
                 } catch (err) {
@@ -274,7 +276,7 @@ export class Login {
                         try {
                             const context = currentPage.context()
                             const newPage: Page = await (context as any).newPage()
-                            await newPage.goto('https://rewards.bing.com', { waitUntil: 'domcontentloaded' })
+                            await newPage.goto('https://rewards.bing.com', { waitUntil: 'domcontentloaded',timeout: 120000 })
                             await this.bot.utils.wait(1500)
 
                             // WAIT: ensure previous page/context settles before closing the old page.
@@ -420,7 +422,7 @@ export class Login {
         const emailInputSelector = 'input[type="email"]'
 
         try {
-            const emailField = await page.waitForSelector(emailInputSelector, { state: 'visible', timeout: 7000 }).catch(() => null)
+            const emailField = await page.waitForSelector(emailInputSelector, { state: 'visible', timeout: 120000 }).catch(() => null)
             if (!emailField) {
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'Email field not found', 'warn')
                 return
@@ -428,7 +430,7 @@ export class Login {
 
             await this.bot.utils.wait(800)
 
-            const emailPrefilled = await page.waitForSelector('#userDisplayName', { timeout: 3000 }).catch(() => null)
+            const emailPrefilled = await page.waitForSelector('#userDisplayName', { timeout: 120000 }).catch(() => null)
             if (emailPrefilled) {
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'Email already prefilled by Microsoft')
             } else {
@@ -438,7 +440,7 @@ export class Login {
                 await this.bot.utils.wait(800)
             }
 
-            const nextButton = await page.waitForSelector('button[type="submit"]', { timeout: 6000 }).catch(() => null)
+            const nextButton = await page.waitForSelector('button[type="submit"]', { timeout: 120000 }).catch(() => null)
             if (nextButton) {
                 await nextButton.click()
                 await this.bot.utils.wait(2000)
@@ -470,7 +472,7 @@ export class Login {
         ]
 
         try {
-            const skip2FAButton = await page.waitForSelector(skip2FASelector, { timeout: 2000 }).catch(() => null)
+            const skip2FAButton = await page.waitForSelector(skip2FASelector, { timeout: 120000 }).catch(() => null)
             if (skip2FAButton) {
                 await skip2FAButton.click()
                 await this.bot.utils.wait(1200)
@@ -482,7 +484,7 @@ export class Login {
             await this.bot.utils.wait(800)
 
             // FIRST attempt: look directly for password input and fill if present
-            const passwordField = await page.waitForSelector(passwordInputSelector, { state: 'visible', timeout: 4000 }).catch(() => null)
+            const passwordField = await page.waitForSelector(passwordInputSelector, { state: 'visible', timeout: 120000 }).catch(() => null)
             if (passwordField) {
                 await this.bot.utils.wait(700)
                 await page.fill(passwordInputSelector, '')
@@ -564,7 +566,7 @@ export class Login {
             if (passwordOptionClicked) {
                 // give the UI a short moment to render the password input
                 await this.bot.utils.wait(600)
-                const pwdFieldAfterClick = await page.waitForSelector(passwordInputSelector, { state: 'visible', timeout: 4000 }).catch(() => null)
+                const pwdFieldAfterClick = await page.waitForSelector(passwordInputSelector, { state: 'visible', timeout: 120000 }).catch(() => null)
                 if (pwdFieldAfterClick) {
                     await this.bot.utils.wait(400)
                     await page.fill(passwordInputSelector, '')
@@ -572,7 +574,7 @@ export class Login {
                     await page.fill(passwordInputSelector, password)
                     await this.bot.utils.wait(400)
 
-                    const nextButton2 = await page.waitForSelector('button[type="submit"]', { timeout: 4000 }).catch(() => null)
+                    const nextButton2 = await page.waitForSelector('button[type="submit"]', { timeout: 120000 }).catch(() => null)
                     if (nextButton2) {
                         await nextButton2.click()
                         await this.bot.utils.wait(1800)
@@ -635,7 +637,7 @@ export class Login {
                 let sendClicked = false
                 for (const sel of sendSelectors) {
                     try {
-                        const btn = await page.waitForSelector(sel, { timeout: 1500 }).catch(() => null)
+                        const btn = await page.waitForSelector(sel, { timeout: 120000 }).catch(() => null)
                         if (btn) {
                             await btn.click().catch(() => { })
                             sendClicked = true
@@ -810,7 +812,7 @@ export class Login {
                             const digit: string = code.charAt(i)
                             const input = inputs.nth(i)
                             try {
-                                await input.click({ timeout: 500 }).catch(() => { })
+                                await input.click({ timeout: 120000 }).catch(() => { })
                                 await input.fill(digit).catch(async () => {
                                     await input.type(digit, { delay: 80 }).catch(() => { })
                                 })
@@ -869,7 +871,7 @@ export class Login {
 
         for (const sel of selectors) {
             try {
-                const el = await page.waitForSelector(sel, { state: 'visible', timeout: 5000 }).catch(() => null)
+                const el = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
                 if (el) {
                     const txt = (await el.textContent().catch(() => null)) ?? null
                     if (txt) return txt
@@ -888,14 +890,14 @@ export class Login {
             for (let attempt = 0; attempt < 6; attempt++) {
                 for (const rsel of retryButtonSelectors) {
                     try {
-                        const b = await page.waitForSelector(rsel, { timeout: 2000 }).catch(() => null)
+                        const b = await page.waitForSelector(rsel, { timeout: 120000 }).catch(() => null)
                         if (b) { await b.click().catch(() => { }) ; this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked retry button: ${rsel}`) }
                     } catch { /* ignore */ }
                 }
                 await this.bot.utils.wait(60000)
                 for (const sel of selectors) {
                     try {
-                        const el = await page.waitForSelector(sel, { state: 'visible', timeout: 2000 }).catch(() => null)
+                        const el = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
                         if (el) {
                             const t = (await el.textContent().catch(() => null)) ?? null
                             if (t) return t
@@ -906,11 +908,11 @@ export class Login {
         }
 
         try {
-            const confirm = await page.waitForSelector('button[aria-describedby="confirmSendTitle"], button:has-text("Send")', { timeout: 2000 }).catch(() => null)
+            const confirm = await page.waitForSelector('button[aria-describedby="confirmSendTitle"], button:has-text("Send")', { timeout: 120000 }).catch(() => null)
             if (confirm) {
                 await confirm.click().catch(() => { })
                 await this.bot.utils.wait(2000)
-                const el = await page.waitForSelector('#displaySign, div[data-testid="displaySign"]>span', { timeout: 5000 }).catch(() => null)
+                const el = await page.waitForSelector('#displaySign, div[data-testid="displaySign"]>span', { timeout: 120000 }).catch(() => null)
                 if (el) {
                     const t = (await el.textContent().catch(() => null)) ?? null
                     if (t) return t
@@ -926,12 +928,12 @@ export class Login {
             try {
                 this.bot.log(this.bot.isMobile, 'LOGIN', `Press the number ${numberToPress} on your Authenticator app to approve the login`)
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'If you press the wrong number or the "DENY" button, try again in 60 seconds')
-                await page.waitForSelector('form[name="f1"]', { state: 'detached', timeout: 60000 })
+                await page.waitForSelector('form[name="f1"]', { state: 'detached', timeout: 120000 })
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'Login successfully approved!')
                 break
             } catch {
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'The code is expired. Trying to get a new code...')
-                const primaryButton = await page.waitForSelector('button[data-testid="primaryButton"]', { state: 'visible', timeout: 5000 }).catch(() => null)
+                const primaryButton = await page.waitForSelector('button[data-testid="primaryButton"]', { state: 'visible', timeout: 120000 }).catch(() => null)
                 if (primaryButton) { await primaryButton.click().catch(() => { }) }
                 numberToPress = await this.get2FACode(page)
             }
@@ -991,7 +993,7 @@ export class Login {
                 // Use a simpler navigation approach
                 await page.goto(url.href, {
                     waitUntil: 'domcontentloaded',
-                    timeout: 30000
+                    timeout: 120000
                 });
 
                 const start = Date.now();
@@ -1059,7 +1061,7 @@ export class Login {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     },
                     data: form.toString(),
-                    timeout: 10000
+                    timeout: 120000
                 };
 
                 const resp = await this.bot.axios.request(req);
@@ -1092,7 +1094,7 @@ export class Login {
                     try {
                         await page.goto('https://rewards.bing.com/', {
                             waitUntil: 'domcontentloaded',
-                            timeout: 15000
+                            timeout: 120000
                         });
                     } catch (e) {
                         // Ignore navigation errors in fallback
@@ -1224,7 +1226,7 @@ export class Login {
             }
         }
 
-        await page.waitForSelector('html[data-role-name="RewardsPortal"]', { timeout: 10000 })
+        await page.waitForSelector('html[data-role-name="RewardsPortal"]', { timeout: 120000 })
         this.bot.log(this.bot.isMobile, 'LOGIN', 'Successfully logged into the rewards portal')
     }
 
@@ -1338,7 +1340,7 @@ export class Login {
             }
 
             // Wait for the page to finish loading network activity to avoid racing with redirects/refreshes
-            await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => { });
+            await page.waitForLoadState('networkidle', { timeout: 120000 }).catch(() => { });
 
             this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Attempting robust popup dismissal (max 2 attempts).');
 
@@ -1601,7 +1603,9 @@ export class Login {
     private async checkBingLogin(page: Page): Promise<void> {
         try {
             this.bot.log(this.bot.isMobile, 'LOGIN-BING', 'Verifying Bing login')
-            await page.goto('https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F')
+            await page.goto('https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F', {
+                    timeout: 120000 // 2 minutes (in milliseconds)
+            })
 
             const maxIterations = 5
             for (let iteration = 1; iteration <= maxIterations; iteration++) {
@@ -1626,7 +1630,7 @@ export class Login {
 
     private async checkBingLoginStatus(page: Page): Promise<boolean> {
         try {
-            await page.waitForSelector('#id_n', { timeout: 5000 })
+            await page.waitForSelector('#id_n', { timeout: 120000 })
             return true
         } catch (error) {
             return false
@@ -1635,7 +1639,7 @@ export class Login {
 
     private async checkAccountLocked(page: Page) {
         await this.bot.utils.wait(2000)
-        const isLocked = await page.waitForSelector('#serviceAbuseLandingTitle', { state: 'visible', timeout: 1000 }).then(() => true).catch(() => false)
+        const isLocked = await page.waitForSelector('#serviceAbuseLandingTitle', { state: 'visible', timeout: 120000 }).then(() => true).catch(() => false)
         if (isLocked) {
             // Get email from current context if possible
             let email = 'unknown';
@@ -1849,7 +1853,7 @@ export class Login {
                 }
             } catch { /* ignore */ }
 
-            await gmailPage.waitForSelector('div[role="main"], div[role="list"]', { timeout: 15000 }).catch(() => null)
+            await gmailPage.waitForSelector('div[role="main"], div[role="list"]', { timeout: 120000 }).catch(() => null)
             await gmailPage.waitForTimeout(1200)
 
             const searchTerms = [

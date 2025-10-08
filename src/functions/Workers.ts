@@ -252,7 +252,7 @@ export class Workers {
             const nav = await navPromise
 
             if (popup) {
-                try { await popup.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null) } catch {}
+                try { await popup.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => null) } catch {}
                 return { success: true, popup }
             }
 
@@ -344,7 +344,7 @@ export class Workers {
 
             this.bot.log(this.bot.isMobile, 'PUNCH-CARD', `Started solving "Punch Card" items for punchcard: "${punchCard.parentPromotion.title}"`)
 
-            await page.goto(punchCard.parentPromotion.destinationUrl, { referer: this.bot.config.baseURL })
+            await page.goto(punchCard.parentPromotion.destinationUrl, { referer: this.bot.config.baseURL, timeout: 120000 })
             await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => { })
 
             await this.solveActivities(page, activitiesUncompleted, punchCard)

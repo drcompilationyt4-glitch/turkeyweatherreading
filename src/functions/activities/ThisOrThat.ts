@@ -13,7 +13,7 @@ export class ThisOrThat extends Workers {
             await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
 
             // Check if the quiz has been started or not
-            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)
+            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: 120000 }).then(() => true).catch(() => false)
             if (quizNotStarted) {
                 // Human-like delay before clicking start (1-2 seconds)
                 await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 2000))

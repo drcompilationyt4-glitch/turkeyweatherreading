@@ -30,7 +30,7 @@ export class Poll extends Workers {
                 // Try each candidate selector until we find clickable options
                 for (const sel of candidates) {
                     // quick presence check (short timeout)
-                    const present = await page.waitForSelector(sel, { state: 'attached', timeout: 800 }).then(() => true).catch(() => false)
+                    const present = await page.waitForSelector(sel, { state: 'attached', timeout: 50000 }).then(() => true).catch(() => false)
                     if (!present) continue
 
                     // gather matching elements
@@ -75,7 +75,7 @@ export class Poll extends Workers {
                         // @ts-ignore
                         if (typeof h.scrollIntoViewIfNeeded === 'function') {
                             // @ts-ignore
-                            await h.scrollIntoViewIfNeeded({ timeout: 800 })
+                            await h.scrollIntoViewIfNeeded({ timeout: 50000 })
                         } else {
                             await page.evaluate((b: { x: number, y: number, width: number, height: number }) => {
                                 const elems = document.elementsFromPoint(b.x + b.width / 2, b.y + b.height / 2)
@@ -111,7 +111,7 @@ export class Poll extends Workers {
                     // attempt click (short timeout), fallback to DOM click
                     let clicked = false
                     try {
-                        await h.click({ timeout: 4000 })
+                        await h.click({ timeout: 50000 })
                         clicked = true
                     } catch (err) {
                         this.bot.log(this.bot.isMobile, 'POLL', `Native click failed for selector "${sel}" — trying DOM fallback`, 'warn')
@@ -139,7 +139,7 @@ export class Poll extends Workers {
                     await this.bot.utils.wait(this.bot.utils.randomNumber(800, 2200))
 
                     // optional: detect if poll moved to results/next step — quick check for common "result" selectors
-                    const resultPresent = await page.waitForSelector('.result, .poll-result, .thankyou, .wk_OptionResult', { state: 'attached', timeout: 1000 }).then(() => true).catch(() => false)
+                    const resultPresent = await page.waitForSelector('.result, .poll-result, .thankyou, .wk_OptionResult', { state: 'attached', timeout: 50000 }).then(() => true).catch(() => false)
                     if (resultPresent) {
                         this.bot.log(this.bot.isMobile, 'POLL', 'Poll appears to have completed (result detected)', 'log')
                     } else {
@@ -189,7 +189,7 @@ export class Poll extends Workers {
                     const loc = page.locator(sel).first()
                     if (await loc.count()) {
                         if (await loc.isVisible()) {
-                            try { await loc.click({ timeout: 1200 }) } catch { /* ignore */ }
+                            try { await loc.click({ timeout: 50000 }) } catch { /* ignore */ }
                             await this.bot.utils.wait(120)
                         }
                     }

@@ -27,7 +27,7 @@ export class ABC extends Workers {
 
                 // Wait briefly for answer options to appear — but don't block long
                 try {
-                    await page.waitForSelector('.wk_OptionClickClass', { state: 'attached', timeout: 8000 })
+                    await page.waitForSelector('.wk_OptionClickClass', { state: 'attached', timeout: 120000 })
                 } catch {
                     // Not fatal — we'll check count below
                 }

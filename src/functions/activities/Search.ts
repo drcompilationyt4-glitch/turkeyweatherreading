@@ -540,13 +540,13 @@ export class Search extends Workers {
         try {
             // Small wait+click to open a result if present
             await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 2000))
-            await page.click('#b_results .b_algo h2', { timeout: 2000 }).catch(() => { })
+            await page.click('#b_results .b_algo h2', { timeout: 120000  }).catch(() => { })
 
             // Only used if the browser shows an Edge continuation popup
             await this.closeContinuePopup(page)
 
             // Stay for 10 seconds for page to load and "visit"
-            await this.bot.utils.wait(10000)
+            await this.bot.utils.wait(34000)
 
             // Will get current tab if no new one is created
             let lastTab = await this.bot.browser.utils.getLatestTab(page)

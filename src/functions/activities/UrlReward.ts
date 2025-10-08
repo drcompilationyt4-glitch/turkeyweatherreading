@@ -121,7 +121,7 @@ export class UrlReward extends Workers {
             try { await this.restoreHiddenOverlays(page) } catch {}
 
             if (popup) {
-                try { await popup.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null) } catch {}
+                try { await popup.waitForLoadState('domcontentloaded', { timeout: 120000 }).catch(() => null) } catch {}
                 this.bot.log(this.bot.isMobile, 'URL-REWARD', `clickWithRetries: click opened popup for ${selector}`)
                 return { success: true, popup }
             }
@@ -151,7 +151,7 @@ export class UrlReward extends Workers {
             const tileSelector = '[data-bi-id^="Gamification_DailySet_"] .pointLink:not(.contentContainer .pointLink)'
 
             // If the page actually contains those tiles, try to click one
-            const tileExists = await page.waitForSelector(tileSelector, { state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)
+            const tileExists = await page.waitForSelector(tileSelector, { state: 'visible', timeout: 50000 }).then(() => true).catch(() => false)
             if (tileExists) {
                 this.bot.log(this.bot.isMobile, 'URL-REWARD', `Found dailyset tile, attempting robust click: ${tileSelector}`)
 

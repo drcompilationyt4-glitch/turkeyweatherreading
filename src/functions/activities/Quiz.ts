@@ -107,7 +107,7 @@ export class Quiz extends Workers {
             try {
                 const handle = await page.$(sel);
                 if (!handle) return { ok: false, reason: 'not-found' };
-                try { await handle.scrollIntoViewIfNeeded?.({ timeout: 2000 }); } catch {
+                try { await handle.scrollIntoViewIfNeeded?.({ timeout: 120000 }); } catch {
                     await page.evaluate((s) => {
                         const el = document.querySelector(s) as HTMLElement | null;
                         if (el) el.scrollIntoView({ block: 'center', inline: 'center' });
@@ -157,13 +157,13 @@ export class Quiz extends Workers {
 
             let popupPromise: Promise<Page | null> | null = null;
             if (context) {
-                popupPromise = context.waitForEvent('page', { timeout: 1000 }).catch(() => null);
+                popupPromise = context.waitForEvent('page', { timeout: 120000 }).catch(() => null);
             }
-            const navigationPromise = page.waitForNavigation({ timeout: 1000 }).catch(() => null);
+            const navigationPromise = page.waitForNavigation({ timeout: 120000 }).catch(() => null);
 
             try {
                 const locator = page.locator(sel).first();
-                await locator.scrollIntoViewIfNeeded?.({ timeout: 2000 }).catch(() => null);
+                await locator.scrollIntoViewIfNeeded?.({ timeout: 120000 }).catch(() => null);
                 await locator.click({ timeout }).catch(async (err) => {
                     this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: locator.click failed for ${sel} - trying evaluate click (${err})`, 'warn');
                     const clicked = await page.evaluate((s) => {
@@ -201,7 +201,7 @@ export class Quiz extends Workers {
             const nav = await navigationPromise;
 
             if (popup) {
-                try { await popup.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null); } catch {}
+                try { await popup.waitForLoadState('domcontentloaded', { timeout: 120000 }).catch(() => null); } catch {}
                 this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: click opened popup for ${sel}`);
                 return { success: true, popup };
             }
@@ -586,7 +586,7 @@ export class Quiz extends Workers {
 
         try {
             // Attempt to click start if available (robust)
-            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)
+            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: 120000 }).then(() => true).catch(() => false)
             if (quizNotStarted) {
                 const startClick = await this.clickWithRetries(page, '#rqStartQuiz', 3, 10000);
                 if (!startClick.success) {
@@ -642,7 +642,7 @@ export class Quiz extends Workers {
 
                     for (let i = 0; i < quizData.numberOfOptions; i++) {
                         const sel = `#rqAnswerOption${i}`
-                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 10000 }).catch(() => null)
+                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
                         const answerAttribute = await answerHandle?.evaluate((el: Element) => el.getAttribute('iscorrectoption')).catch(() => null)
 
                         if (answerAttribute && answerAttribute.toLowerCase() === 'true') {
@@ -652,7 +652,7 @@ export class Quiz extends Workers {
 
                     // Click the answers
                     for (const answer of answers) {
-                        await page.waitForSelector(answer, { state: 'visible', timeout: 2000 }).catch(() => null)
+                        await page.waitForSelector(answer, { state: 'visible', timeout: 120000 }).catch(() => null)
 
                         // Click the answer using robust helper
                         const clickRes = await this.clickWithRetries(page, answer, 3, 12000);
@@ -677,7 +677,7 @@ export class Quiz extends Workers {
                     let answeredThisRound = false
                     for (let i = 0; i < quizData.numberOfOptions; i++) {
                         const sel = `#rqAnswerOption${i}`
-                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 10000 }).catch(() => null)
+                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
                         const dataOption = await answerHandle?.evaluate((el: Element) => el.getAttribute('data-option')).catch(() => null)
 
                         if (dataOption === correctOption) {
