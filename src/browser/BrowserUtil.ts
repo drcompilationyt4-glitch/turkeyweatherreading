@@ -41,8 +41,8 @@ export default class BrowserUtil {
             for (const btn of buttonGroups) {
                 try {
                     const loc = btn.isXPath ? page.locator(`xpath=${btn.selector}`) : page.locator(btn.selector)
-                    if (await loc.first().isVisible({ timeout: 200 }).catch(() => false)) {
-                        await loc.first().click({ timeout: 500 }).catch(() => { })
+                    if (await loc.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+                        await loc.first().click({ timeout: 2000 }).catch(() => { })
                         dismissedThisRound++
                         this.bot.log(this.bot.isMobile, 'DISMISS-ALL-MESSAGES', `Dismissed: ${btn.label}`)
                         await page.waitForTimeout(150)
@@ -53,15 +53,15 @@ export default class BrowserUtil {
             // Special-case overlay handling (common cookie/consent overlays)
             try {
                 const overlay = page.locator('#bnp_overlay_wrapper')
-                if (await overlay.isVisible({ timeout: 200 }).catch(() => false)) {
+                if (await overlay.isVisible({ timeout: 2000 }).catch(() => false)) {
                     const reject = overlay.locator('#bnp_btn_reject, button[aria-label*="Reject" i]')
                     const accept = overlay.locator('#bnp_btn_accept')
                     if (await reject.first().isVisible().catch(() => false)) {
-                        await reject.first().click({ timeout: 500 }).catch(() => { })
+                        await reject.first().click({ timeout: 2000 }).catch(() => { })
                         this.bot.log(this.bot.isMobile, 'DISMISS-ALL-MESSAGES', 'Dismissed: Overlay Reject')
                         dismissedThisRound++
                     } else if (await accept.first().isVisible().catch(() => false)) {
-                        await accept.first().click({ timeout: 500 }).catch(() => { })
+                        await accept.first().click({ timeout: 2000 }).catch(() => { })
                         this.bot.log(this.bot.isMobile, 'DISMISS-ALL-MESSAGES', 'Dismissed: Overlay Accept')
                         dismissedThisRound++
                     }

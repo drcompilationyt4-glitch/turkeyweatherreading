@@ -3,6 +3,8 @@ import https from 'https'
 import { BrowserContext, Page } from 'rebrowser-playwright'
 import { CheerioAPI, load } from 'cheerio'
 import { AxiosRequestConfig } from 'axios'
+import * as fs from 'fs/promises'
+import * as path from 'path'
 
 import { MicrosoftRewardsBot } from '../index'
 import { saveSessionData } from '../util/Load'
@@ -24,7 +26,7 @@ export default class BrowserFunc {
      * Helper: quiet randomized delay between 30-45 seconds to reduce race/timeout issues.
      */
     private async quietDelay() {
-        const ms = 30000 + Math.floor(Math.random() * 15001) // 30,000 - 45,000 ms
+        const ms = 3000 + Math.floor(Math.random() * 1500) // 30,000 - 45,000 ms
         if (this.bot && this.bot.utils && typeof (this.bot.utils as any).wait === 'function') {
             await (this.bot.utils as any).wait(ms)
         } else {
@@ -57,7 +59,7 @@ export default class BrowserFunc {
                 await this.bot.browser.utils.tryDismissAllMessages(page)
 
                 // Check if account is suspended (multiple heuristics)
-                const suspendedByHeader = await page.waitForSelector('#suspendedAccountHeader', { state: 'visible', timeout: 1500 }).then(() => true).catch(() => false)
+                const suspendedByHeader = await page.waitForSelector('#suspendedAccountHeader', { state: 'visible', timeout: 3000 }).then(() => true).catch(() => false)
                 let suspendedByText = false
                 if (!suspendedByHeader) {
                     try {
@@ -72,7 +74,7 @@ export default class BrowserFunc {
 
                 try {
                     // If activities are found, exit the loop
-                    await page.waitForSelector('#more-activities', { timeout: 1000 })
+                    await page.waitForSelector('#more-activities', { timeout: 120000 })
                     this.bot.log(this.bot.isMobile, 'GO-HOME', 'Visited homepage successfully')
                     break
 
@@ -460,7 +462,7 @@ export default class BrowserFunc {
         try {
             // Wait briefly for the page / quiz UI to settle. Increase timeout if your environment is slow.
             try {
-                await page.waitForSelector('body', { timeout: 5000 })
+                await page.waitForSelector('body', { timeout: 80000 })
             } catch (e) {
                 // continue — we'll still try to extract scripts even if the page is slow
             }
@@ -675,7 +677,7 @@ export default class BrowserFunc {
 
     async waitForQuizRefresh(page: Page): Promise<boolean> {
         try {
-            await page.waitForSelector('span.rqMCredits', { state: 'visible', timeout: 10000 })
+            await page.waitForSelector('span.rqMCredits', { state: 'visible', timeout: 120000 })
             await this.bot.utils.wait(2000)
 
             return true
@@ -687,7 +689,7 @@ export default class BrowserFunc {
 
     async checkQuizCompleted(page: Page): Promise<boolean> {
         try {
-            await page.waitForSelector('#quizCompleteContainer', { state: 'visible', timeout: 2000 })
+            await page.waitForSelector('#quizCompleteContainer', { state: 'visible', timeout: 120000 })
             await this.bot.utils.wait(2000)
 
             return true
@@ -723,19 +725,189 @@ export default class BrowserFunc {
         return selector
     }
 
-    async closeBrowser(browser: BrowserContext, email: string) {
+    // Paste this function into your class. Make sure you have:
+// import * as fs from 'fs/promises'
+// import * as path from 'path'
+// and that `saveSessionData` is in scope.
+
+    async closeBrowser(
+        browser: BrowserContext,
+        email: string,
+        options?: {
+            backupSessionsBeforeClose?: boolean
+            backupSessionPath?: string
+            skipSave?: boolean
+        }
+    ) {
         try {
             // slight randomized delay before saving session & closing
             await this.quietDelay()
 
-            // Save cookies
-            await saveSessionData(this.bot.config.sessionPath, browser, email, this.bot.isMobile)
+            // --- OPTIONAL BACKUP PHASE (non-destructive) ---
+            const cfgBackupEnabled = !!(this.bot?.config?.backupSessionsBeforeClose)
+            const doBackup = options?.backupSessionsBeforeClose ?? cfgBackupEnabled
+            const skipSave = !!options?.skipSave
+            const backupPath = options?.backupSessionPath ?? this.bot?.config?.backupSessionPath ?? this.bot?.config?.sessionPath
+            const resolvedBackupPath = String(backupPath ?? this.bot?.config?.sessionPath ?? '.')
 
-            await this.bot.utils.wait(2000)
+            if (doBackup && !skipSave && typeof saveSessionData === 'function') {
+                try {
+                    await saveSessionData(resolvedBackupPath, browser, email, this.bot.isMobile)
+                    this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Saved session backup for ${email} to ${resolvedBackupPath}`)
+                } catch (e) {
+                    this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Failed saving session backup: ${e}`, 'warn')
+                }
+            }
 
-            // Close browser
-            await browser.close()
-            this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'Browser closed cleanly!')
+            // --- CLEANUP PHASE ---
+            // 1) Try to clear storage on every open page (localStorage, sessionStorage, indexedDB, service workers)
+            try {
+                const pages: Page[] = typeof (browser as any).pages === 'function' ? (browser as any).pages() : []
+
+                for (const p of pages) {
+                    try {
+                        // Navigate to about:blank to reduce cross-origin issues
+                        try { await p.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 120000 }) } catch (_) { }
+
+                        await p.evaluate(async () => {
+                            try {
+                                try { localStorage.clear() } catch (_) { }
+                                try { sessionStorage.clear() } catch (_) { }
+
+                                // Delete all indexedDB databases if supported
+                                try {
+                                    // @ts-ignore
+                                    if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+                                        // @ts-ignore
+                                        const dbs = await indexedDB.databases()
+                                        for (const db of dbs) {
+                                            try {
+                                                if (db && db.name) {
+                                                    const name = db.name as string
+                                                    await new Promise<void>((resolve) => {
+                                                        try {
+                                                            const req = indexedDB.deleteDatabase(name)
+                                                            req.onsuccess = () => resolve()
+                                                            req.onerror = () => resolve()
+                                                            req.onblocked = () => resolve()
+                                                        } catch (_) {
+                                                            resolve()
+                                                        }
+                                                    })
+                                                }
+                                            } catch (_) { }
+                                        }
+                                    }
+                                } catch (_) { }
+
+                                // Unregister service workers
+                                try {
+                                    if (navigator && 'serviceWorker' in navigator) {
+                                        // @ts-ignore
+                                        const regs = await navigator.serviceWorker.getRegistrations()
+                                        for (const r of regs) {
+                                            try { await r.unregister() } catch (_) { }
+                                        }
+                                    }
+                                } catch (_) { }
+                            } catch (_) { }
+                        })
+
+                        // small delay per page
+                        await this.bot.utils.wait(200)
+
+                        // attempt to close the page itself to release resources
+                        try { await p.close() } catch (_) { }
+                    } catch (err) {
+                        this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Per-page cleanup error: ${err}`, 'warn')
+                    }
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Error during per-page cleanup: ${err}`, 'warn')
+            }
+
+            // 2) Attempt to clear cookies & cache at the context level (best-effort)
+            try {
+                if (typeof (browser as any).clearCookies === 'function') {
+                    try { await (browser as any).clearCookies() } catch (_) { }
+                    this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'Context cookies cleared')
+                } else if (typeof (browser as any).cookies === 'function') {
+                    try {
+                        const existing = await (browser as any).cookies()
+                        if (Array.isArray(existing) && existing.length) {
+                            try { await (browser as any).clearCookies?.() } catch (_) { }
+                        }
+                    } catch (_) { }
+                }
+
+                if (typeof (browser as any).clearStorage === 'function') {
+                    try { await (browser as any).clearStorage() } catch (_) { }
+                }
+                if (typeof (browser as any).clearBrowserCaches === 'function') {
+                    try { await (browser as any).clearBrowserCaches() } catch (_) { }
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Error clearing cookies/cache: ${err}`, 'warn')
+            }
+
+            // 3) Remove any on-disk session files for this email (best-effort and defensive)
+            try {
+                const sp = this.bot.config.sessionPath
+                if (sp) {
+                    try {
+                        const stat = await fs.stat(sp)
+                        if (stat.isDirectory()) {
+                            const files = await fs.readdir(sp)
+                            const emailSan = email.toLowerCase().replace(/[@.]/g, '')
+                            for (const f of files) {
+                                const fname = f.toLowerCase()
+                                if (fname.includes(email.toLowerCase()) || fname.includes(emailSan)) {
+                                    try {
+                                        await fs.unlink(path.join(sp, f))
+                                        this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Deleted session file: ${path.join(sp, f)}`)
+                                    } catch (e) {
+                                        this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Failed deleting session file ${path.join(sp, f)}: ${e}`, 'warn')
+                                    }
+                                }
+                            }
+                        } else {
+                            const bn = path.basename(sp).toLowerCase()
+                            const emailSan = email.toLowerCase().replace(/[@.]/g, '')
+                            if (bn.includes(email.toLowerCase()) || bn.includes(emailSan)) {
+                                try {
+                                    await fs.unlink(sp)
+                                    this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Deleted session file: ${sp}`)
+                                } catch (e) {
+                                    this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Failed deleting session file ${sp}: ${e}`, 'warn')
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // session path doesn't exist or not accessible — ignore
+                    }
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Error while trying to remove session files: ${err}`, 'warn')
+            }
+
+            // 4) Clear any in-memory references on the bot that might contain auth/session data (best-effort)
+            try {
+                try { if ((this.bot as any).session) (this.bot as any).session = undefined } catch (_) { }
+                try { if ((this.bot as any).sessionData) (this.bot as any).sessionData = undefined } catch (_) { }
+                try { if ((this.bot as any).authToken) (this.bot as any).authToken = undefined } catch (_) { }
+            } catch (_) { }
+
+            // small pause before closing
+            await this.bot.utils.wait(1000)
+
+            // Close browser context
+            try {
+                await browser.close()
+                this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'Browser closed cleanly!')
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', `Error closing browser: ${err}`, 'error')
+                throw new Error('CLOSE-BROWSER error: ' + err)
+            }
         } catch (error) {
             this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'An error occurred:' + error, 'error')
             throw new Error('CLOSE-BROWSER error: ' + error)
