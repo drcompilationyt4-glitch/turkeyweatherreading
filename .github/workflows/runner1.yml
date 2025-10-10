@@ -26,6 +26,80 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+      # -------------------------
+      # Shadowsocks: install + configure oracle.json (manual steps version)
+      # -------------------------
+      - name: Install and configure Shadowsocks (following manual steps)
+        env:
+          SHADOWSOCKS_SERVER: ${{ secrets.SHADOWSOCKS_SERVER }}
+          SHADOWSOCKS_PASSWORD: ${{ secrets.SHADOWSOCKS_PASSWORD }}
+          SHADOWSOCKS_LOCAL_ADDRESS: ${{ secrets.SHADOWSOCKS_LOCAL_ADDRESS || '127.0.0.1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Step 1: Installing shadowsocks-libev..."
+          sudo apt-get update -y
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y shadowsocks-libev
+
+          echo "Step 2: Checking initial service status..."
+          sudo systemctl status shadowsocks-libev || true
+
+          echo "Step 3: Disabling shadowsocks-libev service..."
+          sudo systemctl disable shadowsocks-libev --now || true
+
+          echo "Step 4: Configuring /etc/shadowsocks-libev directory..."
+          cd /etc/shadowsocks-libev/
+
+          if [ -f config.json ]; then
+            sudo mv config.json config.json.default
+            echo "Backed up existing config.json to config.json.default"
+          else
+            echo "No existing config.json found, creating default backup..."
+            sudo touch config.json.default
+          fi
+
+          echo "Step 5: Creating oracle.json..."
+          if [ -f config.json.default ]; then
+            echo "Default config content (for reference):"
+            sudo cat config.json.default | head -20 || true
+          fi
+
+          sudo tee oracle.json > /dev/null <<EOF
+          {
+            "server": "$SHADOWSOCKS_SERVER",
+            "server_port": 8388,
+            "local_address": "$SHADOWSOCKS_LOCAL_ADDRESS",
+            "local_port": 1080,
+            "password": "$SHADOWSOCKS_PASSWORD",
+            "timeout": 300,
+            "method": "chacha20-ietf-poly1305"
+          }
+          EOF
+
+          echo "Step 6: oracle.json content:"
+
+          echo "Step 7: Enabling and starting shadowsocks-libev-local@oracle..."
+          sudo systemctl enable shadowsocks-libev-local@oracle --now
+
+          echo "Step 8: Checking service status..."
+          systemctl status shadowsocks-libev-local@oracle
+
+          echo "Step 9: Checking list status..."
+          sudo lsof -P -i -n
+
+          sleep 3
+          if sudo systemctl is-active shadowsocks-libev-local@oracle; then
+            echo "✅ Shadowsocks oracle service is running successfully!"
+          else
+            echo "❌ Service failed to start. Checking logs..."
+            sudo journalctl -u shadowsocks-libev-local@oracle -n 20 --no-pager
+            exit 1
+          fi
+
+      # -------------------------
+      # End shadowsocks block
+      # -------------------------
 
       - name: Setup Node
         uses: actions/setup-node@v4
