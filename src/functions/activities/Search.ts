@@ -302,18 +302,20 @@ export class Search extends Workers {
      * IMPORTANT: This implementation uses native `https.request` with `agent: false` to bypass any
      * axios/global proxy or agent configuration. Behaves like previous function in terms of parsing and errors.
      */
+    // === generateQueriesWithLLM ===
     private async generateQueriesWithLLM(geoLocale: string): Promise<GoogleSearch[]> {
-        const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
-        const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
-        const apiKey = envKey || cfgKey
-        if (!apiKey) {
-            throw new Error('OpenRouter API key not configured')
-        }
+        const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
+        const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
+        const apiKey = envKey || cfgKey;
+        if (!apiKey) throw new Error('OpenRouter API key not configured');
 
-        // Prompt: ask explicitly for pure JSON output
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:\n- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).\n- "related": an array of 0..6 related searches (short strings).\n\nReturn at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`
+        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
+- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).
+- "related": an array of 0..6 related searches (short strings).
 
-        const userPrompt = `Generate a diverse list of short search queries a typical university student (undergrad) would use. Include games, course queries (e.g., "econ midterm study guide"), campus services, cheap food spots, debugging/programming help, and popular non-suspicious entertainment. Output only JSON.`
+Return at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`;
+
+        const userPrompt = `Generate a diverse list of short search queries a typical university student (undergrad) would use. Include games, course queries (e.g., "econ midterm study guide"), campus services, cheap food spots, debugging/programming help, and popular non-suspicious entertainment. Output only JSON.`;
 
         const body = {
             model: 'meta-llama/llama-3.3-70b-instruct:free',
@@ -321,28 +323,25 @@ export class Search extends Workers {
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt }
             ],
-            // keep completions small-ish
             max_tokens: 1200,
             temperature: 0.7
-        }
+        };
 
-        const url = new URL('https://openrouter.ai/api/v1/chat/completions')
-        const payload = JSON.stringify(body)
+        const url = new URL('https://openrouter.ai/api/v1/chat/completions');
+        const payload = JSON.stringify(body);
+        const timeoutMs = (this.bot.config?.openRouter?.timeoutMs) || 10000;
 
-        // Timeout in ms
-        const timeoutMs = (this.bot.config?.openRouter?.timeoutMs) || 10000
-
-        // Build headers
         const headers: Record<string, string> = {
             'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(payload).toString(),
+            'Accept': 'application/json',
             'Authorization': `Bearer ${apiKey}`,
-            ...(this.bot.config?.openRouter?.referer ? { 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
-            ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {}),
-        }
+            ...(this.bot.config?.openRouter?.referer ? { 'Referer': this.bot.config.openRouter.referer } : {}),
+            ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {})
+        };
 
-        // Do the request with native https so we bypass axios and any axios/global proxy settings
-        let rawResponse: string
+        let rawResponse = '';
+        let statusCode: number | undefined;
+
         try {
             rawResponse = await new Promise<string>((resolve, reject) => {
                 const req = https.request({
@@ -351,133 +350,243 @@ export class Search extends Workers {
                     path: url.pathname + url.search,
                     method: 'POST',
                     headers,
-                    // explicit: do not use an agent (no proxy/pooling)
-                    agent: false as any
+                    agent: undefined as any
                 }, (res) => {
-                    let data = ''
-                    res.on('data', (chunk) => { data += chunk })
-                    res.on('end', () => {
-                        resolve(data)
-                    })
-                })
+                    statusCode = res.statusCode;
+                    const chunks: Buffer[] = [];
+                    res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+                    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+                });
 
-                req.on('error', (err) => {
-                    reject(err)
-                })
-
-                req.setTimeout(timeoutMs, () => {
-                    req.destroy(new Error('OpenRouter request timeout'))
-                })
-
-                req.write(payload)
-                req.end()
-            })
+                req.on('error', (err) => reject(err));
+                req.setTimeout(timeoutMs, () => req.destroy(new Error('OpenRouter request timeout')));
+                req.write(payload);
+                req.end();
+            });
         } catch (err) {
-            const status = (err as any)?.status
-            const details = (err as Error).message || JSON.stringify(err || {})
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${status || ''} ${details}`, 'error')
-            throw err
+            const details = (err as Error).message || JSON.stringify(err || {});
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${statusCode || ''} ${details}`, 'error');
+            throw err;
         }
 
-        // The rest follows your original parsing logic (try multiple shapes)
-        let responseData: any
+        // top-level parse attempt
+        let responseData: any;
         try {
-            responseData = JSON.parse(rawResponse)
+            responseData = JSON.parse(rawResponse);
         } catch {
-            // keep as string if not JSON (later parsing can handle)
-            responseData = rawResponse
+            responseData = rawResponse;
         }
 
-        const choices = responseData?.choices
-        let content: string | undefined
+        const extractContent = (obj: any): string | undefined => {
+            if (!obj) return undefined;
+            if (Array.isArray(obj.choices) && obj.choices.length) {
+                const first = obj.choices[0];
+                if (first?.message?.content) return first.message.content;
+                if (first?.text) return first.text;
+                if (obj.choices.every((c: any) => c?.delta)) {
+                    return obj.choices.map((c: any) => c.delta?.content || '').join('');
+                }
+            }
+            if (typeof obj.output_text === 'string') return obj.output_text;
+            if (obj.result?.content) return obj.result.content;
+            if (obj.generated_text) return obj.generated_text;
+            return undefined;
+        };
 
-        if (Array.isArray(choices) && choices.length) {
-            content = choices[0]?.message?.content || choices[0]?.text
-        } else if (typeof responseData === 'string') {
-            content = responseData
-        } else if (responseData?.result?.content) {
-            content = responseData.result.content
-        } else if (responseData?.output_text) {
-            content = responseData.output_text
-        }
+        let content: string | undefined = extractContent(responseData);
 
-        if (!content) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'No content returned from OpenRouter', 'error')
-            throw new Error('No content returned from OpenRouter')
-        }
+        // SSE-style parsing (data: ...)
+        if (!content && typeof rawResponse === 'string') {
+            const s = rawResponse.trim();
+            if (/^data: /m.test(s)) {
+                const lines = s.split(/\r?\n/);
+                const jsonPieces: string[] = [];
+                for (const line of lines) {
+                    const m = line.match(/^data:\s*(.*)$/);
+                    if (!m) continue;
+                    // guard against m[1] possibly being undefined
+                    if (typeof m[1] !== 'string') continue;
+                    const payloadChunk = m[1].trim();
+                    if (payloadChunk === '[DONE]') continue;
+                    jsonPieces.push(payloadChunk);
+                }
 
-        // Try to parse content as JSON. The model was instructed to return pure JSON.
-        let parsed: any
-        try {
-            parsed = JSON.parse(content)
-        } catch (e) {
-            // Some models wrap JSON in code fences — attempt to strip fences and parse
-            const trimmed = String(content).replace(/```json|```/g, '').trim()
-            try {
-                parsed = JSON.parse(trimmed)
-            } catch (e2) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Failed to parse LLM JSON output', 'error')
-                throw new Error('Failed to parse LLM JSON output')
+                // parse from last to first the JSON chunks
+                for (let i = jsonPieces.length - 1; i >= 0; i--) {
+                    const chunk = jsonPieces[i];
+                    if (typeof chunk !== 'string') continue; // <-- TS-safe guard
+                    try {
+                        const parsedChunk = JSON.parse(chunk);
+                        const maybe = extractContent(parsedChunk);
+                        if (maybe) {
+                            content = maybe;
+                            break;
+                        }
+                    } catch {
+                        // ignore partial/invalid chunk
+                    }
+                }
+
+                if (!content && jsonPieces.length) {
+                    // join as fallback (still a string)
+                    content = jsonPieces.join('\n');
+                }
             }
         }
 
-        // Validate shape and normalize
-        if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+        if (!content && typeof rawResponse === 'string') {
+            content = rawResponse;
+        }
+
+        if (!content) {
+            const snippet = typeof rawResponse === 'string' ? rawResponse.slice(0, 2000) : String(rawResponse);
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content extracted from OpenRouter (status=${statusCode}). Body snippet: ${snippet}`, 'error');
+            throw new Error('No content returned from OpenRouter');
+        }
+
+        // strip fences and parse JSON
+        const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
+        let parsed: any;
+        try {
+            parsed = JSON.parse(content);
+        } catch {
+            const trimmed = stripFences(content);
+            try {
+                parsed = JSON.parse(trimmed);
+            } catch {
+                const match = trimmed.match(/(\[.*\]|\{.*\})/s);
+                if (match && typeof match[1] === 'string') {
+                    try {
+                        parsed = JSON.parse(match[1]);
+                    } catch {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Failed to parse LLM JSON output. Preview: ${trimmed.slice(0,500)}`, 'error');
+                        throw new Error('Failed to parse LLM JSON output');
+                    }
+                } else {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No JSON-like content in LLM output. Preview: ${trimmed.slice(0,500)}`, 'error');
+                    throw new Error('Failed to parse LLM JSON output');
+                }
+            }
+        }
+
+        if (!Array.isArray(parsed)) {
+            if (parsed?.data && Array.isArray(parsed.data)) parsed = parsed.data;
+            else if (parsed?.items && Array.isArray(parsed.items)) parsed = parsed.items;
+            else {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned non-array JSON: ${JSON.stringify(parsed).slice(0,1000)}`, 'error');
+                throw new Error('LLM returned non-array JSON');
+            }
+        }
 
         const normalized: GoogleSearch[] = parsed.map((item: any) => {
-            const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
-            const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-            return { topic, related }
-        }).filter(x => x.topic && x.topic.length > 1)
+            let topic = '';
+            if (typeof item.topic === 'string') topic = item.topic;
+            else if (typeof item === 'string') topic = item;
+            else if (typeof item?.title === 'string') topic = item.title;
 
-        return normalized
+            const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : [];
+            return { topic: String(topic).trim(), related };
+        }).filter((x: GoogleSearch) => !!x.topic && x.topic.length > 1);
+
+        if (!normalized.length) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Parsed JSON but no valid search items found. Parsed length: ${Array.isArray(parsed) ? parsed.length : 0}`, 'error');
+            throw new Error('LLM returned empty or invalid results');
+        }
+
+        return normalized;
     }
 
-    private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        const queryTerms: GoogleSearch[] = []
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
+// === getGoogleTrends ===
+    private async getGoogleTrends(geoLocale: string = 'US', triedFallback: boolean = false): Promise<GoogleSearch[]> {
+        const queryTerms: GoogleSearch[] = [];
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`);
 
-        // Human-like delay before fetching trends (0.5-1.5 seconds)
-        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
+        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500));
 
         try {
             const request: AxiosRequestConfig = {
                 url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'Accept': '*/*',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
                 },
-                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`
+                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
+                responseType: 'text',
+                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
+            };
+
+            const axiosConfig = {
+                ...request,
+                ...(this.bot.config?.proxy?.proxyGoogleTrends ? { proxy: this.bot.config.proxy.proxyGoogleTrends } : {})
+            };
+
+            const response = await this.bot.axios.request(axiosConfig);
+            let rawText: string;
+            if (typeof response.data === 'string') rawText = response.data;
+            else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8');
+            else rawText = JSON.stringify(response.data);
+
+            const trendsData = this.extractJsonFromResponse(rawText);
+            if (!Array.isArray(trendsData) || trendsData.length === 0) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response or no items found', 'warn');
+                return [];
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy?.proxyGoogleTrends)
-            const rawText = response.data
+            const mapped: Array<[string, string[]]> = [];
+            for (const entry of trendsData) {
+                if (!Array.isArray(entry)) continue;
 
-            const trendsData = this.extractJsonFromResponse(rawText)
-            if (!trendsData) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response', 'warn')
-                return []
+                const topic = typeof entry[0] === 'string' ? entry[0] : null;
+                let related: string[] = [];
+
+                try {
+                    if (Array.isArray(entry[9])) {
+                        const nested = entry[9];
+                        // find first nested array of strings
+                        for (const el of nested) {
+                            if (Array.isArray(el) && el.every((v: any) => typeof v === 'string')) {
+                                // safe convert to string[] without narrow-casting
+                                related = (el as any[]).map((v: any) => String(v));
+                                break;
+                            }
+                        }
+                        // fallback: collect string elements directly in nested
+                        if (!related.length) {
+                            related = nested.filter((x: any) => typeof x === 'string').map((v: any) => String(v));
+                        }
+                    } else {
+                        // fallback: find any string-array inside entry
+                        for (const el of entry) {
+                            if (Array.isArray(el) && el.length > 0 && typeof el[0] === 'string') {
+                                related = el.filter((r: any) => typeof r === 'string').map((v: any) => String(v));
+                                break;
+                            }
+                        }
+                    }
+                } catch {
+                    related = [];
+                }
+
+                if (topic) mapped.push([topic, related]);
             }
 
-            const mappedTrendsData = trendsData.map(query => [query[0], query[9]!.slice(1)])
-            if (mappedTrendsData.length < 90) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Insufficient search queries from trends, falling back to US', 'warn')
-                return this.getGoogleTrends()
+            if (mapped.length < 90 && geoLocale.toUpperCase() !== 'US' && !triedFallback) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient search queries from trends for ${geoLocale}, falling back to US`, 'warn');
+                return this.getGoogleTrends('US', true);
             }
 
-            for (const [topic, relatedQueries] of mappedTrendsData) {
-                queryTerms.push({
-                    topic: topic as string,
-                    related: relatedQueries as string[]
-                })
+            for (const [topic, rel] of mapped) {
+                queryTerms.push({ topic, related: Array.isArray(rel) ? rel : [] });
             }
-
-        } catch (error) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred while fetching trends: ' + (error instanceof Error ? error.message : String(error)), 'error')
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred while fetching trends: ' + (err instanceof Error ? err.message : String(err)), 'error');
         }
 
-        return queryTerms
+        return queryTerms;
     }
+
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
         const lines = String(text).split('\n')

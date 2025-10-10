@@ -9,66 +9,47 @@ import path from 'path'
 
 import { Workers } from '../Workers'
 import { MorePromotion, PromotionalItem } from '../../interface/DashboardData'
+import { AxiosRequestConfig } from 'axios'
 
 export class SearchOnBing extends Workers {
     /**
      * Main flow to perform "Search on Bing" activity.
-     * - Uses configured local queries.json when enabled, otherwise fetches remote repo file.
-     * - If no matching query is found, optionally calls OpenRouter to generate a concise query and (optionally) cache it.
-     * - Uses robust element interaction with fallback direct navigation to ensure the search completes.
      */
     async doSearchOnBing(page: Page, activity: MorePromotion | PromotionalItem) {
         this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING', 'Trying to complete SearchOnBing')
 
         try {
-            // Human-like delay before starting (2-5s)
             await this.bot.utils.wait(this.bot.utils.randomNumber(2000, 5000))
-
-            // Clear common overlays first
             await this.bot.browser.utils.tryDismissAllMessages(page)
 
             const query = await this.getSearchQuery(activity.title)
 
             const searchBar = '#sb_form_q'
-            // prefer locator + attached state for robustness
             const box = page.locator(searchBar)
-            await box.waitFor({ state: 'attached', timeout: 50000 }).catch(() => {
-                // If the search bar never attached, we'll try direct navigation fallback below
-            })
+            await box.waitFor({ state: 'attached', timeout: 50000 }).catch(() => { /* fallback below */ })
 
-            // try multiple approaches to type and submit the query
             try {
-                // try dismiss overlays again (sometimes they appear late)
                 await this.bot.browser.utils.tryDismissAllMessages(page)
                 await this.bot.utils.wait(200)
 
-                // Focus / fill / type aggressively but human-like
                 await box.focus({ timeout: 60000 }).catch(() => { /* ignore focus errors */ })
                 await box.fill('')
                 await this.bot.utils.wait(200)
-                // Type with a slight delay between keystrokes to appear human
                 await page.keyboard.type(query, { delay: 20 })
-                // Small pause before enter
                 await this.bot.utils.wait(this.bot.utils.randomNumber(200, 800))
                 await page.keyboard.press('Enter')
             } catch (typeErr) {
-                // As robust fallback, navigate directly to the search results URL
                 const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`
                 await page.goto(url).catch(() => { /* last-resort navigation */ })
             }
 
-            // Let results settle
             await this.bot.utils.wait(this.bot.utils.randomNumber(3000, 5000))
-
-            // Small extra wait to mimic a real visit
             await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
 
-            // Close the results/worker page
             try { await page.close() } catch (e) { /* ignore close errors */ }
 
             this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING', 'Completed the SearchOnBing successfully')
         } catch (error) {
-            // On any error: attempt a safe close, log and continue
             try { await page.close() } catch { /* ignore */ }
             this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING', 'An error occurred:' + String(error), 'error')
         }
@@ -76,13 +57,10 @@ export class SearchOnBing extends Workers {
 
     /**
      * Resolve a short search query for a given promotion title.
-     * Flow:
-     *  - If config.searchOnBingLocalQueries is true, read local queries.json.
-     *  - Otherwise attempt to fetch the repository raw queries.json.
-     *  - If not found, attempt the LLM (OpenRouter) fallback when an API key exists (runs even if enableOpenRouterForQueries is false).
+     * Try LLM first (if an OpenRouter API key is available). If LLM fails or no key,
+     * fall back to local queries.json or remote queries.json, then finally the title.
      */
     private async getSearchQuery(title: string): Promise<string> {
-        // Human-like delay before fetching query (0.5-1.5s)
         await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
 
         interface Queries {
@@ -93,10 +71,56 @@ export class SearchOnBing extends Workers {
         let queries: Queries[] = []
 
         try {
-            if (this.bot.config && this.bot.config.searchOnBingLocalQueries) {
-                // Read local queries.json shipped with the code
-                const data = fs.readFileSync(path.join(__dirname, '../queries.json'), 'utf8')
+            // --- Attempt LLM first if API key present ---
+            const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
+            const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
+            const apiKey = envKey || cfgKey
+
+            if (apiKey) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Attempting LLM-first fallback for title: ${title}`)
                 try {
+                    const llmQuery = await this.callOpenRouterForQuery(title, apiKey)
+                    if (llmQuery) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `LLM-first answer: ${llmQuery} | question: ${title}`)
+
+                        if (this.bot.config && this.bot.config.cacheGeneratedQueries) {
+                            try {
+                                const localPath = path.join(__dirname, '../queries.json')
+                                let existing: Queries[] = []
+                                if (fs.existsSync(localPath)) {
+                                    try {
+                                        existing = JSON.parse(fs.readFileSync(localPath, 'utf8'))
+                                        if (!Array.isArray(existing)) existing = []
+                                    } catch {
+                                        existing = []
+                                    }
+                                }
+                                existing.push({ title, queries: [llmQuery] })
+                                fs.writeFileSync(localPath, JSON.stringify(existing, null, 2), 'utf8')
+                                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Cached generated query for title: ${title}`)
+                            } catch (cacheErr) {
+                                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Caching failed: ${String(cacheErr)}`, 'warn')
+                            }
+                        }
+
+                        return llmQuery
+                    } else {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'LLM-first fallback returned empty or failed; continuing to other sources', 'warn')
+                    }
+                } catch (llmErr) {
+                    // callOpenRouterForQuery already logs details; still note and continue.
+                    this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `LLM-first attempt threw: ${String(llmErr)}. Falling back to queries.json`, 'warn')
+                }
+            } else {
+                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'No OpenRouter API key found (process.env.OPENROUTER_API_KEY or bot.config.openRouterApiKey). Skipping LLM-first step.', 'log')
+            }
+
+            // --- If we get here, either no API key or LLM failed; proceed to local/remote queries ---
+
+            if (this.bot.config && this.bot.config.searchOnBingLocalQueries) {
+                const localPath = path.join(__dirname, '../queries.json')
+                try {
+                    const data = fs.readFileSync(localPath, 'utf8')
                     const parsed = JSON.parse(data)
                     if (Array.isArray(parsed)) queries = parsed
                     else queries = []
@@ -105,19 +129,18 @@ export class SearchOnBing extends Workers {
                     queries = []
                 }
             } else {
-                // Fetch from GitHub raw so users don't need to pull updates manually
-                // small human-like delay before web request
                 await this.bot.utils.wait(this.bot.utils.randomNumber(300, 1000))
 
-                const response = await this.bot.axios.request({
+                const axiosReq: AxiosRequestConfig = {
                     method: 'GET',
                     url: 'https://raw.githubusercontent.com/TheNetsky/Microsoft-Rewards-Script/refs/heads/main/src/functions/queries.json',
-                    timeout: 8000
-                }).catch(() => ({ data: null }))
+                    timeout: 8000,
+                    responseType: 'text'
+                }
 
+                const response = await this.bot.axios.request(axiosReq).catch(() => ({ data: null }))
                 let remoteData: any = response && response.data ? response.data : null
 
-                // The raw response can be a string (JSON string) or already an object.
                 if (typeof remoteData === 'string') {
                     try {
                         remoteData = JSON.parse(remoteData)
@@ -130,7 +153,6 @@ export class SearchOnBing extends Workers {
                 if (Array.isArray(remoteData)) {
                     queries = remoteData
                 } else if (remoteData && typeof remoteData === 'object') {
-                    // Some repos may wrap the array; try common keys
                     if (Array.isArray((remoteData as any).queries)) queries = (remoteData as any).queries
                     else if (Array.isArray((remoteData as any).default)) queries = (remoteData as any).default
                     else queries = []
@@ -139,7 +161,7 @@ export class SearchOnBing extends Workers {
                 }
             }
 
-            // Try to find an exact / normalized match
+            // Find match (normalized)
             const answers = Array.isArray(queries) ? queries.find(x => this.normalizeString(x.title) === this.normalizeString(title)) : undefined
             if (answers && Array.isArray(answers.queries) && answers.queries.length > 0) {
                 const answer = this.bot.utils.shuffleArray(answers.queries)[0] as string
@@ -147,44 +169,8 @@ export class SearchOnBing extends Workers {
                 return answer
             }
 
-            // No pre-defined query found -> attempt LLM fallback when an API key exists. This now runs regardless of enableOpenRouterForQueries flag.
-            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `No local/remote query found for: ${title}. Attempting LLM fallback if API key present...`)
-
-            const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined
-            const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined
-            const apiKey = envKey || cfgKey
-
-            if (apiKey) {
-                const llmQuery = await this.callOpenRouterForQuery(title, apiKey)
-                if (llmQuery) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `LLM answer: ${llmQuery} | question: ${title}`)
-
-                    // Optional: cache generated query back to local queries.json if enabled
-                    if (this.bot.config && this.bot.config.cacheGeneratedQueries) {
-                        try {
-                            const localPath = path.join(__dirname, '../queries.json')
-                            let existing: Queries[] = []
-                            if (fs.existsSync(localPath)) {
-                                existing = JSON.parse(fs.readFileSync(localPath, 'utf8'))
-                            }
-                            existing.push({ title, queries: [llmQuery] })
-                            fs.writeFileSync(localPath, JSON.stringify(existing, null, 2), 'utf8')
-                            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Cached generated query for title: ${title}`)
-                        } catch (cacheErr) {
-                            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Caching failed: ${String(cacheErr)}`, 'warn')
-                        }
-                    }
-
-                    return llmQuery
-                } else {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'LLM fallback failed or returned empty', 'warn')
-                }
-            } else {
-                this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', 'No OpenRouter API key found (process.env.OPENROUTER_API_KEY or bot.config.openRouterApiKey). Skipping LLM fallback.', 'log')
-            }
-
-            // Final fallback: use the title itself as the query
-            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `Falling back to title for query: ${title}`)
+            // No LLM result earlier and no local/remote queries matched: fall back to title
+            this.bot.log(this.bot.isMobile, 'SEARCH-ON-BING-QUERY', `No local/remote query found for: ${title}. Falling back to title for query.`)
             return title
 
         } catch (error) {
@@ -194,18 +180,21 @@ export class SearchOnBing extends Workers {
     }
 
     private normalizeString(input: string): string {
-        return input.normalize('NFD').trim().toLowerCase().replace(/[^         return input.normalize('NFD').trim().toLowerCase().replace(/[^\x20-\x7E]/g, '').replace(/[?!]/g, '')
+        // Normalize accents, remove diacritics, keep printable ASCII characters, remove question/exclamation,
+        // normalize whitespace and lowercase for consistent comparisons.
+        if (typeof input !== 'string') return ''
+        const decomposed = input.normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip diacritics
+        const asciiOnly = decomposed.replace(/[^\x20-\x7E]/g, '') // printable ASCII
+        const noPunct = asciiOnly.replace(/[?!]/g, '') // remove these punctuation (keep other characters)
+        return noPunct.trim().toLowerCase()
     }
 
     /**
      * Calls OpenRouter's chat completions endpoint to generate a short query.
-     * Reads API key from environment variable OPENROUTER_API_KEY or from bot.config.openRouterApiKey.
-     * This will be attempted whenever an API key exists (see getSearchQuery).
-     * NOTE: request is sent with `proxy: false` to bypass any axios-level proxy settings.
+     * If bot.config.openRouterForceDirect === true, request will set proxy: false to bypass axios proxy.
      */
     private async callOpenRouterForQuery(title: string, providedApiKey?: string): Promise<string | null> {
         try {
-            // small delay to appear human-like
             await this.bot.utils.wait(this.bot.utils.randomNumber(300, 800))
 
             const envKey = providedApiKey || (process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined)
@@ -239,39 +228,69 @@ export class SearchOnBing extends Workers {
                 payload.zdr = true
             }
 
-            // Force bypass of proxy by setting proxy: false on this request. This overrides axios proxy behavior
+            // Only force bypass when explicit config is set; otherwise let axios follow normal proxy settings.
+            const forceDirect = !!(this.bot.config && this.bot.config.openRouterForceDirect === true)
+
             const resp = await this.bot.axios.request({
                 method: 'POST',
                 url: 'https://openrouter.ai/api/v1/chat/completions',
                 headers: {
                     'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
                 },
                 data: payload,
                 timeout: 15000,
-                proxy: false
+                ...(forceDirect ? { proxy: false } : {})
             })
 
+            // Robustly extract textual content from possible response shapes
             let llmText: string | undefined
-
-            if (resp && resp.data && Array.isArray(resp.data.choices) && resp.data.choices.length > 0) {
-                const msg = resp.data.choices[0].message
-                if (msg && typeof msg.content === 'string') llmText = msg.content
-                else if (typeof resp.data.choices[0].text === 'string') llmText = resp.data.choices[0].text
+            const tryExtract = (obj: any): string | undefined => {
+                if (!obj) return undefined
+                if (Array.isArray(obj.choices) && obj.choices.length) {
+                    const first = obj.choices[0]
+                    if (first?.message?.content && typeof first.message.content === 'string') return first.message.content
+                    if (typeof first.text === 'string') return first.text
+                    // some providers return {choices: [{ delta: { content: '...' }}, ...]}
+                    if (obj.choices.every((c: any) => c?.delta) ) {
+                        return obj.choices.map((c: any) => c.delta?.content || '').join('')
+                    }
+                }
+                if (typeof obj.output_text === 'string') return obj.output_text
+                if (Array.isArray(obj.result) && obj.result.length > 0) {
+                    const r0 = obj.result[0]
+                    if (r0?.content) {
+                        if (Array.isArray(r0.content) && typeof r0.content[0] === 'string') return r0.content[0]
+                        if (typeof r0.content === 'string') return r0.content
+                    }
+                }
+                if (typeof obj.generated_text === 'string') return obj.generated_text
+                return undefined
             }
 
-            if (!llmText && resp.data && typeof resp.data.output_text === 'string') llmText = resp.data.output_text
-            if (!llmText && resp.data && Array.isArray(resp.data.result) && resp.data.result[0]) {
-                const r0 = resp.data.result[0]
-                if (r0?.content) {
-                    if (Array.isArray(r0.content) && typeof r0.content[0] === 'string') llmText = r0.content[0]
-                    else if (typeof r0.content === 'string') llmText = r0.content
+            // resp.data might be string or object
+            if (resp && resp.data) {
+                if (typeof resp.data === 'string') {
+                    // Could be raw JSON string or plain text — try JSON parse
+                    try {
+                        const parsed = JSON.parse(resp.data)
+                        llmText = tryExtract(parsed) || parsed
+                    } catch {
+                        llmText = resp.data
+                    }
+                } else if (typeof resp.data === 'object') {
+                    llmText = tryExtract(resp.data) || (typeof resp.data === 'string' ? resp.data : undefined)
+                } else {
+                    llmText = String(resp.data)
                 }
             }
 
             if (!llmText) return null
 
-            const cleaned = llmText.trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || ''
+            // Clean and normalize: remove fences, take first non-empty line, strip surrounding quotes, enforce length
+            const stripFences = (s: string) => String(s).replace(/```(?:json)?/g, '')
+            const cleaned = stripFences(llmText).split('\n').map(s => s.trim()).filter(Boolean)[0] || ''
             const stripped = cleaned.replace(/^["']|["']$/g, '').trim()
             const finalText = stripped.length > 200 ? stripped.slice(0, 200) : stripped
 

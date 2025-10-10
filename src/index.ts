@@ -105,7 +105,6 @@ export class MicrosoftRewardsBot {
     private pointsCanCollect: number = 0
     private pointsInitial: number = 0
     private activeWorkers: number
-    private mobileRetryAttempts: number
     private browserFactory: Browser = new Browser(this)
     private accounts: Account[]
     private workers: Workers
@@ -137,7 +136,7 @@ export class MicrosoftRewardsBot {
         this.workers = new Workers(this)
         this.humanizer = new Humanizer(this.utils, this.config.humanization)
         this.activeWorkers = this.config.clusters
-        this.mobileRetryAttempts = 0
+        // this.mobileRetryAttempts = 0
         // Base buy mode from config
         const cfgAny = this.config as unknown as { buyMode?: { enabled?: boolean } }
         if (cfgAny.buyMode?.enabled === true) {
@@ -373,7 +372,7 @@ export class MicrosoftRewardsBot {
             const maxMinutes = Math.max(10, Number(maxMinutesRaw))
             const endAt = start + maxMinutes * 60 * 1000
             while (Date.now() < endAt) {
-                await this.utils.wait(10000)
+                await this.utils.waitRandom(8000, 12000) // More human-like variable refresh interval ~8-12s
                 // If monitor tab was closed by user, recreate it quietly
                 try {
                     if (monitor.isClosed()) {
@@ -478,7 +477,7 @@ export class MicrosoftRewardsBot {
                 const cr = this.config.crashRecovery
                 if (cr?.restartFailedWorker && code !== 0) {
                     const attempts = (worker as any)._restartAttempts || 0
-                    if (attempts < (cr.restartFailedWorkerAttempts ?? 1)) {
+                    if (attempts < (cr.restartFailedWorkerAttempts ?? 1) ) {
                         (worker as any)._restartAttempts = attempts + 1
                         rlog('main','CRASH-RECOVERY',`Respawning worker (attempt ${attempts + 1})`, 'warn','yellow')
                         const newW = cluster.fork()
@@ -599,8 +598,12 @@ export class MicrosoftRewardsBot {
             this.currentAccountEmail = account.email
             this.currentAccountRecoveryEmail = account.recoveryEmail
             rlog('main', 'MAIN-WORKER', `Preparing tasks for account ${account.email}`)
+            // Reset compromised state per account
+            this.compromisedModeActive = false
+            this.compromisedReason = undefined
+            this.compromisedEmail = undefined
             // Reset per-account mobile retry counter
-            this.mobileRetryAttempts = 0
+            // this.mobileRetryAttempts = 0
             // Random pre-start delay
             const preDelay = randomInt(startMin, startMax)
             rlog('main', 'MAIN-WORKER', `Waiting ${preDelay}ms before starting account ${account.email}`)
@@ -893,16 +896,39 @@ export class MicrosoftRewardsBot {
     }
 
     // Desktop
-// Assumes sleep(ms) exists and this.utils.wait(ms) may exist.
-// Replace the previous Desktop() and Mobile() methods with these.
-
+    // Desktop
+    // File: src/index.ts
+// Method: async Desktop(account: Account)
     async Desktop(account: Account) {
         rlog(this.isMobile, 'FLOW', 'Desktop() invoked');
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email);
         this.homePage = await browser.newPage();
 
         // Helper: small settle delay 1.0 - 1.5s
-        const smallSettle = () => Math.floor(Math.random() * 500);
+        const smallSettle = () => Math.floor(Math.random() * 500) + 1000;
+
+        // Utility helpers
+        const randomDelay = async (minMs = 1000, maxMs = 3000) => {
+            const delay = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(delay);
+            } else {
+                await sleep(delay);
+            }
+        };
+        const humanScroll = async (page: Page) => {
+            try {
+                const viewportHeight = (page.viewportSize()?.height || 720) / 2;
+                const scrollAmount = viewportHeight * (0.5 + Math.random() * 0.5);
+                const direction = Math.random() > 0.5 ? 1 : -1;
+                await page.evaluate((amount) => window.scrollBy(0, amount), scrollAmount * direction);
+                await randomDelay(300, 700);
+                if (Math.random() < 0.3) {
+                    await page.evaluate((amount) => window.scrollBy(0, amount), -scrollAmount * direction * 0.2);
+                    await randomDelay(100, 200);
+                }
+            } catch { /* ignore */ }
+        };
 
         // Fast navigation + small waits (total ~1-1.5s)
         try {
@@ -922,8 +948,8 @@ export class MicrosoftRewardsBot {
             // Small settle delay (1.0-1.5s)
             const settleMs = smallSettle();
             this.log(this.isMobile, 'MAIN', `Page fast-loaded; waiting additional ${settleMs}ms for JS to settle.`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(settleMs);
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(settleMs);
             } else {
                 await sleep(settleMs);
             }
@@ -932,8 +958,8 @@ export class MicrosoftRewardsBot {
             rlog(this.isMobile, 'MAIN', `Fast page-ready wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
             const waitMs = 100 + Math.floor(Math.random() * 500);
             this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page (fallback).`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(waitMs);
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(waitMs);
             } else {
                 await sleep(waitMs);
             }
@@ -956,7 +982,9 @@ export class MicrosoftRewardsBot {
         }
 
         await this.browser.func.goHome(this.homePage);
-        const data = await this.browser.func.getDashboardData();
+        await humanScroll(this.homePage);
+        await randomDelay(500, 1500);
+        let data = await this.browser.func.getDashboardData();
         this.pointsInitial = data.userStatus.availablePoints;
         const initial = this.pointsInitial;
         rlog(this.isMobile, 'MAIN-POINTS', `Current point count: ${this.pointsInitial}`);
@@ -973,44 +1001,104 @@ export class MicrosoftRewardsBot {
             return { initialPoints: initial, collectedPoints: 0 };
         }
 
-        const workerPage = await browser.newPage();
+        // Interleaving loop for human-like task switching
+        const maxLoops = 100; // Safety to prevent infinite loops
+        let loopCount = 0;
+        let currentData = data;
 
-        // Worker page: same fast approach
-        try {
-            rlog(this.isMobile, 'MAIN', 'Navigating worker page to home (fast) to avoid waiting on blank tab');
-            if (typeof this.browser.func.goHome === 'function') {
-                await this.browser.func.goHome(workerPage);
-            } else {
-                await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
+        while (loopCount < maxLoops) {
+            loopCount++;
+            await this.browser.func.goHome(this.homePage);
+            currentData = await this.browser.func.getDashboardData(); // Refresh data to check pending tasks
+
+            const categories: { name: string; action: () => Promise<void> }[] = [];
+
+            // Daily Set
+            const today = this.utils.getFormattedDate();
+            const dailyUncompleted = (currentData.dailySetPromotions[today] ?? []).filter(x => !x.complete && x.pointProgressMax > 0);
+            if (this.config.workers.doDailySet && dailyUncompleted.length > 0) {
+                categories.push({
+                    name: 'daily',
+                    action: async () => {
+                        const idx = randomInt(0, dailyUncompleted.length - 1);
+                        const item = dailyUncompleted[idx];
+                        if (item) {
+                            await this.workers.solveActivities(this.homePage, [item]);
+                        }
+                    }
+                });
             }
-            await workerPage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
-            await workerPage.waitForFunction(() => document.readyState === 'complete', { timeout: 100 }).catch(() => {});
-            await workerPage.waitForSelector('body', { timeout: 100 }).catch(() => {});
-            const settleMs = smallSettle();
-            this.log(this.isMobile, 'MAIN', `Worker page fast-loaded; waiting ${settleMs}ms for JS to settle.`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(settleMs);
-            } else {
-                await sleep(settleMs);
+
+            // Punch Cards
+            const punchUncompleted = (currentData.punchCards ?? []).filter(x => x.parentPromotion && !x.parentPromotion.complete);
+            if (this.config.workers.doPunchCards && punchUncompleted.length > 0) {
+                // choose a random parent punch card entry for later (we still guard everything)
+                const pcCandidate = punchUncompleted[randomInt(0, punchUncompleted.length - 1)];
+                if (pcCandidate) {
+                    const childUncompleted = (pcCandidate.childPromotions ?? []).filter(x => !x.complete);
+                    if (childUncompleted.length > 0) {
+                        categories.push({
+                            name: 'punch',
+                            action: async () => {
+                                const idx = randomInt(0, childUncompleted.length - 1);
+                                const child = childUncompleted[idx];
+                                if (child) {
+                                    await this.workers.solveActivities(this.homePage, [child], pcCandidate);
+                                }
+                            }
+                        });
+                    }
+                }
             }
-        } catch (err) {
-            rlog(this.isMobile, 'MAIN', `Worker page fast-wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
-            const waitMs = Math.floor(Math.random() * 500);
-            this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating worker page (fallback).`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(waitMs);
-            } else {
-                await sleep(waitMs);
+
+            // More Promotions
+            const moreUncompleted = (currentData.morePromotions ?? []).filter(x => !x.complete && x.pointProgressMax > 0 && x.exclusiveLockedFeatureStatus !== 'locked');
+            if (this.config.workers.doMorePromotions && moreUncompleted.length > 0) {
+                categories.push({
+                    name: 'promotions',
+                    action: async () => {
+                        const idx = randomInt(0, moreUncompleted.length - 1);
+                        const item = moreUncompleted[idx];
+                        if (item) {
+                            await this.workers.solveActivities(this.homePage, [item]);
+                        }
+                    }
+                });
             }
+
+            // Desktop Search
+            const pcSearchData = await this.browser.func.getSearchPoints();
+            const pcSearch = pcSearchData.pcSearch ? pcSearchData.pcSearch[0] : null;
+            if (this.config.workers.doDesktopSearch && pcSearch && pcSearch.pointProgress < pcSearch.pointProgressMax) {
+                categories.push({
+                    name: 'search',
+                    action: async () => {
+                        await this.activities.doSearch(this.homePage, currentData); // Removed numToDo since doSearch expects 2 args
+                    }
+                });
+            }
+
+            if (categories.length === 0) break; // All done
+
+            // Pick random category
+            const pickedIdx = randomInt(0, categories.length - 1);
+            const picked = categories[pickedIdx];
+            if (picked) {
+                try {
+                    await picked.action();
+                } catch (err) {
+                    this.log(this.isMobile, 'INTERLEAVE', `Error in category ${picked.name}: ${err}`, 'warn');
+                    // Continue to next without stopping
+                }
+            }
+
+            // Pause (stop)
+            await randomDelay(3000, 10000);
         }
 
-        await this.browser.func.goHome(workerPage);
-
-        // Tasks (unchanged)
-        if (this.config.workers.doDailySet) await this.workers.doDailySet(workerPage, data);
-        if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(workerPage, data);
-        if (this.config.workers.doPunchCards) await this.workers.doPunchCard(workerPage, data);
-        if (this.config.workers.doDesktopSearch) await this.activities.doSearch(workerPage, data);
+        if (loopCount >= maxLoops) {
+            this.log(this.isMobile, 'INTERLEAVE', 'Max loop count reached; possible stuck tasks. Proceeding to close.', 'warn');
+        }
 
         await saveSessionData(this.config.sessionPath, browser, account.email, this.isMobile);
         const after = await this.browser.func.getCurrentPoints().catch(() => initial);
@@ -1022,13 +1110,38 @@ export class MicrosoftRewardsBot {
     }
 
 
+// Mobile
+    // Mobile
     async Mobile(account: Account): Promise<{ initialPoints: number; collectedPoints: number }> {
         rlog(this.isMobile, 'FLOW', 'Mobile() invoked');
         let browser = await this.browserFactory.createBrowser(account.proxy, account.email);
         this.homePage = await browser.newPage();
 
         // Helper small settle
-        const smallSettle = () => Math.floor(Math.random() * 500);
+        const smallSettle = () => Math.floor(Math.random() * 500) + 1000;
+
+        // Utility helpers (same as Desktop)
+        const randomDelay = async (minMs = 1000, maxMs = 3000) => {
+            const delay = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(delay);
+            } else {
+                await sleep(delay);
+            }
+        };
+        const humanScroll = async (page: Page) => {
+            try {
+                const viewportHeight = (page.viewportSize()?.height || 720) / 2;
+                const scrollAmount = viewportHeight * (0.5 + Math.random() * 0.5);
+                const direction = Math.random() > 0.5 ? 1 : -1;
+                await page.evaluate((amount) => window.scrollBy(0, amount), scrollAmount * direction);
+                await randomDelay(300, 700);
+                if (Math.random() < 0.3) {
+                    await page.evaluate((amount) => window.scrollBy(0, amount), -scrollAmount * direction * 0.2);
+                    await randomDelay(100, 200);
+                }
+            } catch { /* ignore */ }
+        };
 
         // Fast initial navigation & small waits
         try {
@@ -1036,15 +1149,15 @@ export class MicrosoftRewardsBot {
             if (typeof this.browser.func.goHome === 'function') {
                 await this.browser.func.goHome(this.homePage);
             } else {
-                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000  });
+                await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
             }
-            await this.homePage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
-            await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 300 }).catch(() => {});
-            await this.homePage.waitForSelector('body', { timeout: 300 }).catch(() => {});
+            await this.homePage.waitForLoadState('domcontentloaded', { timeout: 5000 + Math.random() * 2000 }).catch(() => { })
+            await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 1500 + Math.random() * 1000 }).catch(() => {})
+            await this.homePage.waitForSelector('body', { timeout: 5000 + Math.random() * 2000 }).catch(() => { })
             const settleMs = smallSettle();
             this.log(this.isMobile, 'MAIN', `Page fast-loaded; waiting additional ${settleMs}ms for JS to settle.`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(settleMs);
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(settleMs);
             } else {
                 await sleep(settleMs);
             }
@@ -1052,8 +1165,8 @@ export class MicrosoftRewardsBot {
             rlog(this.isMobile, 'MAIN', `Fast page-ready wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
             const waitMs = Math.floor(Math.random() * 500);
             this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page (fallback).`);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(waitMs);
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(waitMs);
             } else {
                 await sleep(waitMs);
             }
@@ -1083,9 +1196,9 @@ export class MicrosoftRewardsBot {
             try { await this.browser.func.closeBrowser(browser, account.email); } catch (err) { rlog(this.isMobile, 'MAIN', `Error closing browser before retry for ${account.email}: ${err}`, 'warn'); }
 
             // Wait only 1-1.5s (instead of 10 minutes)
-            const TEN_MS = Math.floor(Math.random() * 500);
-            if (this.utils && typeof (this.utils as any).wait === 'function') {
-                await (this.utils as any).wait(TEN_MS);
+            const TEN_MS = Math.floor(Math.random() * 500) + 1000;
+            if (this.utils && typeof this.utils.wait === 'function') {
+                await this.utils.wait(TEN_MS);
             } else {
                 await sleep(TEN_MS);
             }
@@ -1103,12 +1216,12 @@ export class MicrosoftRewardsBot {
                     } else {
                         await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
                     }
-                    await this.homePage.waitForLoadState('domcontentloaded', { timeout: 200 }).catch(() => {});
-                    await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 100 }).catch(() => {});
-                    await this.homePage.waitForSelector('body', { timeout: 200 }).catch(() => {});
+                    await this.homePage.waitForLoadState('domcontentloaded', { timeout: 5000 + Math.random() * 2000 }).catch(() => { })
+                    await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 1500 + Math.random() * 1000 }).catch(() => {})
+                    await this.homePage.waitForSelector('body', { timeout: 5000 + Math.random() * 2000 }).catch(() => { })
                     const settleMs = smallSettle();
-                    if (this.utils && typeof (this.utils as any).wait === 'function') {
-                        await (this.utils as any).wait(settleMs);
+                    if (this.utils && typeof this.utils.wait === 'function') {
+                        await this.utils.wait(settleMs);
                     } else {
                         await sleep(settleMs);
                     }
@@ -1141,6 +1254,8 @@ export class MicrosoftRewardsBot {
 
         // Continue normal mobile flow
         await this.browser.func.goHome(this.homePage);
+        await humanScroll(this.homePage);
+        await randomDelay(500, 1500);
         const data = await this.browser.func.getDashboardData();
         const initialPoints = data.userStatus.availablePoints || this.pointsInitial || 0;
         const browserEnarablePoints = await this.browser.func.getBrowserEarnablePoints();
@@ -1167,75 +1282,71 @@ export class MicrosoftRewardsBot {
             rlog(this.isMobile, 'MAIN', 'App points unknown due to fetch error but proceeding because app data is unavailable.', 'log', 'yellow');
         }
 
-        // doDailyCheckIn / readToEarn / mobile searches unchanged except waits inside them
-        if (this.config.workers.doDailyCheckIn) {
-            try { await this.activities.doDailyCheckIn(this.accessToken, data); } catch (err) { rlog(this.isMobile, 'MOBILE', `DailyCheckIn failed for ${account.email}: ${err}`, 'warn'); }
-        }
-        if (this.config.workers.doReadToEarn) {
-            try { await this.activities.doReadToEarn(this.accessToken, data); } catch (err) { rlog(this.isMobile, 'MOBILE', `ReadToEarn failed for ${account.email}: ${err}`, 'warn'); }
-        }
+        // Interleaving loop for mobile
+        const maxLoops = 100;
+        let loopCount = 0;
+        let currentData = data;
 
-        if (this.config.workers.doMobileSearch) {
-            if (data.userStatus.counters.mobileSearch) {
-                this.mobileRetryAttempts = 0;
-                const workerPage = await browser.newPage();
+        // Flags for single-run tasks like checkin and read (since no easy way to check completion without running)
+        let checkInDone = false;
+        let readDone = false;
 
-                try {
-                    if (typeof this.browser.func.goHome === 'function') {
-                        await this.browser.func.goHome(workerPage);
-                    } else {
-                        await workerPage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000 });
-                    }
-                    await workerPage.waitForLoadState('domcontentloaded', { timeout: 200}).catch(() => {});
-                    await workerPage.waitForFunction(() => document.readyState === 'complete', { timeout: 200}).catch(() => {});
-                    await workerPage.waitForSelector('body', { timeout: 200}).catch(() => {});
-                    const settleMs = smallSettle();
-                    if (this.utils && typeof (this.utils as any).wait === 'function') {
-                        await (this.utils as any).wait(settleMs);
-                    } else {
-                        await sleep(settleMs);
-                    }
-                } catch (err) {
-                    rlog(this.isMobile, 'MAIN', `Worker page fast-wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
-                    const waitMs = Math.floor(Math.random() * 500);
-                    if (this.utils && typeof (this.utils as any).wait === 'function') {
-                        await (this.utils as any).wait(waitMs);
-                    } else {
-                        await sleep(waitMs);
-                    }
-                }
+        while (loopCount < maxLoops) {
+            loopCount++;
+            await this.browser.func.goHome(this.homePage);
+            currentData = await this.browser.func.getDashboardData(); // refresh
 
-                await this.browser.func.goHome(workerPage);
-                try {
-                    await this.activities.doSearch(workerPage, data);
-                } catch (err) {
-                    rlog(this.isMobile, 'MOBILE', `Mobile searches failed for ${account.email}: ${err}`, 'warn');
-                }
+            const categories: { name: string; action: () => Promise<void> }[] = [];
 
-                // rest of retry logic unchanged...
-                const mobileSearchCounter = (await this.browser.func.getSearchPoints()).mobileSearch?.[0];
-                if (mobileSearchCounter && (mobileSearchCounter.pointProgressMax - mobileSearchCounter.pointProgress) > 0) {
-                    this.mobileRetryAttempts++;
-                }
-                if (this.mobileRetryAttempts > (this.config.searchSettings?.retryMobileSearchAmount ?? 2)) {
-                    rlog(this.isMobile, 'MAIN', `Max retry limit of ${this.config.searchSettings?.retryMobileSearchAmount ?? 2} reached. Not retrying further.`, 'warn');
-                } else if (this.mobileRetryAttempts !== 0) {
-                    rlog(this.isMobile, 'MAIN', `Attempt ${this.mobileRetryAttempts}/${this.config.searchSettings?.retryMobileSearchAmount ?? 2}: Unable to complete mobile searches. Retrying once...`, 'log', 'yellow');
-                    await this.browser.func.closeBrowser(browser, account.email);
-                    const retryInstance = new MicrosoftRewardsBot(true);
-                    retryInstance.axios = this.axios;
-                    retryInstance.config = this.config;
-                    retryInstance.utils = this.utils;
-                    try {
-                        return await retryInstance.Mobile(account);
-                    } catch (err) {
-                        rlog(this.isMobile, 'MAIN', `Mobile retry failed for ${account.email}: ${err}`, 'warn');
-                        return { initialPoints: initialPoints, collectedPoints: 0 };
+            if (this.config.workers.doDailyCheckIn && !checkInDone) {
+                categories.push({
+                    name: 'checkin',
+                    action: async () => {
+                        await this.activities.doDailyCheckIn(this.accessToken, currentData);
+                        checkInDone = true; // Mark done after attempt
                     }
-                }
-            } else {
-                rlog(this.isMobile, 'MAIN', 'Unable to fetch search points, your account is most likely too "new" for this! Try again later!', 'warn');
+                });
             }
+
+            if (this.config.workers.doReadToEarn && !readDone) {
+                categories.push({
+                    name: 'read',
+                    action: async () => {
+                        await this.activities.doReadToEarn(this.accessToken, currentData);
+                        readDone = true; // Mark done after attempt
+                    }
+                });
+            }
+
+            // Mobile Search
+            const mobileSearchData = await this.browser.func.getSearchPoints();
+            const mobileSearchCounter = mobileSearchData.mobileSearch ? mobileSearchData.mobileSearch[0] : null;
+            if (this.config.workers.doMobileSearch && mobileSearchCounter && mobileSearchCounter.pointProgress < mobileSearchCounter.pointProgressMax) {
+                categories.push({
+                    name: 'search',
+                    action: async () => {
+                        await this.activities.doSearch(this.homePage, currentData); // Removed numToDo since doSearch expects 2 args
+                    }
+                });
+            }
+
+            if (categories.length === 0) break;
+
+            const pickedIdx = randomInt(0, categories.length - 1);
+            const picked = categories[pickedIdx];
+            if (picked) {
+                try {
+                    await picked.action();
+                } catch (err) {
+                    this.log(this.isMobile, 'INTERLEAVE', `Error in category ${picked.name}: ${err}`, 'warn');
+                }
+            }
+
+            await randomDelay(3000, 10000);
+        }
+
+        if (loopCount >= maxLoops) {
+            this.log(this.isMobile, 'INTERLEAVE', 'Max loop count reached; possible stuck tasks. Proceeding to close.', 'warn');
         }
 
         const afterPointAmount = await this.browser.func.getCurrentPoints();
@@ -1246,6 +1357,8 @@ export class MicrosoftRewardsBot {
             collectedPoints: (afterPointAmount - initialPoints) || 0
         };
     }
+
+
 
 
 
@@ -1485,26 +1598,6 @@ export class MicrosoftRewardsBot {
             await ConclusionWebhook(cfg, fallback, { embeds })
         }
         // Write local JSON report for observability
-        try {
-            const fs = await import('fs')
-            const path = await import('path')
-            const now = new Date()
-            const day = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`
-            const baseDir = path.join(process.cwd(), 'reports', day)
-            if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true })
-            const file = path.join(baseDir, `summary_${this.runId}.json`)
-            const payload = {
-                runId: this.runId,
-                timestamp: now.toISOString(),
-                totals: { totalCollected, totalInitial, totalEnd, totalDuration, totalAccounts, accountsWithErrors },
-                perAccount: summaries
-            }
-            fs.writeFileSync(file, JSON.stringify(payload, null, 2), 'utf-8')
-            rlog('main','REPORT',`Saved report to ${file}`)
-        } catch (e) {
-            rlog('main','REPORT',`Failed to save report: ${e instanceof Error ? e.message : e}`,'warn')
-        }
-        // Optionally cleanup old diagnostics folders
         try {
             const days = cfg.diagnostics?.retentionDays
             if (typeof days === 'number' && days > 0) {
