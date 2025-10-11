@@ -26,9 +26,11 @@ type ActivityKind =
 export default class Activities {
     private bot: MicrosoftRewardsBot
     private handlers: ActivityHandler[] = []
+    private search: Search
 
     constructor(bot: MicrosoftRewardsBot) {
         this.bot = bot
+        this.search = new Search(this.bot)
     }
 
     // Extension point: register custom activity handlers
@@ -38,9 +40,6 @@ export default class Activities {
 
     /**
      * Small humanization helper used after activity actions.
-     * Uses bot.config.humanization if present:
-     *  bot.config.humanization.enabled (bool) - disable all human delays when false
-     *  bot.config.humanization.actionDelay = { min: number, max: number } - explicit ms bounds
      */
     private async humanPause(minMs = 1000, maxMs = 3000) {
         try {
@@ -70,7 +69,7 @@ export default class Activities {
     }
 
     /**
-     * Simulate natural scrolling behaviour. Random distance, occasional slight reverse.
+     * Simulate natural scrolling behaviour.
      */
     private async humanScroll(page: Page) {
         try {
@@ -106,7 +105,6 @@ export default class Activities {
 
     /**
      * Central dispatch entry point.
-     * First tries custom registered handlers, then falls back to built-in classifiers.
      */
     async run(page: Page, activity: MorePromotion | PromotionalItem): Promise<void> {
         // Try custom handlers first
@@ -187,41 +185,21 @@ export default class Activities {
         return { type: 'unsupported' }
     }
 
-    // ---- activity wrappers (instantiate per-call so they get fresh bot reference) ----
+    // ---- activity wrappers ----
 
     /**
-     * doSearch now supports an optional numSearches parameter.
-     * If provided, activities will attempt to perform up to that many searches in this call.
+     * Updated doSearch with proper chunking support
      */
     async doSearch(page: Page, data: DashboardData, numSearches?: number): Promise<void> {
-        // small pre-search humanization: scroll + optional hover on the search field
+        // small pre-search humanization
         await this.humanScroll(page)
         await this.humanHover(page, '#sb_form_q')
 
-        // instantiate and delegate to the Search activity
-        const search = new Search(this.bot)
-
         try {
-            // If caller provided a hint for number of searches, forward it.
-            // Search.doSearch should be updated to accept the optional third parameter.
-            // We keep compatibility with existing signature by checking function length
-            // but prefer passing numSearches when available.
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            // @ts-ignore
-            if (typeof (search.doSearch) === 'function') {
-                // attempt to call with numSearches; if upstream doesn't accept it, it should ignore the extra arg
-                // calling with explicit three args is safe in JS/TS if function ignores extras
-                // ensure reasonable guard on numSearches (positive integer)
-                let n: number | undefined = undefined
-                if (typeof numSearches === 'number' && Number.isInteger(numSearches) && numSearches > 0) n = Math.min(Math.max(1, numSearches), 50) // cap
-
-                await (search as any).doSearch(page, data, n)
-            } else {
-                // fallback: call old signature
-                await (search as any).doSearch(page, data)
-            }
+            // Call the search instance with the numSearches parameter
+            await this.search.doSearch(page, data, numSearches)
         } catch (err) {
-            this.bot.log(this.bot.isMobile, 'ACTIVITY', `doSearch wrapper error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+            this.bot.log(this.bot.isMobile, 'ACTIVITY', `doSearch error: ${err instanceof Error ? err.message : String(err)}`, 'error')
         }
 
         // small post-search humanization
@@ -286,7 +264,6 @@ export default class Activities {
 
     async doReadToEarn(accessToken: string, data: DashboardData): Promise<void> {
         const readToEarn = new ReadToEarn(this.bot)
-        // API-based: quicker pauses
         await readToEarn.doReadToEarn(accessToken, data)
         await this.humanPause(500, 1500)
     }

@@ -377,7 +377,10 @@ export class Workers {
        Public flows (DailySet / PunchCard / MorePromotions)
        ========================= */
 
-    async doDailySet(page: Page, data: DashboardData) {
+    /**
+     * Updated doDailySet with interleaving support
+     */
+    async doDailySet(page: Page, data: DashboardData, maxActivities?: number) {
         const today = this.bot.utils.getFormattedDate()
         const todayData = data.dailySetPromotions[today] ?? []
 
@@ -392,11 +395,18 @@ export class Workers {
             return
         }
 
-        this.bot.log(this.bot.isMobile, 'DAILY-SET', 'Started solving "Daily Set" items')
+        this.bot.log(this.bot.isMobile, 'DAILY-SET',
+            `Started solving "Daily Set" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
 
-        await this.solveActivities(page, activitiesUncompleted)
+        // Use chunking if maxActivities is specified
+        const activitiesToProcess = maxActivities ?
+            activitiesUncompleted.slice(0, maxActivities) :
+            activitiesUncompleted
 
-        if (this.bot.config.jobState?.enabled !== false) {
+        await this.solveActivities(page, activitiesToProcess, undefined, maxActivities)
+
+        if (this.bot.config.jobState?.enabled !== false && !maxActivities) {
+            // Only mark as done if we're completing all activities (not chunking)
             const email = this.bot.currentAccountEmail || 'unknown'
             for (const a of activitiesUncompleted) {
                 this.jobState.markDone(email, today, a.offerId)
@@ -405,9 +415,17 @@ export class Workers {
 
         page = await this.bot.browser.utils.getLatestTab(page)
         await this.bot.browser.func.goHome(page)
-        this.bot.log(this.bot.isMobile, 'DAILY-SET', 'All "Daily Set" items have been completed')
 
-        if (!this.bot.isMobile && this.bot.config.workers?.bundleDailySetWithSearch && this.bot.config.workers?.doDesktopSearch) {
+        if (maxActivities && activitiesToProcess.length < activitiesUncompleted.length) {
+            this.bot.log(this.bot.isMobile, 'DAILY-SET',
+                `Completed ${activitiesToProcess.length} Daily Set items this iteration (${activitiesUncompleted.length - activitiesToProcess.length} remaining)`)
+        } else {
+            this.bot.log(this.bot.isMobile, 'DAILY-SET', 'All "Daily Set" items have been completed')
+        }
+
+        // Bundle with search only when completing all activities
+        if (!this.bot.isMobile && this.bot.config.workers?.bundleDailySetWithSearch &&
+            this.bot.config.workers?.doDesktopSearch && !maxActivities) {
             try {
                 await this.bot.utils.waitRandom(1200, 2600)
                 await this.bot.activities.doSearch(page, data)
@@ -417,7 +435,10 @@ export class Workers {
         }
     }
 
-    async doPunchCard(page: Page, data: DashboardData) {
+    /**
+     * Updated doPunchCard with interleaving support
+     */
+    async doPunchCard(page: Page, data: DashboardData, maxActivities?: number) {
         const punchCardsUncompleted = data.punchCards?.filter(x => x.parentPromotion && !x.parentPromotion.complete) ?? []
 
         if (!punchCardsUncompleted.length) {
@@ -425,7 +446,10 @@ export class Workers {
             return
         }
 
-        for (const punchCard of punchCardsUncompleted) {
+        let totalProcessed = 0
+        const maxCardsToProcess = maxActivities ? Math.min(maxActivities, punchCardsUncompleted.length) : punchCardsUncompleted.length
+
+        for (const punchCard of punchCardsUncompleted.slice(0, maxCardsToProcess)) {
             if (!punchCard.parentPromotion?.title) {
                 this.bot.log(this.bot.isMobile, 'PUNCH-CARD', `Skipped punchcard "${punchCard.name}" | Reason: Parent promotion is missing!`, 'warn')
                 continue
@@ -435,11 +459,13 @@ export class Workers {
 
             const activitiesUncompleted = punchCard.childPromotions.filter(x => !x.complete)
 
-            this.bot.log(this.bot.isMobile, 'PUNCH-CARD', `Started solving "Punch Card" items for punchcard: "${punchCard.parentPromotion.title}"`)
+            this.bot.log(this.bot.isMobile, 'PUNCH-CARD',
+                `Started solving "Punch Card" items for punchcard: "${punchCard.parentPromotion.title}"`)
 
             await page.goto(punchCard.parentPromotion.destinationUrl, { referer: this.bot.config.baseURL, timeout: 120000 + Math.random() * 20000 })
             await page.waitForLoadState('networkidle', { timeout: 5000 + Math.random() * 3000 }).catch(() => {})
 
+            // Process all child activities for this punch card (they're usually small sets)
             await this.solveActivities(page, activitiesUncompleted, punchCard)
 
             page = await this.bot.browser.utils.getLatestTab(page)
@@ -451,13 +477,28 @@ export class Workers {
                 await this.bot.browser.func.goHome(page)
             }
 
-            this.bot.log(this.bot.isMobile, 'PUNCH-CARD', `All items for punchcard: "${punchCard.parentPromotion.title}" have been completed`)
+            this.bot.log(this.bot.isMobile, 'PUNCH-CARD',
+                `Completed items for punchcard: "${punchCard.parentPromotion.title}"`)
+            totalProcessed++
+
+            // If we're chunking and have reached our limit, break early
+            if (maxActivities && totalProcessed >= maxActivities) {
+                break
+            }
         }
 
-        this.bot.log(this.bot.isMobile, 'PUNCH-CARD', 'All "Punch Card" items have been completed')
+        if (maxActivities && totalProcessed < punchCardsUncompleted.length) {
+            this.bot.log(this.bot.isMobile, 'PUNCH-CARD',
+                `Completed ${totalProcessed} punch cards this iteration (${punchCardsUncompleted.length - totalProcessed} remaining)`)
+        } else {
+            this.bot.log(this.bot.isMobile, 'PUNCH-CARD', 'All "Punch Card" items have been completed')
+        }
     }
 
-    async doMorePromotions(page: Page, data: DashboardData) {
+    /**
+     * Updated doMorePromotions with interleaving support
+     */
+    async doMorePromotions(page: Page, data: DashboardData, maxActivities?: number) {
         const morePromotions = data.morePromotions
 
         if (data.promotionalItem) {
@@ -473,37 +514,48 @@ export class Workers {
             return
         }
 
-        this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS', 'Started solving "More Promotions" items')
+        this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS',
+            `Started solving "More Promotions" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
+
+        // Use chunking if maxActivities is specified
+        const activitiesToProcess = maxActivities ?
+            activitiesUncompleted.slice(0, maxActivities) :
+            activitiesUncompleted
 
         page = await this.bot.browser.utils.getLatestTab(page)
-        await this.solveActivities(page, activitiesUncompleted)
+        await this.solveActivities(page, activitiesToProcess, undefined, maxActivities)
         page = await this.bot.browser.utils.getLatestTab(page)
         await this.bot.browser.func.goHome(page)
 
-        this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS', 'All "More Promotion" items have been completed')
+        if (maxActivities && activitiesToProcess.length < activitiesUncompleted.length) {
+            this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS',
+                `Completed ${activitiesToProcess.length} More Promotion items this iteration (${activitiesUncompleted.length - activitiesToProcess.length} remaining)`)
+        } else {
+            this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS', 'All "More Promotion" items have been completed')
+        }
     }
 
     /**
-     * Solve activities with robust selector candidates, click logic, and human-like behavior.
+     * UPDATED: solveActivities with chunking support for interleaving
      */
-    /**
-     * Solve activities with robust selector candidates, click logic, and human-like behavior.
-     */
-    /**
-     * Solve activities with robust selector candidates, click logic, and human-like behavior.
-     */
-    // File: src/functions/Workers.ts
-// Method: public async solveActivities(...)
-    public async solveActivities(activityPage: Page, activities: BaseActivity[], punchCard?: PunchCard) {
+    public async solveActivities(activityPage: Page, activities: BaseActivity[], punchCard?: PunchCard, maxActivities?: number) {
         const activityInitial = activityPage.url();
 
         const retry = new Retry(this.bot.config.retryPolicy);
         const throttle = new AdaptiveThrottler();
 
-        // Shuffle activities safely
-        const shuffledActivities = [...activities].sort(() => Math.random() - 0.5);
+        // Shuffle activities safely, but only process up to maxActivities if specified
+        let activitiesToProcess = [...activities].sort(() => Math.random() - 0.5);
+        if (maxActivities && maxActivities > 0) {
+            activitiesToProcess = activitiesToProcess.slice(0, maxActivities);
+            this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                `Processing ${activitiesToProcess.length} of ${activities.length} activities this iteration`);
+        }
 
-        for (const activity of shuffledActivities) {
+        let processedCount = 0;
+
+        for (const activity of activitiesToProcess) {
+            processedCount++;
             try {
                 activityPage = await this.bot.browser.utils.getLatestTab(activityPage);
 
@@ -557,12 +609,14 @@ export class Workers {
                         clickedResult = res;
                         break;
                     } else {
-                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Could not click selector "${sel}" for "${activity.title}" | reason: ${res.reason}`, 'warn');
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                            `Could not click selector "${sel}" for "${activity.title}" | reason: ${res.reason}`, 'warn');
                     }
                 }
 
                 if (!clickedResult || !clickedResult.success) {
-                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Skipped activity "${activity.title}" | Reason: Could not click any selectors (tried ${candidateCount})`, 'warn');
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                        `Skipped activity "${activity.title}" | Reason: Could not click any selectors (tried ${candidateCount})`, 'warn');
                     await this.bot.utils.wait(500 + Math.random() * 500);
                     throttle.record(false);
                     continue;
@@ -579,9 +633,13 @@ export class Workers {
                 await this.bot.utils.waitRandom(800, 2200);
                 if (Math.random() < 0.7) await this.humanScroll(activityPage);
 
-                const typeLabel = this.bot.activities?.getTypeLabel ? this.bot.activities.getTypeLabel(activity as PromotionalItem | MorePromotion) : activity.promotionType || 'unknown';
+                const typeLabel = this.bot.activities?.getTypeLabel ?
+                    this.bot.activities.getTypeLabel(activity as PromotionalItem | MorePromotion) :
+                    activity.promotionType || 'unknown';
+
                 if (typeLabel !== 'Unsupported') {
-                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "${typeLabel}" title: "${activity.title}"`);
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                        `Processing activity ${processedCount}/${activitiesToProcess.length}: "${typeLabel}" - "${activity.title}"`);
                     const timeoutMs = this.bot.utils.stringToMs(this.bot.config?.globalTimeout ?? '30s') * 2 + Math.random() * 10000;
                     const runWithTimeout = (p: Promise<void>) => Promise.race([
                         p,
@@ -600,16 +658,17 @@ export class Workers {
                             }
                         }, () => true);
                     } catch (e) {
-                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Activity "${activity.title}" failed after retries: ${e instanceof Error ? e.message : e}`, 'error');
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                            `Activity "${activity.title}" failed after retries: ${e instanceof Error ? e.message : e}`, 'error');
                     }
                 } else {
-                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Skipped activity "${activity.title}" | Reason: Unsupported type: "${activity.promotionType}"!`, 'warn');
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY',
+                        `Skipped activity "${activity.title}" | Reason: Unsupported type: "${activity.promotionType}"!`, 'warn');
                 }
 
                 await this.bot.browser.utils.humanizePage(activityPage);
                 {
                     const m = throttle.getDelayMultiplier();
-                    // FIXED: use this.bot.utils instead of this.utils
                     await this.bot.utils.waitRandom(Math.floor(1200 * m), Math.floor(2600 * m));
                 }
                 if (Math.random() < 0.4) await this.humanHover(activityPage, 'body');
@@ -618,6 +677,8 @@ export class Workers {
                 this.bot.log(this.bot.isMobile, 'ACTIVITY', `An error occurred: ${error}`, 'error');
             }
         }
-    }
 
+        this.bot.log(this.bot.isMobile, 'ACTIVITY',
+            `Completed processing ${processedCount} activities this iteration`);
+    }
 }

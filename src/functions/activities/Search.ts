@@ -22,8 +22,8 @@ export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
 
-    public async doSearch(page: Page, data: DashboardData) {
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
+    public async doSearch(page: Page, data: DashboardData, numSearches?: number) {
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING', `Starting Bing searches${numSearches ? ` (max ${numSearches} this run)` : ''}`)
 
         // Human-like delay before starting searches (1-3 seconds)
         await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
@@ -38,28 +38,127 @@ export class Search extends Workers {
             return
         }
 
-        // decide geo for LLM context or trends
-        const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
+        // Initialize or reuse query state for interleaving
+        if (!this.currentQueries || this.currentQueries.length === 0 || this.currentQueryIndex >= this.currentQueries.length) {
+            await this.initializeQueries(data)
+        }
 
-        // Try to seed with Google Trends or local fallback first (optional)
+        const pointsPerSearch = this.bot.config.searchSettings?.pointsPerSearch || 5
+        const maxNeededSearches = Math.ceil(missingPoints / pointsPerSearch)
+
+        // Determine how many searches to do in this chunk
+        const searchesToDo = numSearches ?
+            Math.min(numSearches, maxNeededSearches) :
+            maxNeededSearches
+
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING',
+            `Doing ${searchesToDo} searches this iteration (${missingPoints} points remaining, ${maxNeededSearches} total needed)`)
+
+        let attempts = 0
+        const maxSearchAttempts = Math.min(searchesToDo * 2, this.bot.config.searchSettings.maxSearchAttempts || 100)
+        let stagnation = 0
+        let searchesCompleted = 0
+
+        while (searchesCompleted < searchesToDo && attempts < maxSearchAttempts && missingPoints > 0) {
+            attempts++
+
+            // Get next query from our pre-generated list
+            if (this.currentQueryIndex >= this.currentQueries.length) {
+                // If we run out of queries, generate more
+                await this.initializeQueries(data)
+            }
+
+            const query = this.currentQueries[this.currentQueryIndex++]
+            if (!query) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'No query available, skipping', 'warn')
+                continue
+            }
+
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING',
+                `${missingPoints} Points Remaining | Query: ${query} (${searchesCompleted + 1}/${searchesToDo})`)
+
+            searchCounters = await this.bingSearch(page, query)
+            const newMissingPoints = this.calculatePoints(searchCounters)
+
+            if (newMissingPoints === missingPoints) {
+                stagnation++
+            } else {
+                stagnation = 0
+                searchesCompleted++
+            }
+
+            missingPoints = newMissingPoints
+
+            if (missingPoints === 0) break
+
+            // Break conditions for stagnation
+            if (stagnation > 5 && this.bot.isMobile) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search stagnation detected on mobile, breaking', 'warn')
+                break
+            }
+
+            if (stagnation > 10) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search stagnation detected, breaking', 'warn')
+                break
+            }
+        }
+
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING',
+            `Completed ${searchesCompleted} searches this iteration (${missingPoints} points remaining)`)
+    }
+
+// Add these instance variables to your Search class for state management
+    private currentQueries: string[] = []
+    private currentQueryIndex: number = 0
+
+    /**
+     * Initialize or refresh the query list (replaces the inline query initialization)
+     */
+    private async initializeQueries(data: DashboardData) {
+        const geo = this.bot.config.searchSettings.useGeoLocaleQueries ?
+            (data?.userProfile?.attributes?.country || 'US') : 'US'
+
         let initialQueries: GoogleSearch[] = []
+
+        // Try Google Trends first (preserving your existing logic)
         try {
             initialQueries = await this.getGoogleTrends(geo)
         } catch {
             // ignore - we'll fallback to local
         }
+
+        // Fallback to local queries
         if (!initialQueries.length) {
             try {
                 const local = await import('../queries.json')
-                initialQueries = (local.default || []).slice(0, Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25, (local.default || []).length))).map((x: any) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
+                initialQueries = (local.default || []).slice(0,
+                    Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25,
+                        (local.default || []).length))
+                ).map((x: any) => ({
+                    topic: x.queries?.[0] || x.title,
+                    related: x.queries?.slice(1) || []
+                }))
             } catch { /* ignore */ }
         }
 
-        // Shuffle & dedupe seed queries
+        // If we still have no queries, try LLM to generate some initial ones
+        if (!initialQueries.length) {
+            try {
+                const llmQuery = await this.getSingleQueryFromLLM(geo)
+                if (llmQuery) {
+                    initialQueries = [{ topic: llmQuery, related: [] }]
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM',
+                    'LLM failed during query initialization: ' + (err instanceof Error ? err.message : String(err)), 'warn')
+            }
+        }
+
+        // Shuffle & dedupe (preserving your existing logic)
         initialQueries = this.bot.utils.shuffleArray(initialQueries)
         const seen = new Set<string>()
-        // Narrow the filter to guarantee string[] (avoids "string | undefined")
-        const seedTopics: string[] = initialQueries
+
+        this.currentQueries = initialQueries
             .map(q => q.topic)
             .filter((t): t is string => !!t && typeof t === 'string')
             .filter(t => {
@@ -69,84 +168,8 @@ export class Search extends Workers {
                 return true
             })
 
-        // We'll use seedTopics first (if present), then fall back to LLM single-query-per-call.
-        let seedIndex = 0
-        let stagnation = 0 // consecutive searches without point progress
-
-        // Main loop: continue until no points left or we hit safety limits
-        const maxSearchAttempts = Math.max(100, (this.bot.config.searchSettings.maxSearchAttempts || 100))
-        let attempts = 0
-
-        while (missingPoints > 0 && attempts < maxSearchAttempts) {
-            attempts++
-
-            // choose a query:
-            // prefer seed topics until exhausted; after that call the LLM for a single query each time
-            let query = ''
-            if (seedIndex < seedTopics.length) {
-                query = seedTopics[seedIndex++]!
-            } else {
-                try {
-                    // Ask LLM for a single student-like query (using OpenAI client pointed at OpenRouter)
-                    const maybeQuery = await this.getSingleQueryFromLLM(geo)
-                    if (!maybeQuery) {
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'LLM returned no query; falling back to generating from local/trends', 'warn')
-                        // If LLM fails, try a small fallback from local queries file
-                        try {
-                            const local = await import('../queries.json')
-                            const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, 5).map((x: any) => x.queries?.[0] || x.title)
-                            if (sampled.length) {
-                                query = sampled[0]
-                            }
-                        } catch { /* ignore */ }
-                    } else {
-                        query = maybeQuery
-                    }
-                } catch (err) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Single-query LLM call failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
-                    // Give a short delay and continue to try
-                    await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
-                    continue
-                }
-            }
-
-            if (!query) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'No query available for search iteration, aborting', 'warn')
-                break
-            }
-
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING', `${missingPoints} Points Remaining | Query: ${query}`)
-
-            searchCounters = await this.bingSearch(page, query)
-            const newMissingPoints = this.calculatePoints(searchCounters)
-
-            if (newMissingPoints === missingPoints) {
-                stagnation++
-            } else {
-                stagnation = 0
-            }
-
-            missingPoints = newMissingPoints
-
-            if (missingPoints === 0) break
-
-            if (stagnation > 5 && this.bot.isMobile) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 5 iterations, likely bad User-Agent', 'warn')
-                break
-            }
-
-            if (stagnation > 10) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 10 iterations aborting searches', 'warn')
-                stagnation = 0
-                break
-            }
-        }
-
-        if (missingPoints > 0 && this.bot.isMobile) {
-            return
-        }
-
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Completed searches')
+        this.currentQueryIndex = 0
+        this.bot.log(this.bot.isMobile, 'SEARCH', `Initialized ${this.currentQueries.length} queries for interleaving`)
     }
 
     private async bingSearch(searchPage: Page, query: string) {

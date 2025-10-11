@@ -1003,105 +1003,148 @@ export class MicrosoftRewardsBot {
             return { initialPoints: initial, collectedPoints: 0 };
         }
 
+        // Create worker page for activities
+        const workerPage = await browser.newPage();
+        await this.browser.func.goHome(workerPage);
+
         // Interleaving loop for human-like task switching
         const maxLoops = 100; // Safety to prevent infinite loops
         let loopCount = 0;
         let currentData = data;
+
+        // Track progress for activities that need multiple steps
+        const activityProgress = {
+            dailySetCompleted: new Set<string>(),
+            punchCardsCompleted: new Set<string>(),
+            morePromotionsCompleted: new Set<string>()
+        };
 
         while (loopCount < maxLoops) {
             loopCount++;
             await this.browser.func.goHome(this.homePage);
             currentData = await this.browser.func.getDashboardData(); // Refresh data to check pending tasks
 
-            const categories: { name: string; action: () => Promise<void> }[] = [];
+            const categories: { name: string; action: () => Promise<void>; priority: number }[] = [];
 
-            // Daily Set
+            // Daily Set - process 1-2 activities at a time
             const today = this.utils.getFormattedDate();
-            const dailyUncompleted = (currentData.dailySetPromotions[today] ?? []).filter(x => !x.complete && x.pointProgressMax > 0);
+            const dailyUncompleted = (currentData.dailySetPromotions[today] ?? [])
+                .filter(x => !x.complete && x.pointProgressMax > 0)
+                .filter(x => !activityProgress.dailySetCompleted.has(x.offerId || x.title));
+
             if (this.config.workers.doDailySet && dailyUncompleted.length > 0) {
                 categories.push({
                     name: 'daily',
                     action: async () => {
-                        const idx = randomInt(0, dailyUncompleted.length - 1);
-                        const item = dailyUncompleted[idx];
-                        if (item) {
-                            await this.workers.solveActivities(this.homePage, [item]);
-                        }
-                    }
+                        const activitiesToProcess = dailyUncompleted.slice(0, randomInt(1, 2)); // Process 1-2 activities
+                        this.log(this.isMobile, 'INTERLEAVE', `Processing ${activitiesToProcess.length} Daily Set activities`);
+
+                        await this.workers.doDailySet(workerPage, currentData, activitiesToProcess.length);
+
+                        // Mark as completed in our progress tracker
+                        activitiesToProcess.forEach(activity => {
+                            activityProgress.dailySetCompleted.add(activity.offerId || activity.title);
+                        });
+                    },
+                    priority: 3 // High priority - daily sets are time-sensitive
                 });
             }
 
-            // Punch Cards
-            const punchUncompleted = (currentData.punchCards ?? []).filter(x => x.parentPromotion && !x.parentPromotion.complete);
+            // Punch Cards - process 1 card at a time
+            // FIXED: Add proper type guard for parentPromotion
+            const punchUncompleted = (currentData.punchCards ?? [])
+                .filter(x => x.parentPromotion && !x.parentPromotion.complete)
+                .filter(x => {
+                    // Type guard to ensure parentPromotion exists
+                    if (!x.parentPromotion) return false;
+                    return !activityProgress.punchCardsCompleted.has(x.parentPromotion.title);
+                });
+
             if (this.config.workers.doPunchCards && punchUncompleted.length > 0) {
-                const pcCandidate = punchUncompleted[randomInt(0, punchUncompleted.length - 1)];
-                if (pcCandidate) {
-                    const childUncompleted = (pcCandidate.childPromotions ?? []).filter(x => !x.complete);
-                    if (childUncompleted.length > 0) {
-                        categories.push({
-                            name: 'punch',
-                            action: async () => {
-                                const idx = randomInt(0, childUncompleted.length - 1);
-                                const child = childUncompleted[idx];
-                                if (child) {
-                                    await this.workers.solveActivities(this.homePage, [child], pcCandidate);
+                categories.push({
+                    name: 'punch',
+                    action: async () => {
+                        const cardsToProcess = punchUncompleted.slice(0, 1); // Process 1 punch card
+                        // FIXED: Add null check for parentPromotion
+                        if (cardsToProcess.length > 0 && cardsToProcess[0]?.parentPromotion) {
+                            this.log(this.isMobile, 'INTERLEAVE', `Processing 1 Punch Card: ${cardsToProcess[0].parentPromotion.title}`);
+
+                            await this.workers.doPunchCard(workerPage, currentData, 1);
+
+                            // Mark as completed in our progress tracker
+                            cardsToProcess.forEach(card => {
+                                if (card.parentPromotion) {
+                                    activityProgress.punchCardsCompleted.add(card.parentPromotion.title);
                                 }
-                            }
-                        });
-                    }
-                }
+                            });
+                        }
+                    },
+                    priority: 2 // Medium priority
+                });
             }
 
-            // More Promotions
-            const moreUncompleted = (currentData.morePromotions ?? []).filter(x => !x.complete && x.pointProgressMax > 0 && x.exclusiveLockedFeatureStatus !== 'locked');
+            // More Promotions - process 1-2 activities at a time
+            const moreUncompleted = (currentData.morePromotions ?? [])
+                .filter(x => !x.complete && x.pointProgressMax > 0 && x.exclusiveLockedFeatureStatus !== 'locked')
+                .filter(x => !activityProgress.morePromotionsCompleted.has(x.offerId || x.title));
+
             if (this.config.workers.doMorePromotions && moreUncompleted.length > 0) {
                 categories.push({
                     name: 'promotions',
                     action: async () => {
-                        const idx = randomInt(0, moreUncompleted.length - 1);
-                        const item = moreUncompleted[idx];
-                        if (item) {
-                            await this.workers.solveActivities(this.homePage, [item]);
-                        }
-                    }
+                        const activitiesToProcess = moreUncompleted.slice(0, randomInt(1, 2)); // Process 1-2 activities
+                        this.log(this.isMobile, 'INTERLEAVE', `Processing ${activitiesToProcess.length} More Promotion activities`);
+
+                        await this.workers.doMorePromotions(workerPage, currentData, activitiesToProcess.length);
+
+                        // Mark as completed in our progress tracker
+                        activitiesToProcess.forEach(activity => {
+                            activityProgress.morePromotionsCompleted.add(activity.offerId || activity.title);
+                        });
+                    },
+                    priority: 1 // Lower priority
                 });
             }
 
-            // Desktop Search (chunked)
+            // Desktop Search (chunked) - process 2-4 searches at a time
             const pcSearchData = await this.browser.func.getSearchPoints();
             const pcSearch = pcSearchData.pcSearch ? pcSearchData.pcSearch[0] : null;
             if (this.config.workers.doDesktopSearch && pcSearch && pcSearch.pointProgress < pcSearch.pointProgressMax) {
                 categories.push({
                     name: 'search',
                     action: async () => {
-                        // estimate points per search (configurable)
                         const pointsPerSearch = (this.config.searchSettings?.pointsPerSearch) || 5;
                         const missingPoints = Math.max(0, (pcSearch.pointProgressMax || 0) - (pcSearch.pointProgress || 0));
-
-                        // how many searches needed to satisfy missingPoints
                         const needed = Math.max(1, Math.ceil(missingPoints / pointsPerSearch));
-                        // chunk size 1..3
-                        const chunk = randomInt(1, 3);
-                        const searchesToDo = Math.min(chunk, needed);
 
-                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Desktop: performing up to ${searchesToDo} searches this iteration (missingPoints=${missingPoints})`);
+                        // Do 2-4 searches per iteration
+                        const searchesToDo = randomInt(2, 4);
+                        const actualSearches = Math.min(searchesToDo, needed);
+
+                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Desktop: performing ${actualSearches} searches (${missingPoints} points remaining, ${needed} total needed)`);
                         try {
-                            // call doSearch with numSearches hint (update doSearch to accept third arg)
-                            await this.activities.doSearch(this.homePage, currentData, searchesToDo);
+                            await this.activities.doSearch(workerPage, currentData, actualSearches);
                         } catch (err) {
                             this.log(this.isMobile, 'INTERLEAVE', `Desktop search action failed: ${err}`, 'warn');
                         }
-                    }
+                    },
+                    priority: 2 // Medium priority - searches are important but can be interleaved
                 });
             }
 
-            if (categories.length === 0) break; // All done
+            if (categories.length === 0) {
+                this.log(this.isMobile, 'INTERLEAVE', 'All tasks completed!', 'log', 'green');
+                break; // All done
+            }
 
-            // Pick random category
-            const pickedIdx = randomInt(0, categories.length - 1);
-            const picked = categories[pickedIdx];
+            // Sort by priority (higher first) and pick from top 2-3 categories
+            categories.sort((a, b) => b.priority - a.priority);
+            const topCategories = categories.slice(0, randomInt(2, 3));
+            const picked = topCategories[randomInt(0, topCategories.length - 1)];
+
             if (picked) {
                 try {
+                    this.log(this.isMobile, 'INTERLEAVE', `Executing ${picked.name} task (priority: ${picked.priority})`);
                     await picked.action();
                 } catch (err) {
                     this.log(this.isMobile, 'INTERLEAVE', `Error in category ${picked.name}: ${err}`, 'warn');
@@ -1109,8 +1152,17 @@ export class MicrosoftRewardsBot {
                 }
             }
 
-            // Pause between loop iterations to look human
+            // Variable pause between loop iterations (3-10 seconds)
             await randomDelay(3000, 10000);
+
+            // Occasionally refresh data to get current state
+            if (loopCount % 5 === 0) {
+                try {
+                    currentData = await this.browser.func.getDashboardData();
+                } catch (err) {
+                    this.log(this.isMobile, 'INTERLEAVE', `Failed to refresh dashboard data: ${err}`, 'warn');
+                }
+            }
         }
 
         if (loopCount >= maxLoops) {
@@ -1120,6 +1172,8 @@ export class MicrosoftRewardsBot {
         await saveSessionData(this.config.sessionPath, browser, account.email, this.isMobile);
         const after = await this.browser.func.getCurrentPoints().catch(() => initial);
         await this.browser.func.closeBrowser(browser, account.email);
+
+        this.log(this.isMobile, 'DESKTOP-SUMMARY', `Completed Desktop session: ${initial} → ${after} points (+${after - initial})`);
         return {
             initialPoints: initial,
             collectedPoints: (after - initial) || 0
@@ -1304,6 +1358,10 @@ export class MicrosoftRewardsBot {
             rlog(this.isMobile, 'MAIN', 'App points unknown due to fetch error but proceeding because app data is unavailable.', 'log', 'yellow');
         }
 
+        // Create worker page for mobile searches
+        const workerPage = await browser.newPage();
+        await this.browser.func.goHome(workerPage);
+
         // Interleaving loop for mobile
         const maxLoops = 100;
         let loopCount = 0;
@@ -1318,29 +1376,35 @@ export class MicrosoftRewardsBot {
             await this.browser.func.goHome(this.homePage);
             currentData = await this.browser.func.getDashboardData(); // refresh
 
-            const categories: { name: string; action: () => Promise<void> }[] = [];
+            const categories: { name: string; action: () => Promise<void>; priority: number }[] = [];
 
+            // Daily Check-in (one-time)
             if (this.config.workers.doDailyCheckIn && !checkInDone) {
                 categories.push({
                     name: 'checkin',
                     action: async () => {
+                        this.log(this.isMobile, 'INTERLEAVE', 'Performing daily check-in');
                         await this.activities.doDailyCheckIn(this.accessToken, currentData);
                         checkInDone = true;
-                    }
+                    },
+                    priority: 3 // High priority - one-time task
                 });
             }
 
+            // Read to Earn (one-time)
             if (this.config.workers.doReadToEarn && !readDone) {
                 categories.push({
                     name: 'read',
                     action: async () => {
+                        this.log(this.isMobile, 'INTERLEAVE', 'Performing read to earn');
                         await this.activities.doReadToEarn(this.accessToken, currentData);
                         readDone = true;
-                    }
+                    },
+                    priority: 2 // Medium priority
                 });
             }
 
-            // Mobile Search (chunked)
+            // Mobile Search (chunked) - process 2-4 searches at a time
             const mobileSearchData = await this.browser.func.getSearchPoints();
             const mobileSearchCounter = mobileSearchData.mobileSearch ? mobileSearchData.mobileSearch[0] : null;
             if (this.config.workers.doMobileSearch && mobileSearchCounter && mobileSearchCounter.pointProgress < mobileSearchCounter.pointProgressMax) {
@@ -1350,41 +1414,63 @@ export class MicrosoftRewardsBot {
                         const pointsPerSearch = (this.config.searchSettings?.pointsPerSearch) || 5;
                         const missingPoints = Math.max(0, (mobileSearchCounter.pointProgressMax || 0) - (mobileSearchCounter.pointProgress || 0));
                         const needed = Math.max(1, Math.ceil(missingPoints / pointsPerSearch));
-                        const chunk = randomInt(1, 3);
-                        const searchesToDo = Math.min(chunk, needed);
 
-                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Mobile: performing up to ${searchesToDo} searches this iteration (missingPoints=${missingPoints})`);
+                        // Do 2-4 searches per iteration
+                        const searchesToDo = randomInt(2, 4);
+                        const actualSearches = Math.min(searchesToDo, needed);
+
+                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Mobile: performing ${actualSearches} searches (${missingPoints} points remaining, ${needed} total needed)`);
                         try {
-                            await this.activities.doSearch(this.homePage, currentData, searchesToDo);
+                            await this.activities.doSearch(workerPage, currentData, actualSearches);
                         } catch (err) {
                             this.log(this.isMobile, 'INTERLEAVE', `Mobile search action failed: ${err}`, 'warn');
                         }
-                    }
+                    },
+                    priority: 1 // Lower priority - can be interleaved with other tasks
                 });
             }
 
-            if (categories.length === 0) break;
+            if (categories.length === 0) {
+                this.log(this.isMobile, 'INTERLEAVE', 'All mobile tasks completed!', 'log', 'green');
+                break;
+            }
 
-            const pickedIdx = randomInt(0, categories.length - 1);
-            const picked = categories[pickedIdx];
+            // Sort by priority and pick from top categories
+            categories.sort((a, b) => b.priority - a.priority);
+            const topCategories = categories.slice(0, randomInt(1, 2)); // Mobile: be more focused
+            const picked = topCategories[randomInt(0, topCategories.length - 1)];
+
             if (picked) {
                 try {
+                    this.log(this.isMobile, 'INTERLEAVE', `Executing mobile ${picked.name} task`);
                     await picked.action();
                 } catch (err) {
-                    this.log(this.isMobile, 'INTERLEAVE', `Error in category ${picked.name}: ${err}`, 'warn');
+                    this.log(this.isMobile, 'INTERLEAVE', `Error in mobile category ${picked.name}: ${err}`, 'warn');
                 }
             }
 
-            await randomDelay(3000, 10000);
+            // Shorter pauses for mobile (2-8 seconds)
+            await randomDelay(2000, 8000);
+
+            // Refresh data periodically
+            if (loopCount % 5 === 0) {
+                try {
+                    currentData = await this.browser.func.getDashboardData();
+                } catch (err) {
+                    this.log(this.isMobile, 'INTERLEAVE', `Failed to refresh mobile dashboard data: ${err}`, 'warn');
+                }
+            }
         }
 
         if (loopCount >= maxLoops) {
-            this.log(this.isMobile, 'INTERLEAVE', 'Max loop count reached; possible stuck tasks. Proceeding to close.', 'warn');
+            this.log(this.isMobile, 'INTERLEAVE', 'Max mobile loop count reached; proceeding to close.', 'warn');
         }
 
         const afterPointAmount = await this.browser.func.getCurrentPoints();
-        rlog(this.isMobile, 'MAIN-POINTS', `The script collected ${afterPointAmount - initialPoints} points today`);
+        rlog(this.isMobile, 'MAIN-POINTS', `Mobile session collected ${afterPointAmount - initialPoints} points today`);
         await this.browser.func.closeBrowser(browser, account.email);
+
+        this.log(this.isMobile, 'MOBILE-SUMMARY', `Completed Mobile session: ${initialPoints} → ${afterPointAmount} points (+${afterPointAmount - initialPoints})`);
         return {
             initialPoints: initialPoints,
             collectedPoints: (afterPointAmount - initialPoints) || 0
