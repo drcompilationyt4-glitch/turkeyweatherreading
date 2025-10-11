@@ -293,8 +293,11 @@ export class Search extends Workers {
         const client = new OpenAI({
             baseURL: 'https://openrouter.ai/api/v1',
             apiKey,
-            defaultHeaders
-        } as any) // 'openai' types may differ; `as any` avoids type friction
+            defaultHeaders,
+            // --- Key Change: Explicitly disable proxy usage ---
+            httpAgent: undefined,
+            httpsAgent: undefined,
+        } as any)// 'openai' types may differ; `as any` avoids type friction
 
         const systemPrompt = `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.`;
         const userPrompt = `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.`;
