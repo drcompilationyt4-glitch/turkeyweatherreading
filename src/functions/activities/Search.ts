@@ -21,6 +21,9 @@ export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
 
+    // store last response status for diagnostics
+    private _lastOpenRouterStatusCode?: number
+
     public async doSearch(page: Page, data: DashboardData) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
 
@@ -37,16 +40,15 @@ export class Search extends Workers {
             return
         }
 
-        // Generate search queries (probabilistic: 60% LLM -> OpenRouter, 40% original Google Trends)
+        // --- LLM FIRST, FALLBACK TO TRENDS + LOCAL ---
         const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
         let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo)
 
-        // Fallback: if trends/LLM failed or insufficient, sample from local queries file
+        // Fallback: if trends/LLM failed or insufficient, sample from local queries file (extra safety)
         if (!googleSearchQueries.length || googleSearchQueries.length < 10) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Primary trends source insufficient, falling back to local queries.json', 'warn')
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Primary queries insufficient, falling back to local queries.json', 'warn')
             try {
                 const local = await import('../queries.json')
-                // Flatten & sample
                 const sampleSize = Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25, (local.default || []).length))
                 const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, sampleSize)
                 googleSearchQueries = sampled.map((x: { title: string; queries: string[] }) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
@@ -259,50 +261,43 @@ export class Search extends Workers {
         return await this.bot.browser.func.getSearchPoints()
     }
 
-    /**
-     * Decide whether to use LLM-based generator (60%) or original Google Trends (40%).
-     * If LLM is chosen but fails, fall back to Google Trends for this run.
-     */
+    // === LLM-FIRST QUERY GENERATION (with fallbacks) ===
     private async getSearchQueries(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        // 60% chance to attempt LLM generation
-        const useLLM = Math.random() < 0.6
+        // 60% chance used previously in other code, but here we will attempt LLM first always.
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting LLM-based query generation (primary path)')
 
-        if (useLLM) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting LLM-based query generation (60% path)')
-            try {
-                const llmResult = await this.generateQueriesWithLLM(geoLocale)
+        try {
+            const llmResult = await this.generateQueriesWithLLM(geoLocale)
 
-                if (Array.isArray(llmResult) && llmResult.length > 0) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmResult.length} queries`)
-                    return llmResult
-                } else {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM returned empty/invalid result, falling back to Google Trends', 'warn')
-                }
-            } catch (err) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM generation failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
+            if (Array.isArray(llmResult) && llmResult.length > 0) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmResult.length} queries`)
+                return llmResult
+            } else {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM returned empty/invalid result, falling back to Google Trends', 'warn')
             }
-
-            // Fall-through: LLM failed or returned invalid -> use original Google Trends for this run
-            try {
-                return await this.getGoogleTrends(geoLocale)
-            } catch (e) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Fallback Google Trends also failed: ' + (e instanceof Error ? e.message : String(e)), 'error')
-                return []
-            }
-        } else {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Using original Google Trends (40% path)')
-            return this.getGoogleTrends(geoLocale)
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM generation failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
         }
+
+        // Fall back to Google Trends
+        try {
+            const trends = await this.getGoogleTrends(geoLocale)
+            if (Array.isArray(trends) && trends.length > 0) return trends
+        } catch (e) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Fallback Google Trends failed: ' + (e instanceof Error ? e.message : String(e)), 'warn')
+        }
+
+        // Local fallback handled by caller if needed
+        return []
     }
 
     /**
      * Use OpenRouter (chat completions) to ask for a JSON array of "university-student-like" search queries.
      * Expected output: [{ topic: "example topic", related: ["r1","r2", ...] }, ...]
      *
-     * IMPORTANT: This implementation uses native `https.request` with `agent: false` to bypass any
-     * axios/global proxy or agent configuration. Behaves like previous function in terms of parsing and errors.
+     * If the first attempt fails and a proxy appears to be configured (via environment or this.bot.config.proxy),
+     * this will retry the request with environment proxy variables temporarily removed (i.e., no proxy).
      */
-    // === generateQueriesWithLLM ===
     private async generateQueriesWithLLM(geoLocale: string): Promise<GoogleSearch[]> {
         const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
         const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
@@ -327,7 +322,6 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
             temperature: 0.7
         };
 
-        const url = new URL('https://openrouter.ai/api/v1/chat/completions');
         const payload = JSON.stringify(body);
         const timeoutMs = (this.bot.config?.openRouter?.timeoutMs) || 10000;
 
@@ -335,38 +329,38 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Authorization': `Bearer ${apiKey}`,
-            ...(this.bot.config?.openRouter?.referer ? { 'Referer': this.bot.config.openRouter.referer } : {}),
+            ...(this.bot.config?.openRouter?.referer ? { 'Referer': this.bot.config.openRouter.referer, 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
             ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {})
         };
 
         let rawResponse = '';
         let statusCode: number | undefined;
 
+        // Attempt 1: normal request (this will use environment proxy variables if present = "with proxy")
         try {
-            rawResponse = await new Promise<string>((resolve, reject) => {
-                const req = https.request({
-                    hostname: url.hostname,
-                    port: url.port || 443,
-                    path: url.pathname + url.search,
-                    method: 'POST',
-                    headers,
-                    agent: undefined as any
-                }, (res) => {
-                    statusCode = res.statusCode;
-                    const chunks: Buffer[] = [];
-                    res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-                    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-                });
-
-                req.on('error', (err) => reject(err));
-                req.setTimeout(timeoutMs, () => req.destroy(new Error('OpenRouter request timeout')));
-                req.write(payload);
-                req.end();
-            });
+            rawResponse = await this.performOpenRouterRequest(payload, headers, timeoutMs, false)
+            statusCode = this._lastOpenRouterStatusCode
         } catch (err) {
-            const details = (err as Error).message || JSON.stringify(err || {});
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${statusCode || ''} ${details}`, 'error');
-            throw err;
+            const details = (err as Error).message || String(err)
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed (first attempt): ${details}`, 'error')
+
+            // If a proxy appears to be configured, retry without environment proxy vars ("without proxy").
+            const envHasProxy = Boolean(process.env.HTTP_PROXY || process.env.http_proxy || process.env.HTTPS_PROXY || process.env.https_proxy)
+            const botHasProxyConfig = Boolean(this.bot.config?.proxy)
+            if (envHasProxy || botHasProxyConfig) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Detected proxy configuration; retrying OpenRouter request without environment proxy variables', 'warn')
+                try {
+                    rawResponse = await this.performOpenRouterRequest(payload, headers, timeoutMs, true)
+                    statusCode = this._lastOpenRouterStatusCode
+                } catch (err2) {
+                    const details2 = (err2 as Error).message || String(err2)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter retry without proxy failed: ${details2}`, 'error')
+                    throw err2
+                }
+            } else {
+                // No proxy detected — rethrow original error
+                throw err
+            }
         }
 
         // top-level parse attempt
@@ -403,18 +397,18 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
                 const jsonPieces: string[] = [];
                 for (const line of lines) {
                     const m = line.match(/^data:\s*(.*)$/);
-                    if (!m) continue;
-                    // guard against m[1] possibly being undefined
-                    if (typeof m[1] !== 'string') continue;
+                    // Ensure match exists and group 1 is a string
+                    if (!m || typeof m[1] !== 'string') continue;
                     const payloadChunk = m[1].trim();
                     if (payloadChunk === '[DONE]') continue;
+                    if (payloadChunk.length === 0) continue;
                     jsonPieces.push(payloadChunk);
                 }
 
                 // parse from last to first the JSON chunks
                 for (let i = jsonPieces.length - 1; i >= 0; i--) {
                     const chunk = jsonPieces[i];
-                    if (typeof chunk !== 'string') continue; // <-- TS-safe guard
+                    if (!chunk) continue;
                     try {
                         const parsedChunk = JSON.parse(chunk);
                         const maybe = extractContent(parsedChunk);
@@ -496,216 +490,128 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
         return normalized;
     }
 
-// === getGoogleTrends ===
-    private async getGoogleTrends(geoLocale: string = 'US', triedFallback: boolean = false): Promise<GoogleSearch[]> {
-        const queryTerms: GoogleSearch[] = [];
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`);
+    /**
+     * Perform the HTTPS request to OpenRouter. If disableEnvProxy is true, temporarily removes
+     * environment proxy variables (HTTP_PROXY / HTTPS_PROXY / http_proxy / https_proxy) for the duration
+     * of the request so the request is made without the OS/env proxy.
+     */
+    private async performOpenRouterRequest(payload: string, headers: Record<string, string>, timeoutMs: number, disableEnvProxy: boolean): Promise<string> {
+        const url = new URL('https://openrouter.ai/api/v1/chat/completions');
+        // Save existing env proxy vars if asked to disable them
+        const savedEnv: Record<string, string | undefined> = {}
+        const proxyEnvKeys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
 
-        // small human-like delay
-        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500));
-
-        // Build basic request payload (same as before)
-        const request: AxiosRequestConfig = {
-            url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                'Accept': '*/*',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
-            },
-            data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
-            responseType: 'text',
-            timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
-        };
-
-        // Debug: log proxy-related config and env proxies
-        try {
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `config.proxy.proxyGoogleTrends: ${JSON.stringify(this.bot.config?.proxy?.proxyGoogleTrends)}`);
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `env HTTP_PROXY: ${process.env.HTTP_PROXY || process.env.http_proxy || ''} | HTTPS_PROXY: ${process.env.HTTPS_PROXY || process.env.https_proxy || ''}`);
-        } catch {
-            // ignore logging failures
+        if (disableEnvProxy) {
+            for (const k of proxyEnvKeys) {
+                savedEnv[k] = process.env[k]
+                if (process.env[k]) delete process.env[k]
+            }
         }
 
-        // Normalize proxy configuration and build axios config
-        const axiosConfig: any = { ...request };
-
-        const rawProxy = this.bot.config?.proxy?.proxyGoogleTrends;
-
-        // Helper: validate a proxy host is not localhost/loopback (avoid accidental ::1)
-        const isLocalhostCandidate = (host?: string | null) => {
-            if (!host) return false;
-            const h = String(host).toLowerCase();
-            return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.startsWith('127.') || h.startsWith('::1') || h === '[::1]';
-        };
-
-        if (!rawProxy) {
-            // Explicitly disable proxy so axios doesn't use environment proxies
-            axiosConfig.proxy = false;
-        } else if (typeof rawProxy === 'string') {
-            try {
-                const p = new URL(rawProxy);
-                const hostname = p.hostname;
-                const port = p.port ? Number(p.port) : (p.protocol === 'https:' ? 443 : 80);
-
-                if (isLocalhostCandidate(hostname)) {
-                    // don't accidentally proxy to localhost — disable and warn
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Configured proxy resolves to localhost (${hostname}). Disabling proxy for Google Trends request.`, 'warn');
-                    axiosConfig.proxy = false;
-                } else {
-                    // Use axios proxy shape
-                    axiosConfig.proxy = {
-                        host: hostname,
-                        port,
-                        protocol: p.protocol?.replace(':', '') || undefined
-                    };
-                    if (p.username || p.password) {
-                        axiosConfig.proxy.auth = { username: decodeURIComponent(p.username), password: decodeURIComponent(p.password) };
-                    }
-                }
-            } catch (parseErr) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Invalid proxy string for proxyGoogleTrends: ${String(rawProxy)}. Disabling proxy.`, 'warn');
-                axiosConfig.proxy = false;
-            }
-        } else if (typeof rawProxy === 'object') {
-            // trust object format but guard against local host
-            if (isLocalhostCandidate((rawProxy as any).host)) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `proxyGoogleTrends object points to localhost. Disabling proxy.`, 'warn');
-                axiosConfig.proxy = false;
-            } else {
-                axiosConfig.proxy = rawProxy;
-            }
-        } else {
-            axiosConfig.proxy = false;
-        }
-
-        // Force IPv4 lookup to avoid accidental ::1 resolution / IPv6 loopback mapping.
-        // We reuse the https import already present at top of file.
         try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const dns = require('dns');
-
-            // custom lookup that forces family:4
-            const lookup = (hostname: string, options: any, callback: Function) => {
-                // options may be the integer in older node signatures
-                try {
-                    dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
-                        callback(err, address, family);
+            return await new Promise<string>((resolve, reject) => {
+                const req = https.request({
+                    hostname: url.hostname,
+                    port: url.port || 443,
+                    path: url.pathname + url.search,
+                    method: 'POST',
+                    headers,
+                    agent: undefined as any // explicitly undefined to avoid agent/proxy reuse
+                }, (res) => {
+                    const statusCode = res.statusCode;
+                    const chunks: Buffer[] = [];
+                    res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+                    res.on('end', () => {
+                        const raw = Buffer.concat(chunks).toString('utf8');
+                        // store for caller diagnostics
+                        this._lastOpenRouterStatusCode = statusCode;
+                        resolve(raw);
                     });
-                } catch (e) {
-                    // fallback to default lookup if something goes wrong
-                    dns.lookup(hostname, (err: any, address: any, family: any) => callback(err, address, family));
-                }
-            };
+                });
 
-            // create agent to pass to axios (keepAlive helps)
-            axiosConfig.httpsAgent = new https.Agent({ keepAlive: true, lookup });
-        } catch (e) {
-            // If dns/require fails for some reason, continue without custom lookup
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Could not create IPv4-forcing lookup agent: ${(e instanceof Error) ? e.message : String(e)}`, 'warn');
-        }
-
-        // Retries with exponential backoff
-        const maxAttempts = 3;
-        let attempt = 0;
-        let lastErr: any = null;
-        while (attempt < maxAttempts) {
-            attempt++;
-            try {
-                // Small randomized delay before request (humanization)
-                await this.bot.utils.wait(this.bot.utils.randomNumber(200, 700));
-
-                // If we explicitly disabled proxy above via axiosConfig.proxy = false
-                // axios will not use env proxies.
-
-                // Make the request
-                const response = await this.bot.axios.request(axiosConfig);
-                let rawText: string;
-                if (typeof response.data === 'string') rawText = response.data;
-                else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8');
-                else rawText = JSON.stringify(response.data);
-
-                const trendsData = this.extractJsonFromResponse(rawText);
-                if (!Array.isArray(trendsData) || trendsData.length === 0) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response or no items found', 'warn');
-                    return [];
-                }
-
-                const mapped: Array<[string, string[]]> = [];
-                for (const entry of trendsData) {
-                    if (!Array.isArray(entry)) continue;
-
-                    const topic = typeof entry[0] === 'string' ? entry[0] : null;
-                    let related: string[] = [];
-
-                    try {
-                        if (Array.isArray(entry[9])) {
-                            const nested = entry[9];
-                            for (const el of nested) {
-                                if (Array.isArray(el) && el.every((v: any) => typeof v === 'string')) {
-                                    related = (el as any[]).map((v: any) => String(v));
-                                    break;
-                                }
-                            }
-                            if (!related.length) {
-                                related = nested.filter((x: any) => typeof x === 'string').map((v: any) => String(v));
-                            }
-                        } else {
-                            for (const el of entry) {
-                                if (Array.isArray(el) && el.length > 0 && typeof el[0] === 'string') {
-                                    related = el.filter((r: any) => typeof r === 'string').map((v: any) => String(v));
-                                    break;
-                                }
-                            }
-                        }
-                    } catch {
-                        related = [];
-                    }
-
-                    if (topic) mapped.push([topic, related]);
-                }
-
-                if (mapped.length < 90 && geoLocale.toUpperCase() !== 'US' && !triedFallback) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient search queries from trends for ${geoLocale}, falling back to US`, 'warn');
-                    return this.getGoogleTrends('US', true);
-                }
-
-                for (const [topic, rel] of mapped) {
-                    queryTerms.push({ topic, related: Array.isArray(rel) ? rel : [] });
-                }
-
-                // success -> break retry loop
-                return queryTerms;
-            } catch (err) {
-                lastErr = err;
-                const errMsg = (err instanceof Error) ? err.message : String(err);
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `An error occurred while fetching trends (attempt ${attempt}/${maxAttempts}): ${errMsg}`, 'error');
-
-                // If it's a connection refused to ::1, log explicit hint
-                if (/::1|localhost|127\.0\.0\.1/.test(errMsg)) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Connection attempt appears to target localhost (::1 / 127.0.0.1). Check proxy settings (this.bot.config.proxy.proxyGoogleTrends) and environment variables HTTP(S)_PROXY.', 'warn');
-                }
-
-                // If this was a proxy misparse or configured to localhost, stop retrying
-                if (attempt === 1 && /ECONNREFUSED.*::1|ECONNREFUSED.*127\.0\.0\.1/.test(errMsg)) {
-                    // very likely misconfigured local proxy — don't continue exponential backoff
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Aborting additional retries due to immediate localhost connect refusal.', 'warn');
-                    break;
-                }
-
-                if (attempt < maxAttempts) {
-                    // exponential backoff with jitter
-                    const backoff = Math.min(10000, Math.pow(2, attempt) * 500) + Math.floor(Math.random() * 300);
-                    await this.bot.utils.wait(backoff);
+                req.on('error', (err) => reject(err));
+                req.setTimeout(timeoutMs, () => req.destroy(new Error('OpenRouter request timeout')));
+                req.write(payload);
+                req.end();
+            })
+        } finally {
+            // Restore environment proxy variables
+            if (disableEnvProxy) {
+                for (const k of proxyEnvKeys) {
+                    if (typeof savedEnv[k] === 'string') process.env[k] = savedEnv[k] as string
+                    else delete process.env[k]
                 }
             }
         }
-
-        // If we reach here we failed
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'All attempts to fetch Google Trends failed.' + (lastErr ? ` Last error: ${(lastErr instanceof Error) ? lastErr.message : String(lastErr)}` : ''), 'error');
-        return queryTerms;
     }
 
+    private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
+        const queryTerms: GoogleSearch[] = []
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
 
+        // Human-like delay before fetching trends (0.5-1.5 seconds)
+        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
+
+        try {
+            const request: AxiosRequestConfig = {
+                url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'Accept': '*/*',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
+                },
+                data: `f.req=[[[i0OFE,"[null, null, \\\"${geoLocale.toUpperCase()}\\\", 0, null, 48]"]]]`,
+                responseType: 'text',
+                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
+            };
+
+            // Normalize proxy config, force IPv4 lookup if possible (copied from earlier robust impl)
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                const dns = require('dns');
+                const lookup = (hostname: string, options: any, callback: Function) => {
+                    try {
+                        dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
+                            callback(err, address, family);
+                        });
+                    } catch (e) {
+                        dns.lookup(hostname, (err: any, address: any, family: any) => callback(err, address, family));
+                    }
+                };
+                request['httpsAgent'] = new https.Agent({ keepAlive: true, lookup });
+            } catch (e) {
+                // ignore agent creation failures
+            }
+
+            const response = await this.bot.axios.request(request as any);
+            const rawText = typeof response.data === 'string' ? response.data : (Buffer.isBuffer(response.data) ? response.data.toString('utf8') : JSON.stringify(response.data));
+
+            const trendsData = this.extractJsonFromResponse(rawText)
+            if (!trendsData) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response', 'warn')
+                return []
+            }
+
+            const mappedTrendsData = trendsData.map((query: any) => [query[0], query[9] ? query[9].slice(1) : []])
+            if (mappedTrendsData.length < 90 && geoLocale.toUpperCase() !== 'US') {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Insufficient search queries from trends for locale, falling back to US', 'warn')
+                return this.getGoogleTrends('US')
+            }
+
+            for (const [topic, relatedQueries] of mappedTrendsData) {
+                queryTerms.push({
+                    topic: topic as string,
+                    related: relatedQueries as string[]
+                })
+            }
+
+        } catch (error) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred while fetching trends: ' + (error instanceof Error ? error.message : String(error)), 'error')
+        }
+
+        return queryTerms
+    }
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
         const lines = String(text).split('\n')
@@ -768,13 +674,13 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
         try {
             // Small wait+click to open a result if present
             await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 2000))
-            await page.click('#b_results .b_algo h2', { timeout: 120000  }).catch(() => { })
+            await page.click('#b_results .b_algo h2', { timeout: 2000 }).catch(() => { })
 
             // Only used if the browser shows an Edge continuation popup
             await this.closeContinuePopup(page)
 
             // Stay for 10 seconds for page to load and "visit"
-            await this.bot.utils.wait(34000)
+            await this.bot.utils.wait(10000)
 
             // Will get current tab if no new one is created
             let lastTab = await this.bot.browser.utils.getLatestTab(page)

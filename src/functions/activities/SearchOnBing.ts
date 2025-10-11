@@ -1,4 +1,4 @@
-// src/workers/SearchOnBing.ts
+// src/functions/activities/SearchOnBing.ts  (fixed)
 import { Page } from 'rebrowser-playwright'
 import * as fs from 'fs'
 import path from 'path'
@@ -275,8 +275,9 @@ export class SearchOnBing extends Workers {
                     // Could be raw JSON string or plain text — try JSON parse
                     try {
                         const parsed = JSON.parse(resp.data)
-                        llmText = tryExtract(parsed) || parsed
+                        llmText = tryExtract(parsed) || String(parsed)
                     } catch {
+                        // not JSON — treat as plain text
                         llmText = resp.data
                     }
                 } else if (typeof resp.data === 'object') {
@@ -288,11 +289,75 @@ export class SearchOnBing extends Workers {
 
             if (!llmText) return null
 
-            // Clean and normalize: remove fences, take first non-empty line, strip surrounding quotes, enforce length
-            const stripFences = (s: string) => String(s).replace(/```(?:json)?/g, '')
-            const cleaned = stripFences(llmText).split('\n').map(s => s.trim()).filter(Boolean)[0] || ''
-            const stripped = cleaned.replace(/^["']|["']$/g, '').trim()
-            const finalText = stripped.length > 200 ? stripped.slice(0, 200) : stripped
+            // Clean and normalize: handle fenced JSON or plain text robustly, avoid accessing possibly-undefined matches.
+            const textStr = String(llmText)
+
+            // 1) Attempt to extract JSON blocks inside ``` or JSON-like blocks safely
+            const jsonBlockRegex = /```(?:json)?\s*([\s\S]*?)```/g
+            const jsonPieces: string[] = []
+            let match: RegExpExecArray | null
+            while ((match = jsonBlockRegex.exec(textStr)) !== null) {
+                // Guard access to capture group
+                const group = match[1]
+                if (typeof group === 'string' && group.trim()) jsonPieces.push(group.trim())
+            }
+
+            // 2) If no fenced JSON blocks, try to find standalone JSON-like substrings (e.g. starting with { and ending with })
+            if (jsonPieces.length === 0) {
+                // This tries to find top-level JSON objects in the string safely
+                const simpleJsonRegex = /({[\s\S]*})/g
+                const simpleMatches: string[] = []
+                let sm: RegExpExecArray | null
+                while ((sm = simpleJsonRegex.exec(textStr)) !== null) {
+                    const g = sm[1]
+                    if (typeof g === 'string' && g.trim()) simpleMatches.push(g.trim())
+                }
+                // prefer simpleMatches if we found any
+                if (simpleMatches.length) jsonPieces.push(...simpleMatches)
+            }
+
+            // 3) Conservative attempt to parse any jsonPieces (only strings) — ensure element is a string before JSON.parse
+            let finalText: string | null = null
+            for (let i = 0; i < jsonPieces.length; i++) {
+                const piece = jsonPieces[i]
+                if (typeof piece !== 'string' || piece.trim() === '') continue
+                try {
+                    const p = JSON.parse(piece)
+                    // If parser returns a string directly
+                    if (typeof p === 'string' && p.trim()) {
+                        finalText = p.trim()
+                        break
+                    }
+                    // If it's an object, try to read known fields
+                    if (p && typeof p === 'object') {
+                        if (typeof p.query === 'string' && p.query.trim()) {
+                            finalText = p.query.trim(); break
+                        }
+                        if (typeof p.text === 'string' && p.text.trim()) {
+                            finalText = p.text.trim(); break
+                        }
+                        if (typeof p.output === 'string' && p.output.trim()) {
+                            finalText = p.output.trim(); break
+                        }
+                        // fallback: stringify the object and take the first non-empty line
+                        const objStr = JSON.stringify(p)
+                        if (objStr) {
+                            const firstLine = objStr.split('\n').map(s => s.trim()).filter(Boolean)[0]
+                            if (firstLine) { finalText = firstLine; break }
+                        }
+                    }
+                } catch (e) {
+                    // ignore parse error for this piece and continue trying others
+                }
+            }
+
+            // 4) Fallback: take the first non-empty plain line after removing fences
+            if (!finalText) {
+                const stripFences = (s: string) => s.replace(/```(?:json)?/g, '')
+                const cleaned = stripFences(textStr).split('\n').map(s => s.trim()).filter(Boolean)[0] || ''
+                const stripped = cleaned.replace(/^['\"]|['\"]$/g, '').trim()
+                finalText = stripped.length > 200 ? stripped.slice(0, 200) : stripped
+            }
 
             return finalText || null
         } catch (err: any) {
