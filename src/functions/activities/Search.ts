@@ -546,71 +546,134 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
     }
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        const queryTerms: GoogleSearch[] = []
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
+        const queryTerms: GoogleSearch[] = [];
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries | GeoLocale: ${geoLocale}`);
 
-        // Human-like delay before fetching trends (0.5-1.5 seconds)
-        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
+        // Human-like delay before fetching trends (increased for safety)
+        await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000));
 
         try {
+            // Enhanced request configuration
             const request: AxiosRequestConfig = {
                 url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
                     'Accept': '*/*',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://trends.google.com/trends/',
+                    'Origin': 'https://trends.google.com'
                 },
-                data: `f.req=[[[i0OFE,"[null, null, \\\"${geoLocale.toUpperCase()}\\\", 0, null, 48]"]]]`,
+                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
                 responseType: 'text',
-                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
+                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 20000,
+                // Important: Explicitly handle proxy configuration
+                proxy: this.bot.config?.proxy?.proxyBingTerms || false
             };
 
-            // Normalize proxy config, force IPv4 lookup if possible (copied from earlier robust impl)
+            // Improved DNS handling with better error management
             try {
                 // eslint-disable-next-line @typescript-eslint/no-var-requires
                 const dns = require('dns');
                 const lookup = (hostname: string, options: any, callback: Function) => {
-                    try {
-                        dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
+                    dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
+                        if (err) {
+                            // Fallback to default lookup if IPv4 fails
+                            dns.lookup(hostname, (err2: any, address2: any, family2: any) => {
+                                callback(err2, address2, family2);
+                            });
+                        } else {
                             callback(err, address, family);
-                        });
-                    } catch (e) {
-                        dns.lookup(hostname, (err: any, address: any, family: any) => callback(err, address, family));
-                    }
+                        }
+                    });
                 };
-                request['httpsAgent'] = new https.Agent({ keepAlive: true, lookup });
+                request.httpsAgent = new (require('https').Agent)({
+                    keepAlive: true,
+                    lookup,
+                    // Additional security options
+                    rejectUnauthorized: true
+                });
             } catch (e) {
-                // ignore agent creation failures
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'DNS agent creation failed, using default: ' + (e instanceof Error ? e.message : String(e)), 'warn');
             }
 
+            // Make the request with enhanced error handling
             const response = await this.bot.axios.request(request as any);
-            const rawText = typeof response.data === 'string' ? response.data : (Buffer.isBuffer(response.data) ? response.data.toString('utf8') : JSON.stringify(response.data));
 
-            const trendsData = this.extractJsonFromResponse(rawText)
-            if (!trendsData) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response', 'warn')
-                return []
+            // Handle different response formats
+            let rawText: string;
+            if (typeof response.data === 'string') {
+                rawText = response.data;
+            } else if (Buffer.isBuffer(response.data)) {
+                rawText = response.data.toString('utf8');
+            } else {
+                rawText = JSON.stringify(response.data);
             }
 
-            const mappedTrendsData = trendsData.map((query: any) => [query[0], query[9] ? query[9].slice(1) : []])
-            if (mappedTrendsData.length < 90 && geoLocale.toUpperCase() !== 'US') {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Insufficient search queries from trends for locale, falling back to US', 'warn')
-                return this.getGoogleTrends('US')
+            // Check for empty or invalid responses
+            if (!rawText || rawText.length < 10) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Empty or invalid response from Google Trends', 'warn');
+                return [];
             }
 
+            const trendsData = this.extractJsonFromResponse(rawText);
+
+            if (!trendsData || !Array.isArray(trendsData)) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse valid trends data from response', 'warn');
+
+                // Fallback to US locale if original wasn't US
+                if (geoLocale.toUpperCase() !== 'US') {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale', 'warn');
+                    return this.getGoogleTrends('US');
+                }
+                return [];
+            }
+
+            // Process the trends data
+            const mappedTrendsData = trendsData.map((query: any) => [
+                query[0],
+                query[9] ? query[9].slice(1) : []
+            ]);
+
+            // More generous fallback logic
+            if (mappedTrendsData.length < 50 && geoLocale.toUpperCase() !== 'US') {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient trends for ${geoLocale} (${mappedTrendsData.length}), falling back to US`, 'warn');
+                return this.getGoogleTrends('US');
+            }
+
+            // Build query terms with validation
             for (const [topic, relatedQueries] of mappedTrendsData) {
-                queryTerms.push({
-                    topic: topic as string,
-                    related: relatedQueries as string[]
-                })
+                if (topic && typeof topic === 'string' && topic.trim().length > 0) {
+                    queryTerms.push({
+                        topic: topic.trim(),
+                        related: Array.isArray(relatedQueries) ? relatedQueries.filter(q => typeof q === 'string') : []
+                    });
+                }
             }
+
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Successfully fetched ${queryTerms.length} search queries`);
 
         } catch (error) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred while fetching trends: ' + (error instanceof Error ? error.message : String(error)), 'error')
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Error fetching trends: ' + errorMessage, 'error');
+
+            // Specific handling for IP-related errors
+            if (errorMessage.includes('IP address') || errorMessage.includes('Invalid IP')) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Google is blocking requests due to IP issues. Consider:', 'error');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Using a VPN or proxy rotation:cite[1]', 'error');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Increasing delays between requests:cite[4]', 'error');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Reducing request frequency:cite[1]', 'error');
+            }
+
+            // Fallback to US locale on any error if original wasn't US
+            if (geoLocale.toUpperCase() !== 'US') {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale after error', 'warn');
+                return this.getGoogleTrends('US');
+            }
         }
 
-        return queryTerms
+        return queryTerms;
     }
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
