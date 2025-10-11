@@ -1,7 +1,8 @@
 // src/workers/Search.ts
 import { Page } from 'rebrowser-playwright'
 import { platform } from 'os'
-import OpenAI from 'openai'
+// import OpenAI from 'openai'
+import axios from 'axios';
 
 import { Workers } from '../Workers'
 
@@ -271,6 +272,9 @@ export class Search extends Workers {
      * Ask OpenRouter (via the OpenAI-compatible client) for one short student-like search query.
      * Returns a single short string (or null on failure).
      */
+    // add at top of file if missing:
+
+
     private async getSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
         const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
         const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
@@ -280,30 +284,36 @@ export class Search extends Workers {
             throw new Error('OpenRouter API key not configured');
         }
 
-        // Build OpenAI-compatible client pointed at OpenRouter
-        const defaultHeaders: Record<string, string> = {}
+        // Build headers (preserve your custom headers)
+        const defaultHeaders: Record<string, string> = {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+        };
         if (this.bot.config?.openRouter?.referer) {
-            defaultHeaders['HTTP-Referer'] = this.bot.config.openRouter.referer
-            defaultHeaders['Referer'] = this.bot.config.openRouter.referer
+            defaultHeaders['HTTP-Referer'] = this.bot.config.openRouter.referer;
+            defaultHeaders['Referer'] = this.bot.config.openRouter.referer;
         }
         if (this.bot.config?.openRouter?.title) {
-            defaultHeaders['X-Title'] = this.bot.config.openRouter.title
+            defaultHeaders['X-Title'] = this.bot.config.openRouter.title;
         }
 
-        const client = new OpenAI({
-            baseURL: 'https://openrouter.ai/api/v1',
-            apiKey,
-            defaultHeaders,
-            // --- Key Change: Explicitly disable proxy usage ---
-            httpAgent: undefined,
-            httpsAgent: undefined,
-        } as any)// 'openai' types may differ; `as any` avoids type friction
-
+        // Prepare payload
         const systemPrompt = `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.`;
         const userPrompt = `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.`;
 
+        // Create an axios client that explicitly disables proxy usage.
+        // This ensures this request bypasses any process-level proxy env vars.
+        const openRouterClient = axios.create({
+            baseURL: 'https://openrouter.ai/api/v1',
+            headers: defaultHeaders,
+            // Important: explicitly disable proxying for this client
+            proxy: false,
+            // keep default agents (no custom http(s) agent) so Node will use direct socket
+            timeout: 30_000,
+        });
+
         try {
-            const completion = await client.chat.completions.create({
+            const payload = {
                 model: 'meta-llama/llama-3.3-70b-instruct:free',
                 messages: [
                     { role: 'system', content: systemPrompt },
@@ -311,53 +321,55 @@ export class Search extends Workers {
                 ],
                 max_tokens: 60,
                 temperature: 0.7
-            } as any)
+            };
 
-            const rawContent = (completion as any)?.choices?.[0]?.message?.content ?? (completion as any)?.choices?.[0]?.text ?? null
+            const resp = await openRouterClient.post('/chat/completions', payload);
+            const completion = resp?.data;
+
+            const rawContent = completion?.choices?.[0]?.message?.content ?? completion?.choices?.[0]?.text ?? null;
 
             if (!rawContent) {
-                // Sometimes the client may return streaming chunks or different formats; fall back to serializing whole object
-                const serialized = JSON.stringify(completion).slice(0, 2000)
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content found in completion. Preview: ${serialized}`, 'error')
-                throw new Error('No content returned from OpenRouter (completion empty)')
+                const serialized = JSON.stringify(completion).slice(0, 2000);
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content found in completion. Preview: ${serialized}`, 'error');
+                throw new Error('No content returned from OpenRouter (completion empty)');
             }
 
             // Clean up fences and whitespace, then return single-line query
-            const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
-            const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
-            const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
-            const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+            const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
+            const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
+            const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim();
+            const final = String(candidate).replace(/(^"|"$)/g, '').trim();
 
             if (!final || final.length < 2) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned an invalid/too-short query: "${final}"`, 'warn')
-                return null
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned an invalid/too-short query: "${final}"`, 'warn');
+                return null;
             }
-            if (final.length > 200) return final.slice(0, 200)
-            return final
+            if (final.length > 200) return final.slice(0, 200);
+            return final;
 
         } catch (err: any) {
-            // Normalize and log OpenRouter-style errors (e.g., {"error":{"message":"User not found.","code":401}})
-            const message = err?.message || JSON.stringify(err)
-            // If the response included a structured error body, try to extract it
+            const message = err?.message || JSON.stringify(err);
+
+            // Try to normalize OpenRouter-style structured error body
             if (err?.response?.data) {
                 try {
-                    const body = err.response.data
+                    const body = err.response.data;
                     if (body?.error) {
-                        const emsg = body.error?.message ?? JSON.stringify(body.error)
-                        const ecode = body.error?.code ?? err?.response?.status
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter returned error (${ecode}): ${emsg}`, 'error')
-                        throw new Error(`OpenRouter error ${ecode}: ${emsg}`)
+                        const emsg = body.error?.message ?? JSON.stringify(body.error);
+                        const ecode = body.error?.code ?? err?.response?.status;
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter returned error (${ecode}): ${emsg}`, 'error');
+                        throw new Error(`OpenRouter error ${ecode}: ${emsg}`);
                     }
                 } catch (parseErr) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Error parsing OpenRouter error body: ${parseErr}`, 'warn')
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Error parsing OpenRouter error body: ${parseErr}`, 'warn');
                 }
             }
 
-            // Generic handling/logging
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${message}`, 'error')
-            throw err
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${message}`, 'error');
+            throw err;
         }
     }
+
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
         const queryTerms: GoogleSearch[] = [];

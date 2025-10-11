@@ -2,7 +2,7 @@
 import { Page } from 'rebrowser-playwright'
 import * as fs from 'fs'
 import path from 'path'
-import OpenAI from 'openai'; // Make sure to import the OpenAI client
+import axios from 'axios';
 
 // If you want to load .env automatically when running locally, either
 // call require('dotenv').config() in your app entry or uncomment the line below:
@@ -195,7 +195,6 @@ export class SearchOnBing extends Workers {
      * If bot.config.openRouterForceDirect === true, request will set proxy: false to bypass axios proxy.
      */
 
-
     private async callOpenRouterForQuery(title: string, providedApiKey?: string): Promise<string | null> {
         try {
             await this.bot.utils.wait(this.bot.utils.randomNumber(300, 800));
@@ -209,62 +208,68 @@ export class SearchOnBing extends Workers {
                 return null;
             }
 
-            // Build headers for OpenRouter
+            // Build headers for OpenRouter (preserve optional config info)
             const defaultHeaders: Record<string, string> = {
-                'HTTP-Referer': this.bot.config?.openRouter?.referer || '<YOUR_SITE_URL>', // Optional, replace with your site URL
-                'X-Title': this.bot.config?.openRouter?.title || '<YOUR_SITE_NAME>', // Optional, replace with your site name
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
             };
+            if (this.bot.config?.openRouter?.referer) defaultHeaders['Referer'] = this.bot.config.openRouter.referer;
+            else defaultHeaders['Referer'] = '<YOUR_SITE_URL>';
+            if (this.bot.config?.openRouter?.title) defaultHeaders['X-Title'] = this.bot.config.openRouter.title;
+            else defaultHeaders['X-Title'] = '<YOUR_SITE_NAME>';
 
-
-            // Initialize OpenAI client with proxy bypass configuration
-            const client = new OpenAI({
-                baseURL: 'https://openrouter.ai/api/v1',
-                apiKey,
-                defaultHeaders,
-                // --- Key Change: Explicitly disable proxy usage ---
-                httpAgent: undefined,
-                httpsAgent: undefined,
-            } as any);
-
+            // Choose model and temperature from config if present
             const model = (this.bot.config && this.bot.config.openRouterModel) || 'openai/gpt-4o-mini:2024-12-17';
+            const temperature = (this.bot.config && typeof this.bot.config.openRouterTemperature === 'number')
+                ? this.bot.config.openRouterTemperature : 0.2;
 
             const promptSystem = `You are a concise assistant that outputs a single short Bing search query. Output only the query (no commentary).`;
             const promptUser = `Promotional title: "${title}". Provide a concise search query (2-8 words) that a user would enter into Bing to find relevant pages.`;
 
-            // Create the completion using the OpenAI client
-            const completion = await client.chat.completions.create({
-                model: model,
+            // Use axios to bypass proxy for this request only
+            const openRouterClient = axios.create({
+                baseURL: 'https://openrouter.ai/api/v1',
+                headers: defaultHeaders,
+                proxy: false, // explicitly disable axios proxying (ignores HTTP(S)_PROXY env vars)
+                timeout: 30_000,
+            });
+
+            const payload: any = {
+                model,
                 messages: [
                     { role: 'system', content: promptSystem },
                     { role: 'user', content: promptUser }
                 ],
                 max_tokens: 64,
-                temperature: (this.bot.config && typeof this.bot.config.openRouterTemperature === 'number') ?
-                    this.bot.config.openRouterTemperature : 0.2,
-                // Add any additional OpenRouter-specific parameters
-                ...(this.bot.config && typeof this.bot.config.openRouterProvider === 'string' && {
-                    provider: this.bot.config.openRouterProvider
-                }),
-            });
+                temperature,
+            };
+            if (this.bot.config && typeof this.bot.config.openRouterProvider === 'string') {
+                payload.provider = this.bot.config.openRouterProvider;
+            }
 
-            // Extract the response content
-            const llmText = completion.choices[0]?.message?.content;
+            const resp = await openRouterClient.post('/chat/completions', payload);
+            const completion = resp?.data;
 
-            if (!llmText) return null;
+            const llmText = completion?.choices?.[0]?.message?.content ?? completion?.choices?.[0]?.text ?? null;
 
-            // Your existing response processing logic remains the same
-            let finalText: string | null = null;
+            if (!llmText) {
+                this.bot.log(this.bot.isMobile, 'OPENROUTER', 'OpenRouter returned no text content in completion.', 'warn');
+                return null;
+            }
 
-            // [Keep all your existing response parsing and cleanup logic here]
-            // This includes your jsonBlockRegex, simpleJsonRegex, and fallback processing
-            // ... (the rest of your parsing logic remains unchanged)
+            // Minimal cleaning: remove fences and take the first non-empty line
+            const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
+            const cleanedLines = stripFences(llmText).split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
+
+            // Use nullish coalescing to ensure candidate is always a string (not undefined)
+            const candidate: string = cleanedLines[0] ?? String(llmText).trim();
+            const finalText: string | null = candidate === '' ? null : candidate;
 
             return finalText || null;
 
         } catch (err: any) {
-            // Enhanced error handling for OpenAI client errors
-            const status = err?.status;
-            const errorData = err?.error;
+            const status = err?.response?.status ?? err?.status;
+            const errorData = err?.response?.data ?? err?.error;
 
             if (status === 404 && errorData) {
                 const msg = (errorData?.message) || String(errorData);
@@ -274,13 +279,12 @@ export class SearchOnBing extends Workers {
                 }
             }
 
-            // Handle OpenRouter-style errors
-            if (err?.error) {
+            if (errorData) {
                 try {
-                    const errorBody = err.error;
-                    if (errorBody?.error) {
-                        const emsg = errorBody.error?.message ?? JSON.stringify(errorBody.error);
-                        const ecode = errorBody.error?.code || status;
+                    const body = errorData;
+                    if (body?.error) {
+                        const emsg = body.error?.message ?? JSON.stringify(body.error);
+                        const ecode = body.error?.code ?? status;
                         this.bot.log(this.bot.isMobile, 'OPENROUTER', `OpenRouter returned error (${ecode}): ${emsg}`, 'error');
                         return null;
                     }
@@ -294,4 +298,6 @@ export class SearchOnBing extends Workers {
             return null;
         }
     }
+
+
 }
