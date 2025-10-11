@@ -53,9 +53,6 @@ class Browser {
                     ? this.bot.utils.randomNumber(50, 150)
                     : Math.floor(Math.random() * 100) + 50
 
-                // Proxy usage probabilistic: use proxy ~70% of the time to diversify traffic patterns
-                const useProxy = proxy?.url ? (Math.random() < 0.7) : false
-
                 const launchOpts: any = {
                     headless,
                     slowMo,
@@ -69,7 +66,8 @@ class Browser {
                     ]
                 }
 
-                if (useProxy && proxy && proxy.url) {
+                // REMOVED PROXY PROBABILITY - always use proxy if available
+                if (proxy && proxy.url) {
                     // Normalize proxy.server as host:port (Playwright expects server string)
                     const server = proxy.port ? `${proxy.url}:${proxy.port}` : proxy.url
                     launchOpts.proxy = {
@@ -77,12 +75,7 @@ class Browser {
                         username: proxy.username,
                         password: proxy.password
                     }
-                    this.bot.log(this.bot.isMobile, 'BROWSER', `Using proxy for launch (probabilistic). Server=${server}`)
-                } else {
-                    if (proxy && proxy.url) {
-                        // 'debug' level not supported by bot.log - use 'log' here
-                        this.bot.log(this.bot.isMobile, 'BROWSER', 'Bypassing configured proxy for this session (probabilistic)', 'log')
-                    }
+                    this.bot.log(this.bot.isMobile, 'BROWSER', `Using proxy for launch. Server=${server}`)
                 }
 
                 launched = await playwright.chromium.launch(launchOpts)
