@@ -1,6 +1,7 @@
+// src/workers/Search.ts
 import { Page } from 'rebrowser-playwright'
 import { platform } from 'os'
-import https from 'https'
+import OpenAI from 'openai'
 
 import { Workers } from '../Workers'
 
@@ -21,9 +22,6 @@ export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
 
-    // store last response status for diagnostics
-    private _lastOpenRouterStatusCode?: number
-
     public async doSearch(page: Page, data: DashboardData) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
 
@@ -40,55 +38,88 @@ export class Search extends Workers {
             return
         }
 
-        // --- LLM FIRST, FALLBACK TO TRENDS + LOCAL ---
+        // decide geo for LLM context or trends
         const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
-        let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo)
 
-        // Fallback: if trends/LLM failed or insufficient, sample from local queries file (extra safety)
-        if (!googleSearchQueries.length || googleSearchQueries.length < 10) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Primary queries insufficient, falling back to local queries.json', 'warn')
+        // Try to seed with Google Trends or local fallback first (optional)
+        let initialQueries: GoogleSearch[] = []
+        try {
+            initialQueries = await this.getGoogleTrends(geo)
+        } catch {
+            // ignore - we'll fallback to local
+        }
+        if (!initialQueries.length) {
             try {
                 const local = await import('../queries.json')
-                const sampleSize = Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25, (local.default || []).length))
-                const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, sampleSize)
-                googleSearchQueries = sampled.map((x: { title: string; queries: string[] }) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
-            } catch (e) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Failed loading local queries fallback: ' + (e instanceof Error ? e.message : String(e)), 'error')
-            }
+                initialQueries = (local.default || []).slice(0, Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25, (local.default || []).length))).map((x: any) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
+            } catch { /* ignore */ }
         }
 
-        // Shuffle and dedupe topics
-        googleSearchQueries = this.bot.utils.shuffleArray(googleSearchQueries)
+        // Shuffle & dedupe seed queries
+        initialQueries = this.bot.utils.shuffleArray(initialQueries)
         const seen = new Set<string>()
-        googleSearchQueries = googleSearchQueries.filter(q => {
-            if (!q || !q.topic) return false
-            const k = q.topic.toLowerCase()
-            if (seen.has(k)) return false
-            seen.add(k)
-            return true
-        })
+        // Narrow the filter to guarantee string[] (avoids "string | undefined")
+        const seedTopics: string[] = initialQueries
+            .map(q => q.topic)
+            .filter((t): t is string => !!t && typeof t === 'string')
+            .filter(t => {
+                const k = t.toLowerCase()
+                if (seen.has(k)) return false
+                seen.add(k)
+                return true
+            })
 
-        // Go to bing
-        await page.goto(this.searchPageURL ? this.searchPageURL : this.bingHome)
-        await this.bot.utils.wait(2000)
-        await this.bot.browser.utils.tryDismissAllMessages(page)
-
+        // We'll use seedTopics first (if present), then fall back to LLM single-query-per-call.
+        let seedIndex = 0
         let stagnation = 0 // consecutive searches without point progress
 
-        const queries: string[] = []
-        // Mobile search doesn't seem to like related queries
-        googleSearchQueries.forEach(x => { this.bot.isMobile ? queries.push(x.topic) : queries.push(x.topic, ...(x.related || [])) })
+        // Main loop: continue until no points left or we hit safety limits
+        const maxSearchAttempts = Math.max(100, (this.bot.config.searchSettings.maxSearchAttempts || 100))
+        let attempts = 0
 
-        // Loop over Google search queries
-        for (let i = 0; i < queries.length; i++) {
-            const query = queries[i] as string
+        while (missingPoints > 0 && attempts < maxSearchAttempts) {
+            attempts++
+
+            // choose a query:
+            // prefer seed topics until exhausted; after that call the LLM for a single query each time
+            let query = ''
+            if (seedIndex < seedTopics.length) {
+                query = seedTopics[seedIndex++]!
+            } else {
+                try {
+                    // Ask LLM for a single student-like query (using OpenAI client pointed at OpenRouter)
+                    const maybeQuery = await this.getSingleQueryFromLLM(geo)
+                    if (!maybeQuery) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'LLM returned no query; falling back to generating from local/trends', 'warn')
+                        // If LLM fails, try a small fallback from local queries file
+                        try {
+                            const local = await import('../queries.json')
+                            const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, 5).map((x: any) => x.queries?.[0] || x.title)
+                            if (sampled.length) {
+                                query = sampled[0]
+                            }
+                        } catch { /* ignore */ }
+                    } else {
+                        query = maybeQuery
+                    }
+                } catch (err) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Single-query LLM call failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
+                    // Give a short delay and continue to try
+                    await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
+                    continue
+                }
+            }
+
+            if (!query) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'No query available for search iteration, aborting', 'warn')
+                break
+            }
 
             this.bot.log(this.bot.isMobile, 'SEARCH-BING', `${missingPoints} Points Remaining | Query: ${query}`)
 
             searchCounters = await this.bingSearch(page, query)
             const newMissingPoints = this.calculatePoints(searchCounters)
 
-            // If the new point amount is the same as before
             if (newMissingPoints === missingPoints) {
                 stagnation++
             } else {
@@ -99,69 +130,20 @@ export class Search extends Workers {
 
             if (missingPoints === 0) break
 
-            // Only for mobile searches
             if (stagnation > 5 && this.bot.isMobile) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 5 iterations, likely bad User-Agent', 'warn')
                 break
             }
 
-            // If we didn't gain points for 10 iterations, assume it's stuck
             if (stagnation > 10) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 10 iterations aborting searches', 'warn')
-                stagnation = 0 // allow fallback loop below
+                stagnation = 0
                 break
             }
         }
 
-        // Only for mobile searches
         if (missingPoints > 0 && this.bot.isMobile) {
             return
-        }
-
-        // If we still got remaining search queries, generate extra ones (related-terms fallback)
-        if (missingPoints > 0) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING', `Search completed but we're missing ${missingPoints} points, generating extra searches`)
-
-            let i = 0
-            let fallbackRounds = 0
-            const extraRetries = this.bot.config.searchSettings.extraFallbackRetries || 1
-            while (missingPoints > 0 && fallbackRounds <= extraRetries) {
-                const query = googleSearchQueries[i++] as GoogleSearch
-                if (!query) break
-
-                // Get related search terms to the Google search queries
-                const relatedTerms = await this.getRelatedTerms(query?.topic)
-                if (relatedTerms.length > 3) {
-                    // Search for the first 2 related terms
-                    for (const term of relatedTerms.slice(1, 3)) {
-                        this.bot.log(this.bot.isMobile, 'SEARCH-BING-EXTRA', `${missingPoints} Points Remaining | Query: ${term}`)
-
-                        searchCounters = await this.bingSearch(page, term)
-                        const newMissingPoints = this.calculatePoints(searchCounters)
-
-                        // If the new point amount is the same as before
-                        if (newMissingPoints === missingPoints) {
-                            stagnation++
-                        } else {
-                            stagnation = 0
-                        }
-
-                        missingPoints = newMissingPoints
-
-                        // If we satisfied the searches
-                        if (missingPoints === 0) {
-                            break
-                        }
-
-                        // Try 5 more times, then give up for this fallback round
-                        if (stagnation > 5) {
-                            this.bot.log(this.bot.isMobile, 'SEARCH-BING-EXTRA', 'Search didn\'t gain point for 5 iterations aborting searches', 'warn')
-                            return
-                        }
-                    }
-                    fallbackRounds++
-                }
-            }
         }
 
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Completed searches')
@@ -261,287 +243,93 @@ export class Search extends Workers {
         return await this.bot.browser.func.getSearchPoints()
     }
 
-    // === LLM-FIRST QUERY GENERATION (with fallbacks) ===
-    private async getSearchQueries(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        // 60% chance used previously in other code, but here we will attempt LLM first always.
-        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting LLM-based query generation (primary path)')
-
-        try {
-            const llmResult = await this.generateQueriesWithLLM(geoLocale)
-
-            if (Array.isArray(llmResult) && llmResult.length > 0) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmResult.length} queries`)
-                return llmResult
-            } else {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM returned empty/invalid result, falling back to Google Trends', 'warn')
-            }
-        } catch (err) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM generation failed: ' + (err instanceof Error ? err.message : String(err)), 'error')
-        }
-
-        // Fall back to Google Trends
-        try {
-            const trends = await this.getGoogleTrends(geoLocale)
-            if (Array.isArray(trends) && trends.length > 0) return trends
-        } catch (e) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Fallback Google Trends failed: ' + (e instanceof Error ? e.message : String(e)), 'warn')
-        }
-
-        // Local fallback handled by caller if needed
-        return []
-    }
-
+    // === SINGLE-QUERY LLM (OpenRouter via openai client) ===
     /**
-     * Use OpenRouter (chat completions) to ask for a JSON array of "university-student-like" search queries.
-     * Expected output: [{ topic: "example topic", related: ["r1","r2", ...] }, ...]
-     *
-     * If the first attempt fails and a proxy appears to be configured (via environment or this.bot.config.proxy),
-     * this will retry the request with environment proxy variables temporarily removed (i.e., no proxy).
+     * Ask OpenRouter (via the OpenAI-compatible client) for one short student-like search query.
+     * Returns a single short string (or null on failure).
      */
-    private async generateQueriesWithLLM(geoLocale: string): Promise<GoogleSearch[]> {
+    private async getSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
         const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
         const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
         const apiKey = envKey || cfgKey;
-        if (!apiKey) throw new Error('OpenRouter API key not configured');
+        if (!apiKey) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key not configured', 'error')
+            throw new Error('OpenRouter API key not configured');
+        }
 
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
-- "topic": a short search query a typical university student might type (games, course topics, assignments, campus services, local food, cheap textbooks, study techniques).
-- "related": an array of 0..6 related searches (short strings).
+        // Build OpenAI-compatible client pointed at OpenRouter
+        const defaultHeaders: Record<string, string> = {}
+        if (this.bot.config?.openRouter?.referer) {
+            defaultHeaders['HTTP-Referer'] = this.bot.config.openRouter.referer
+            defaultHeaders['Referer'] = this.bot.config.openRouter.referer
+        }
+        if (this.bot.config?.openRouter?.title) {
+            defaultHeaders['X-Title'] = this.bot.config.openRouter.title
+        }
 
-Return at least 25 items if possible. Avoid politically sensitive or adult topics. Output must be valid JSON only (no explanatory text). Include geo context where relevant (e.g., use ${geoLocale.toUpperCase()} locale when producing location-specific queries).`;
+        const client = new OpenAI({
+            baseURL: 'https://openrouter.ai/api/v1',
+            apiKey,
+            defaultHeaders
+        } as any) // 'openai' types may differ; `as any` avoids type friction
 
-        const userPrompt = `Generate a diverse list of short search queries a typical university student (undergrad) would use. Include games, course queries (e.g., "econ midterm study guide"), campus services, cheap food spots, debugging/programming help, and popular non-suspicious entertainment. Output only JSON.`;
+        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.`;
+        const userPrompt = `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.`;
 
-        const body = {
-            model: 'meta-llama/llama-3.3-70b-instruct:free',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ],
-            max_tokens: 1200,
-            temperature: 0.7
-        };
-
-        const payload = JSON.stringify(body);
-        const timeoutMs = (this.bot.config?.openRouter?.timeoutMs) || 10000;
-
-        const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            ...(this.bot.config?.openRouter?.referer ? { 'Referer': this.bot.config.openRouter.referer, 'HTTP-Referer': this.bot.config.openRouter.referer } : {}),
-            ...(this.bot.config?.openRouter?.title ? { 'X-Title': this.bot.config.openRouter.title } : {})
-        };
-
-        let rawResponse = '';
-        let statusCode: number | undefined;
-
-        // Attempt 1: normal request (this will use environment proxy variables if present = "with proxy")
         try {
-            rawResponse = await this.performOpenRouterRequest(payload, headers, timeoutMs, false)
-            statusCode = this._lastOpenRouterStatusCode
-        } catch (err) {
-            const details = (err as Error).message || String(err)
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed (first attempt): ${details}`, 'error')
+            const completion = await client.chat.completions.create({
+                model: 'meta-llama/llama-3.3-70b-instruct:free',
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                ],
+                max_tokens: 60,
+                temperature: 0.7
+            } as any)
 
-            // If a proxy appears to be configured, retry without environment proxy vars ("without proxy").
-            const envHasProxy = Boolean(process.env.HTTP_PROXY || process.env.http_proxy || process.env.HTTPS_PROXY || process.env.https_proxy)
-            const botHasProxyConfig = Boolean(this.bot.config?.proxy)
-            if (envHasProxy || botHasProxyConfig) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Detected proxy configuration; retrying OpenRouter request without environment proxy variables', 'warn')
+            const rawContent = (completion as any)?.choices?.[0]?.message?.content ?? (completion as any)?.choices?.[0]?.text ?? null
+
+            if (!rawContent) {
+                // Sometimes the client may return streaming chunks or different formats; fall back to serializing whole object
+                const serialized = JSON.stringify(completion).slice(0, 2000)
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content found in completion. Preview: ${serialized}`, 'error')
+                throw new Error('No content returned from OpenRouter (completion empty)')
+            }
+
+            // Clean up fences and whitespace, then return single-line query
+            const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
+            const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
+            const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
+            const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+
+            if (!final || final.length < 2) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned an invalid/too-short query: "${final}"`, 'warn')
+                return null
+            }
+            if (final.length > 200) return final.slice(0, 200)
+            return final
+
+        } catch (err: any) {
+            // Normalize and log OpenRouter-style errors (e.g., {"error":{"message":"User not found.","code":401}})
+            const message = err?.message || JSON.stringify(err)
+            // If the response included a structured error body, try to extract it
+            if (err?.response?.data) {
                 try {
-                    rawResponse = await this.performOpenRouterRequest(payload, headers, timeoutMs, true)
-                    statusCode = this._lastOpenRouterStatusCode
-                } catch (err2) {
-                    const details2 = (err2 as Error).message || String(err2)
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter retry without proxy failed: ${details2}`, 'error')
-                    throw err2
-                }
-            } else {
-                // No proxy detected — rethrow original error
-                throw err
-            }
-        }
-
-        // top-level parse attempt
-        let responseData: any;
-        try {
-            responseData = JSON.parse(rawResponse);
-        } catch {
-            responseData = rawResponse;
-        }
-
-        const extractContent = (obj: any): string | undefined => {
-            if (!obj) return undefined;
-            if (Array.isArray(obj.choices) && obj.choices.length) {
-                const first = obj.choices[0];
-                if (first?.message?.content) return first.message.content;
-                if (first?.text) return first.text;
-                if (obj.choices.every((c: any) => c?.delta)) {
-                    return obj.choices.map((c: any) => c.delta?.content || '').join('');
-                }
-            }
-            if (typeof obj.output_text === 'string') return obj.output_text;
-            if (obj.result?.content) return obj.result.content;
-            if (obj.generated_text) return obj.generated_text;
-            return undefined;
-        };
-
-        let content: string | undefined = extractContent(responseData);
-
-        // SSE-style parsing (data: ...)
-        if (!content && typeof rawResponse === 'string') {
-            const s = rawResponse.trim();
-            if (/^data: /m.test(s)) {
-                const lines = s.split(/\r?\n/);
-                const jsonPieces: string[] = [];
-                for (const line of lines) {
-                    const m = line.match(/^data:\s*(.*)$/);
-                    // Ensure match exists and group 1 is a string
-                    if (!m || typeof m[1] !== 'string') continue;
-                    const payloadChunk = m[1].trim();
-                    if (payloadChunk === '[DONE]') continue;
-                    if (payloadChunk.length === 0) continue;
-                    jsonPieces.push(payloadChunk);
-                }
-
-                // parse from last to first the JSON chunks
-                for (let i = jsonPieces.length - 1; i >= 0; i--) {
-                    const chunk = jsonPieces[i];
-                    if (!chunk) continue;
-                    try {
-                        const parsedChunk = JSON.parse(chunk);
-                        const maybe = extractContent(parsedChunk);
-                        if (maybe) {
-                            content = maybe;
-                            break;
-                        }
-                    } catch {
-                        // ignore partial/invalid chunk
+                    const body = err.response.data
+                    if (body?.error) {
+                        const emsg = body.error?.message ?? JSON.stringify(body.error)
+                        const ecode = body.error?.code ?? err?.response?.status
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter returned error (${ecode}): ${emsg}`, 'error')
+                        throw new Error(`OpenRouter error ${ecode}: ${emsg}`)
                     }
-                }
-
-                if (!content && jsonPieces.length) {
-                    // join as fallback (still a string)
-                    content = jsonPieces.join('\n');
+                } catch (parseErr) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Error parsing OpenRouter error body: ${parseErr}`, 'warn')
                 }
             }
-        }
 
-        if (!content && typeof rawResponse === 'string') {
-            content = rawResponse;
-        }
-
-        if (!content) {
-            const snippet = typeof rawResponse === 'string' ? rawResponse.slice(0, 2000) : String(rawResponse);
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content extracted from OpenRouter (status=${statusCode}). Body snippet: ${snippet}`, 'error');
-            throw new Error('No content returned from OpenRouter');
-        }
-
-        // strip fences and parse JSON
-        const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
-        let parsed: any;
-        try {
-            parsed = JSON.parse(content);
-        } catch {
-            const trimmed = stripFences(content);
-            try {
-                parsed = JSON.parse(trimmed);
-            } catch {
-                const match = trimmed.match(/(\[.*\]|\{.*\})/s);
-                if (match && typeof match[1] === 'string') {
-                    try {
-                        parsed = JSON.parse(match[1]);
-                    } catch {
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Failed to parse LLM JSON output. Preview: ${trimmed.slice(0,500)}`, 'error');
-                        throw new Error('Failed to parse LLM JSON output');
-                    }
-                } else {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No JSON-like content in LLM output. Preview: ${trimmed.slice(0,500)}`, 'error');
-                    throw new Error('Failed to parse LLM JSON output');
-                }
-            }
-        }
-
-        if (!Array.isArray(parsed)) {
-            if (parsed?.data && Array.isArray(parsed.data)) parsed = parsed.data;
-            else if (parsed?.items && Array.isArray(parsed.items)) parsed = parsed.items;
-            else {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned non-array JSON: ${JSON.stringify(parsed).slice(0,1000)}`, 'error');
-                throw new Error('LLM returned non-array JSON');
-            }
-        }
-
-        const normalized: GoogleSearch[] = parsed.map((item: any) => {
-            let topic = '';
-            if (typeof item.topic === 'string') topic = item.topic;
-            else if (typeof item === 'string') topic = item;
-            else if (typeof item?.title === 'string') topic = item.title;
-
-            const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : [];
-            return { topic: String(topic).trim(), related };
-        }).filter((x: GoogleSearch) => !!x.topic && x.topic.length > 1);
-
-        if (!normalized.length) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Parsed JSON but no valid search items found. Parsed length: ${Array.isArray(parsed) ? parsed.length : 0}`, 'error');
-            throw new Error('LLM returned empty or invalid results');
-        }
-
-        return normalized;
-    }
-
-    /**
-     * Perform the HTTPS request to OpenRouter. If disableEnvProxy is true, temporarily removes
-     * environment proxy variables (HTTP_PROXY / HTTPS_PROXY / http_proxy / https_proxy) for the duration
-     * of the request so the request is made without the OS/env proxy.
-     */
-    private async performOpenRouterRequest(payload: string, headers: Record<string, string>, timeoutMs: number, disableEnvProxy: boolean): Promise<string> {
-        const url = new URL('https://openrouter.ai/api/v1/chat/completions');
-        // Save existing env proxy vars if asked to disable them
-        const savedEnv: Record<string, string | undefined> = {}
-        const proxyEnvKeys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
-
-        if (disableEnvProxy) {
-            for (const k of proxyEnvKeys) {
-                savedEnv[k] = process.env[k]
-                if (process.env[k]) delete process.env[k]
-            }
-        }
-
-        try {
-            return await new Promise<string>((resolve, reject) => {
-                const req = https.request({
-                    hostname: url.hostname,
-                    port: url.port || 443,
-                    path: url.pathname + url.search,
-                    method: 'POST',
-                    headers,
-                    agent: undefined as any // explicitly undefined to avoid agent/proxy reuse
-                }, (res) => {
-                    const statusCode = res.statusCode;
-                    const chunks: Buffer[] = [];
-                    res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-                    res.on('end', () => {
-                        const raw = Buffer.concat(chunks).toString('utf8');
-                        // store for caller diagnostics
-                        this._lastOpenRouterStatusCode = statusCode;
-                        resolve(raw);
-                    });
-                });
-
-                req.on('error', (err) => reject(err));
-                req.setTimeout(timeoutMs, () => req.destroy(new Error('OpenRouter request timeout')));
-                req.write(payload);
-                req.end();
-            })
-        } finally {
-            // Restore environment proxy variables
-            if (disableEnvProxy) {
-                for (const k of proxyEnvKeys) {
-                    if (typeof savedEnv[k] === 'string') process.env[k] = savedEnv[k] as string
-                    else delete process.env[k]
-                }
-            }
+            // Generic handling/logging
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${message}`, 'error')
+            throw err
         }
     }
 
@@ -691,29 +479,6 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
         }
 
         return null
-    }
-
-    private async getRelatedTerms(term: string): Promise<string[]> {
-        try {
-            // Human-like delay before fetching related terms (0.5-1.5s)
-            await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
-
-            const request = {
-                url: `https://api.bing.com/osjson.aspx?query=${encodeURIComponent(term)}`,
-                method: 'GET',
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            }
-
-            const response = await this.bot.axios.request(request, this.bot.config.proxy?.proxyBingTerms)
-
-            return response.data?.[1] as string[] || []
-        } catch (error) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING-RELATED', 'An error occurred:' + (error instanceof Error ? error.message : String(error)), 'error')
-        }
-
-        return []
     }
 
     private async randomScroll(page: Page) {
