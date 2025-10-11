@@ -56,7 +56,52 @@ export default class Activities {
             }
         } catch { /* ignore and use provided defaults */ }
 
-        await this.bot.utils.wait(this.bot.utils.randomNumber(minMs, maxMs))
+        // fallback
+        if (this.bot && this.bot.utils && typeof this.bot.utils.wait === 'function') {
+            await this.bot.utils.wait(this.bot.utils.randomNumber(minMs, maxMs))
+        } else {
+            await new Promise(res => setTimeout(res, this.randomNumber(minMs, maxMs)))
+        }
+    }
+
+    // helper used when bot.utils isn't available in some contexts
+    private randomNumber(min: number, max: number) {
+        return Math.floor(Math.random() * (max - min + 1)) + min
+    }
+
+    /**
+     * Simulate natural scrolling behaviour. Random distance, occasional slight reverse.
+     */
+    private async humanScroll(page: Page) {
+        try {
+            const viewportHeight = await page.evaluate(() => (window.innerHeight || 720)) as number
+            const scrollAmount = Math.floor(viewportHeight * (0.5 + Math.random() * 0.5))
+            const direction = Math.random() > 0.5 ? 1 : -1
+            await page.evaluate((amt) => window.scrollBy(0, amt), scrollAmount * direction)
+            await this.humanPause(300, 700)
+            if (Math.random() < 0.3) {
+                // slight reversal to mimic human indecision
+                await page.evaluate((amt) => window.scrollBy(0, amt), -Math.floor(scrollAmount * 0.2) * direction)
+                await this.humanPause(100, 300)
+            }
+        } catch (e) {
+            // ignore scroll errors
+            this.bot.log(this.bot.isMobile, 'HUMANIZE', `humanScroll failed: ${e instanceof Error ? e.message : String(e)}`, 'warn')
+        }
+    }
+
+    /**
+     * Simulate hovering over an element selector when possible
+     */
+    private async humanHover(page: Page, selector: string, timeout = 3000) {
+        try {
+            const loc = page.locator(selector)
+            await loc.waitFor({ state: 'visible', timeout }).catch(() => { /* ignore */ })
+            await loc.hover({ timeout: 2000 }).catch(() => { /* ignore */ })
+            await this.humanPause(150, 500)
+        } catch (e) {
+            // don't fail activity for hover failure
+        }
     }
 
     /**
@@ -144,57 +189,111 @@ export default class Activities {
 
     // ---- activity wrappers (instantiate per-call so they get fresh bot reference) ----
 
-    async doSearch(page: Page, data: DashboardData): Promise<void> {
+    /**
+     * doSearch now supports an optional numSearches parameter.
+     * If provided, activities will attempt to perform up to that many searches in this call.
+     */
+    async doSearch(page: Page, data: DashboardData, numSearches?: number): Promise<void> {
+        // small pre-search humanization: scroll + optional hover on the search field
+        await this.humanScroll(page)
+        await this.humanHover(page, '#sb_form_q')
+
+        // instantiate and delegate to the Search activity
         const search = new Search(this.bot)
-        await search.doSearch(page, data)
+
+        try {
+            // If caller provided a hint for number of searches, forward it.
+            // Search.doSearch should be updated to accept the optional third parameter.
+            // We keep compatibility with existing signature by checking function length
+            // but prefer passing numSearches when available.
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            // @ts-ignore
+            if (typeof (search.doSearch) === 'function') {
+                // attempt to call with numSearches; if upstream doesn't accept it, it should ignore the extra arg
+                // calling with explicit three args is safe in JS/TS if function ignores extras
+                // ensure reasonable guard on numSearches (positive integer)
+                let n: number | undefined = undefined
+                if (typeof numSearches === 'number' && Number.isInteger(numSearches) && numSearches > 0) n = Math.min(Math.max(1, numSearches), 50) // cap
+
+                await (search as any).doSearch(page, data, n)
+            } else {
+                // fallback: call old signature
+                await (search as any).doSearch(page, data)
+            }
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'ACTIVITY', `doSearch wrapper error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+        }
+
+        // small post-search humanization
+        if (Math.random() < 0.5) await this.humanScroll(page)
+        if (Math.random() < 0.3) await this.humanHover(page, '#b_results .b_algo h2')
+
         await this.humanPause(1000, 2000)
     }
 
     async doABC(page: Page): Promise<void> {
         const abc = new ABC(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, '.rwds_svg')
         await abc.doABC(page)
+        if (Math.random() < 0.4) await this.humanScroll(page)
         await this.humanPause(1500, 3000)
     }
 
     async doPoll(page: Page): Promise<void> {
         const poll = new Poll(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, '.bt_option')
         await poll.doPoll(page)
+        if (Math.random() < 0.4) await this.humanHover(page, '.bt_vote')
         await this.humanPause(1000, 2000)
     }
 
     async doThisOrThat(page: Page): Promise<void> {
         const thisOrThat = new ThisOrThat(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, '.wk_choicesCont')
         await thisOrThat.doThisOrThat(page)
+        if (Math.random() < 0.4) await this.humanScroll(page)
         await this.humanPause(1200, 2500)
     }
 
     async doQuiz(page: Page): Promise<void> {
         const quiz = new Quiz(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, '.wk_QuestionPane')
         await quiz.doQuiz(page)
+        if (Math.random() < 0.4) await this.humanHover(page, '.wk_QuestionPane')
         await this.humanPause(1000, 2000)
     }
 
     async doUrlReward(page: Page): Promise<void> {
         const urlReward = new UrlReward(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, 'a[href*="rewards.microsoft.com"]')
         await urlReward.doUrlReward(page)
+        if (Math.random() < 0.4) await this.humanScroll(page)
         await this.humanPause(1000, 2000)
     }
 
     async doSearchOnBing(page: Page, activity: MorePromotion | PromotionalItem): Promise<void> {
         const searchOnBing = new SearchOnBing(this.bot)
+        await this.humanScroll(page)
+        await this.humanHover(page, '#sb_form_q')
         await searchOnBing.doSearchOnBing(page, activity)
         await this.humanPause(1000, 2000)
     }
 
     async doReadToEarn(accessToken: string, data: DashboardData): Promise<void> {
         const readToEarn = new ReadToEarn(this.bot)
+        // API-based: quicker pauses
         await readToEarn.doReadToEarn(accessToken, data)
-        await this.humanPause(1000, 2000)
+        await this.humanPause(500, 1500)
     }
 
     async doDailyCheckIn(accessToken: string, data: DashboardData): Promise<void> {
         const dailyCheckIn = new DailyCheckIn(this.bot)
         await dailyCheckIn.doDailyCheckIn(accessToken, data)
-        await this.humanPause(1000, 2000)
+        await this.humanPause(500, 1500)
     }
 }

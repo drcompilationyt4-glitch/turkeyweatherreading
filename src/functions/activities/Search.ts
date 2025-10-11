@@ -501,91 +501,210 @@ Return at least 25 items if possible. Avoid politically sensitive or adult topic
         const queryTerms: GoogleSearch[] = [];
         this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`);
 
+        // small human-like delay
         await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500));
 
+        // Build basic request payload (same as before)
+        const request: AxiosRequestConfig = {
+            url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'Accept': '*/*',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
+            },
+            data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
+            responseType: 'text',
+            timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
+        };
+
+        // Debug: log proxy-related config and env proxies
         try {
-            const request: AxiosRequestConfig = {
-                url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                    'Accept': '*/*',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36'
-                },
-                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
-                responseType: 'text',
-                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 15000
-            };
-
-            const axiosConfig = {
-                ...request,
-                ...(this.bot.config?.proxy?.proxyGoogleTrends ? { proxy: this.bot.config.proxy.proxyGoogleTrends } : {})
-            };
-
-            const response = await this.bot.axios.request(axiosConfig);
-            let rawText: string;
-            if (typeof response.data === 'string') rawText = response.data;
-            else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8');
-            else rawText = JSON.stringify(response.data);
-
-            const trendsData = this.extractJsonFromResponse(rawText);
-            if (!Array.isArray(trendsData) || trendsData.length === 0) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response or no items found', 'warn');
-                return [];
-            }
-
-            const mapped: Array<[string, string[]]> = [];
-            for (const entry of trendsData) {
-                if (!Array.isArray(entry)) continue;
-
-                const topic = typeof entry[0] === 'string' ? entry[0] : null;
-                let related: string[] = [];
-
-                try {
-                    if (Array.isArray(entry[9])) {
-                        const nested = entry[9];
-                        // find first nested array of strings
-                        for (const el of nested) {
-                            if (Array.isArray(el) && el.every((v: any) => typeof v === 'string')) {
-                                // safe convert to string[] without narrow-casting
-                                related = (el as any[]).map((v: any) => String(v));
-                                break;
-                            }
-                        }
-                        // fallback: collect string elements directly in nested
-                        if (!related.length) {
-                            related = nested.filter((x: any) => typeof x === 'string').map((v: any) => String(v));
-                        }
-                    } else {
-                        // fallback: find any string-array inside entry
-                        for (const el of entry) {
-                            if (Array.isArray(el) && el.length > 0 && typeof el[0] === 'string') {
-                                related = el.filter((r: any) => typeof r === 'string').map((v: any) => String(v));
-                                break;
-                            }
-                        }
-                    }
-                } catch {
-                    related = [];
-                }
-
-                if (topic) mapped.push([topic, related]);
-            }
-
-            if (mapped.length < 90 && geoLocale.toUpperCase() !== 'US' && !triedFallback) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient search queries from trends for ${geoLocale}, falling back to US`, 'warn');
-                return this.getGoogleTrends('US', true);
-            }
-
-            for (const [topic, rel] of mapped) {
-                queryTerms.push({ topic, related: Array.isArray(rel) ? rel : [] });
-            }
-        } catch (err) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred while fetching trends: ' + (err instanceof Error ? err.message : String(err)), 'error');
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `config.proxy.proxyGoogleTrends: ${JSON.stringify(this.bot.config?.proxy?.proxyGoogleTrends)}`);
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `env HTTP_PROXY: ${process.env.HTTP_PROXY || process.env.http_proxy || ''} | HTTPS_PROXY: ${process.env.HTTPS_PROXY || process.env.https_proxy || ''}`);
+        } catch {
+            // ignore logging failures
         }
 
+        // Normalize proxy configuration and build axios config
+        const axiosConfig: any = { ...request };
+
+        const rawProxy = this.bot.config?.proxy?.proxyGoogleTrends;
+
+        // Helper: validate a proxy host is not localhost/loopback (avoid accidental ::1)
+        const isLocalhostCandidate = (host?: string | null) => {
+            if (!host) return false;
+            const h = String(host).toLowerCase();
+            return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.startsWith('127.') || h.startsWith('::1') || h === '[::1]';
+        };
+
+        if (!rawProxy) {
+            // Explicitly disable proxy so axios doesn't use environment proxies
+            axiosConfig.proxy = false;
+        } else if (typeof rawProxy === 'string') {
+            try {
+                const p = new URL(rawProxy);
+                const hostname = p.hostname;
+                const port = p.port ? Number(p.port) : (p.protocol === 'https:' ? 443 : 80);
+
+                if (isLocalhostCandidate(hostname)) {
+                    // don't accidentally proxy to localhost — disable and warn
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Configured proxy resolves to localhost (${hostname}). Disabling proxy for Google Trends request.`, 'warn');
+                    axiosConfig.proxy = false;
+                } else {
+                    // Use axios proxy shape
+                    axiosConfig.proxy = {
+                        host: hostname,
+                        port,
+                        protocol: p.protocol?.replace(':', '') || undefined
+                    };
+                    if (p.username || p.password) {
+                        axiosConfig.proxy.auth = { username: decodeURIComponent(p.username), password: decodeURIComponent(p.password) };
+                    }
+                }
+            } catch (parseErr) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Invalid proxy string for proxyGoogleTrends: ${String(rawProxy)}. Disabling proxy.`, 'warn');
+                axiosConfig.proxy = false;
+            }
+        } else if (typeof rawProxy === 'object') {
+            // trust object format but guard against local host
+            if (isLocalhostCandidate((rawProxy as any).host)) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `proxyGoogleTrends object points to localhost. Disabling proxy.`, 'warn');
+                axiosConfig.proxy = false;
+            } else {
+                axiosConfig.proxy = rawProxy;
+            }
+        } else {
+            axiosConfig.proxy = false;
+        }
+
+        // Force IPv4 lookup to avoid accidental ::1 resolution / IPv6 loopback mapping.
+        // We reuse the https import already present at top of file.
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const dns = require('dns');
+
+            // custom lookup that forces family:4
+            const lookup = (hostname: string, options: any, callback: Function) => {
+                // options may be the integer in older node signatures
+                try {
+                    dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
+                        callback(err, address, family);
+                    });
+                } catch (e) {
+                    // fallback to default lookup if something goes wrong
+                    dns.lookup(hostname, (err: any, address: any, family: any) => callback(err, address, family));
+                }
+            };
+
+            // create agent to pass to axios (keepAlive helps)
+            axiosConfig.httpsAgent = new https.Agent({ keepAlive: true, lookup });
+        } catch (e) {
+            // If dns/require fails for some reason, continue without custom lookup
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Could not create IPv4-forcing lookup agent: ${(e instanceof Error) ? e.message : String(e)}`, 'warn');
+        }
+
+        // Retries with exponential backoff
+        const maxAttempts = 3;
+        let attempt = 0;
+        let lastErr: any = null;
+        while (attempt < maxAttempts) {
+            attempt++;
+            try {
+                // Small randomized delay before request (humanization)
+                await this.bot.utils.wait(this.bot.utils.randomNumber(200, 700));
+
+                // If we explicitly disabled proxy above via axiosConfig.proxy = false
+                // axios will not use env proxies.
+
+                // Make the request
+                const response = await this.bot.axios.request(axiosConfig);
+                let rawText: string;
+                if (typeof response.data === 'string') rawText = response.data;
+                else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8');
+                else rawText = JSON.stringify(response.data);
+
+                const trendsData = this.extractJsonFromResponse(rawText);
+                if (!Array.isArray(trendsData) || trendsData.length === 0) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response or no items found', 'warn');
+                    return [];
+                }
+
+                const mapped: Array<[string, string[]]> = [];
+                for (const entry of trendsData) {
+                    if (!Array.isArray(entry)) continue;
+
+                    const topic = typeof entry[0] === 'string' ? entry[0] : null;
+                    let related: string[] = [];
+
+                    try {
+                        if (Array.isArray(entry[9])) {
+                            const nested = entry[9];
+                            for (const el of nested) {
+                                if (Array.isArray(el) && el.every((v: any) => typeof v === 'string')) {
+                                    related = (el as any[]).map((v: any) => String(v));
+                                    break;
+                                }
+                            }
+                            if (!related.length) {
+                                related = nested.filter((x: any) => typeof x === 'string').map((v: any) => String(v));
+                            }
+                        } else {
+                            for (const el of entry) {
+                                if (Array.isArray(el) && el.length > 0 && typeof el[0] === 'string') {
+                                    related = el.filter((r: any) => typeof r === 'string').map((v: any) => String(v));
+                                    break;
+                                }
+                            }
+                        }
+                    } catch {
+                        related = [];
+                    }
+
+                    if (topic) mapped.push([topic, related]);
+                }
+
+                if (mapped.length < 90 && geoLocale.toUpperCase() !== 'US' && !triedFallback) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient search queries from trends for ${geoLocale}, falling back to US`, 'warn');
+                    return this.getGoogleTrends('US', true);
+                }
+
+                for (const [topic, rel] of mapped) {
+                    queryTerms.push({ topic, related: Array.isArray(rel) ? rel : [] });
+                }
+
+                // success -> break retry loop
+                return queryTerms;
+            } catch (err) {
+                lastErr = err;
+                const errMsg = (err instanceof Error) ? err.message : String(err);
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `An error occurred while fetching trends (attempt ${attempt}/${maxAttempts}): ${errMsg}`, 'error');
+
+                // If it's a connection refused to ::1, log explicit hint
+                if (/::1|localhost|127\.0\.0\.1/.test(errMsg)) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Connection attempt appears to target localhost (::1 / 127.0.0.1). Check proxy settings (this.bot.config.proxy.proxyGoogleTrends) and environment variables HTTP(S)_PROXY.', 'warn');
+                }
+
+                // If this was a proxy misparse or configured to localhost, stop retrying
+                if (attempt === 1 && /ECONNREFUSED.*::1|ECONNREFUSED.*127\.0\.0\.1/.test(errMsg)) {
+                    // very likely misconfigured local proxy — don't continue exponential backoff
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Aborting additional retries due to immediate localhost connect refusal.', 'warn');
+                    break;
+                }
+
+                if (attempt < maxAttempts) {
+                    // exponential backoff with jitter
+                    const backoff = Math.min(10000, Math.pow(2, attempt) * 500) + Math.floor(Math.random() * 300);
+                    await this.bot.utils.wait(backoff);
+                }
+            }
+        }
+
+        // If we reach here we failed
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'All attempts to fetch Google Trends failed.' + (lastErr ? ` Last error: ${(lastErr instanceof Error) ? lastErr.message : String(lastErr)}` : ''), 'error');
         return queryTerms;
     }
+
 
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {

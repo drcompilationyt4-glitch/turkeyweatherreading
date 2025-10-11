@@ -899,6 +899,7 @@ export class MicrosoftRewardsBot {
     // Desktop
     // File: src/index.ts
 // Method: async Desktop(account: Account)
+    // ---------- Desktop ----------
     async Desktop(account: Account) {
         rlog(this.isMobile, 'FLOW', 'Desktop() invoked');
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email);
@@ -907,13 +908,16 @@ export class MicrosoftRewardsBot {
         // Helper: small settle delay 1.0 - 1.5s
         const smallSettle = () => Math.floor(Math.random() * 500) + 1000;
 
+        // randomInt helper
+        const randomInt = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
+
         // Utility helpers
         const randomDelay = async (minMs = 1000, maxMs = 3000) => {
             const delay = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(delay);
             } else {
-                await sleep(delay);
+                await new Promise(res => setTimeout(res, delay));
             }
         };
         const humanScroll = async (page: Page) => {
@@ -940,7 +944,6 @@ export class MicrosoftRewardsBot {
                 await this.homePage.goto('https://rewards.microsoft.com/', { waitUntil: 'domcontentloaded', timeout: 120000});
             }
 
-            // Fast checks (2s timeout) to ensure page isn't completely blank
             await this.homePage.waitForLoadState('domcontentloaded', { timeout: 100 }).catch(() => {});
             await this.homePage.waitForFunction(() => document.readyState === 'complete', { timeout: 100 }).catch(() => {});
             await this.homePage.waitForSelector('body', { timeout:200 }).catch(() => {});
@@ -951,17 +954,16 @@ export class MicrosoftRewardsBot {
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(settleMs);
             } else {
-                await sleep(settleMs);
+                await new Promise(res => setTimeout(res, settleMs));
             }
         } catch (err) {
-            // Very short fallback (1-1.5s) instead of long 40-60s
             rlog(this.isMobile, 'MAIN', `Fast page-ready wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
             const waitMs = 100 + Math.floor(Math.random() * 500);
             this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page (fallback).`);
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(waitMs);
             } else {
-                await sleep(waitMs);
+                await new Promise(res => setTimeout(res, waitMs));
             }
         }
 
@@ -1032,7 +1034,6 @@ export class MicrosoftRewardsBot {
             // Punch Cards
             const punchUncompleted = (currentData.punchCards ?? []).filter(x => x.parentPromotion && !x.parentPromotion.complete);
             if (this.config.workers.doPunchCards && punchUncompleted.length > 0) {
-                // choose a random parent punch card entry for later (we still guard everything)
                 const pcCandidate = punchUncompleted[randomInt(0, punchUncompleted.length - 1)];
                 if (pcCandidate) {
                     const childUncompleted = (pcCandidate.childPromotions ?? []).filter(x => !x.complete);
@@ -1066,14 +1067,30 @@ export class MicrosoftRewardsBot {
                 });
             }
 
-            // Desktop Search
+            // Desktop Search (chunked)
             const pcSearchData = await this.browser.func.getSearchPoints();
             const pcSearch = pcSearchData.pcSearch ? pcSearchData.pcSearch[0] : null;
             if (this.config.workers.doDesktopSearch && pcSearch && pcSearch.pointProgress < pcSearch.pointProgressMax) {
                 categories.push({
                     name: 'search',
                     action: async () => {
-                        await this.activities.doSearch(this.homePage, currentData); // Removed numToDo since doSearch expects 2 args
+                        // estimate points per search (configurable)
+                        const pointsPerSearch = (this.config.searchSettings?.pointsPerSearch) || 5;
+                        const missingPoints = Math.max(0, (pcSearch.pointProgressMax || 0) - (pcSearch.pointProgress || 0));
+
+                        // how many searches needed to satisfy missingPoints
+                        const needed = Math.max(1, Math.ceil(missingPoints / pointsPerSearch));
+                        // chunk size 1..3
+                        const chunk = randomInt(1, 3);
+                        const searchesToDo = Math.min(chunk, needed);
+
+                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Desktop: performing up to ${searchesToDo} searches this iteration (missingPoints=${missingPoints})`);
+                        try {
+                            // call doSearch with numSearches hint (update doSearch to accept third arg)
+                            await this.activities.doSearch(this.homePage, currentData, searchesToDo);
+                        } catch (err) {
+                            this.log(this.isMobile, 'INTERLEAVE', `Desktop search action failed: ${err}`, 'warn');
+                        }
                     }
                 });
             }
@@ -1092,7 +1109,7 @@ export class MicrosoftRewardsBot {
                 }
             }
 
-            // Pause (stop)
+            // Pause between loop iterations to look human
             await randomDelay(3000, 10000);
         }
 
@@ -1110,8 +1127,10 @@ export class MicrosoftRewardsBot {
     }
 
 
+
 // Mobile
     // Mobile
+    // ---------- Mobile ----------
     async Mobile(account: Account): Promise<{ initialPoints: number; collectedPoints: number }> {
         rlog(this.isMobile, 'FLOW', 'Mobile() invoked');
         let browser = await this.browserFactory.createBrowser(account.proxy, account.email);
@@ -1120,13 +1139,16 @@ export class MicrosoftRewardsBot {
         // Helper small settle
         const smallSettle = () => Math.floor(Math.random() * 500) + 1000;
 
+        // randomInt helper
+        const randomInt = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
+
         // Utility helpers (same as Desktop)
         const randomDelay = async (minMs = 1000, maxMs = 3000) => {
             const delay = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(delay);
             } else {
-                await sleep(delay);
+                await new Promise(res => setTimeout(res, delay));
             }
         };
         const humanScroll = async (page: Page) => {
@@ -1159,7 +1181,7 @@ export class MicrosoftRewardsBot {
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(settleMs);
             } else {
-                await sleep(settleMs);
+                await new Promise(res => setTimeout(res, settleMs));
             }
         } catch (err) {
             rlog(this.isMobile, 'MAIN', `Fast page-ready wait failed: ${err}. Falling back to very short wait (1-1.5s).`, 'warn');
@@ -1168,7 +1190,7 @@ export class MicrosoftRewardsBot {
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(waitMs);
             } else {
-                await sleep(waitMs);
+                await new Promise(res => setTimeout(res, waitMs));
             }
         }
 
@@ -1200,7 +1222,7 @@ export class MicrosoftRewardsBot {
             if (this.utils && typeof this.utils.wait === 'function') {
                 await this.utils.wait(TEN_MS);
             } else {
-                await sleep(TEN_MS);
+                await new Promise(res => setTimeout(res, TEN_MS));
             }
 
             // Recreate browser and retry login once
@@ -1223,7 +1245,7 @@ export class MicrosoftRewardsBot {
                     if (this.utils && typeof this.utils.wait === 'function') {
                         await this.utils.wait(settleMs);
                     } else {
-                        await sleep(settleMs);
+                        await new Promise(res => setTimeout(res, settleMs));
                     }
                 } catch (err) {
                     rlog(this.isMobile, 'MAIN', `Retry page-ready fast wait failed: ${err}. Continuing anyway.`, 'warn');
@@ -1287,7 +1309,7 @@ export class MicrosoftRewardsBot {
         let loopCount = 0;
         let currentData = data;
 
-        // Flags for single-run tasks like checkin and read (since no easy way to check completion without running)
+        // Flags for single-run tasks like checkin and read
         let checkInDone = false;
         let readDone = false;
 
@@ -1303,7 +1325,7 @@ export class MicrosoftRewardsBot {
                     name: 'checkin',
                     action: async () => {
                         await this.activities.doDailyCheckIn(this.accessToken, currentData);
-                        checkInDone = true; // Mark done after attempt
+                        checkInDone = true;
                     }
                 });
             }
@@ -1313,19 +1335,30 @@ export class MicrosoftRewardsBot {
                     name: 'read',
                     action: async () => {
                         await this.activities.doReadToEarn(this.accessToken, currentData);
-                        readDone = true; // Mark done after attempt
+                        readDone = true;
                     }
                 });
             }
 
-            // Mobile Search
+            // Mobile Search (chunked)
             const mobileSearchData = await this.browser.func.getSearchPoints();
             const mobileSearchCounter = mobileSearchData.mobileSearch ? mobileSearchData.mobileSearch[0] : null;
             if (this.config.workers.doMobileSearch && mobileSearchCounter && mobileSearchCounter.pointProgress < mobileSearchCounter.pointProgressMax) {
                 categories.push({
                     name: 'search',
                     action: async () => {
-                        await this.activities.doSearch(this.homePage, currentData); // Removed numToDo since doSearch expects 2 args
+                        const pointsPerSearch = (this.config.searchSettings?.pointsPerSearch) || 5;
+                        const missingPoints = Math.max(0, (mobileSearchCounter.pointProgressMax || 0) - (mobileSearchCounter.pointProgress || 0));
+                        const needed = Math.max(1, Math.ceil(missingPoints / pointsPerSearch));
+                        const chunk = randomInt(1, 3);
+                        const searchesToDo = Math.min(chunk, needed);
+
+                        this.log(this.isMobile, 'SEARCH-INTERLEAVE', `Mobile: performing up to ${searchesToDo} searches this iteration (missingPoints=${missingPoints})`);
+                        try {
+                            await this.activities.doSearch(this.homePage, currentData, searchesToDo);
+                        } catch (err) {
+                            this.log(this.isMobile, 'INTERLEAVE', `Mobile search action failed: ${err}`, 'warn');
+                        }
                     }
                 });
             }
@@ -1357,6 +1390,7 @@ export class MicrosoftRewardsBot {
             collectedPoints: (afterPointAmount - initialPoints) || 0
         };
     }
+
 
 
 
