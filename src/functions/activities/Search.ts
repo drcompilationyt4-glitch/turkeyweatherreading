@@ -189,12 +189,106 @@ export class Search extends Workers {
                 const searchBar = '#sb_form_q'
                 // Prefer attached over visible to avoid strict visibility waits when overlays exist
                 const box = searchPage.locator(searchBar)
-                await box.waitFor({ state: 'attached', timeout: 15000 })
 
-                // Try dismissing overlays before interacting
-                await this.bot.browser.utils.tryDismissAllMessages(searchPage)
-                await this.bot.utils.wait(200)
+                // Helper to find any visible & enabled input on the page
+                const findAnyVisibleInput = async (p: Page) => {
+                    try {
+                        const inputs = await p.$$('input')
+                        for (const inp of inputs) {
+                            try {
+                                const visible = await inp.evaluate((el: HTMLElement) => {
+                                    const style = window.getComputedStyle(el)
+                                    const rect = el.getBoundingClientRect()
+                                    return !el.hasAttribute('disabled') && !!(rect.width && rect.height) && style.visibility !== 'hidden' && style.display !== 'none'
+                                })
+                                if (visible) return inp
+                            } catch { /* ignore evaluation errors */ }
+                        }
+                    } catch { /* ignore */ }
+                    return null
+                }
 
+                // Try waiting for attached; if it times out, we'll attempt alternatives (Ctrl/Cmd+E fallback)
+                try {
+                    await box.waitFor({ state: 'attached', timeout: 15000 })
+                } catch (waitErr) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-BING', `Primary selector ${searchBar} not attached; attempting keyboard shortcut (Ctrl/Cmd+E) and fallback strategies`, 'warn')
+
+                    // 1) Try dismiss overlays then short wait
+                    await this.bot.browser.utils.tryDismissAllMessages(searchPage).catch(() => {})
+                    await this.bot.utils.wait(200)
+
+                    // Helper to try platform modifier + key and then check for the primary selector
+                    const tryShortcut = async (key: string) => {
+                        try {
+                            await searchPage.keyboard.down(platformControlKey)
+                            await searchPage.keyboard.press(key)
+                            await searchPage.keyboard.up(platformControlKey)
+                        } catch { /* ignore */ }
+                        await this.bot.utils.wait(350)
+                        try {
+                            const el = await searchPage.$(searchBar)
+                            if (el) return el
+                        } catch { /* ignore */ }
+                        return null
+                    }
+
+                    // 2) Try Ctrl/Cmd+E first (user requested), then Ctrl/Cmd+K, then '/' key
+                    let found: any = null
+                    found = await tryShortcut('E')
+                    if (!found) found = await tryShortcut('K')
+                    if (!found) {
+                        try { await searchPage.keyboard.press('/') } catch { /* ignore */ }
+                        await this.bot.utils.wait(350)
+                        try { found = await searchPage.$(searchBar) } catch { /* ignore */ }
+                    }
+
+                    // If found via shortcut, use it
+                    if (found) {
+                        try {
+                            await (found as any).focus().catch(() => { })
+                            await (found as any).fill('')
+                            await (found as any).type(query, { delay: 20 })
+                            await searchPage.keyboard.press('Enter')
+                            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Focused via shortcut and executed Enter', 'log')
+                        } catch (e) {
+                            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Shortcut-focused input failed, will try any visible input', 'warn')
+                            found = null
+                        }
+                    }
+
+                    // If still nothing, try any visible input
+                    if (!found) {
+                        const anyInput = await findAnyVisibleInput(searchPage)
+                        if (anyInput) {
+                            try {
+                                await anyInput.focus()
+                                await anyInput.fill('')
+                                await anyInput.type(query, { delay: 20 })
+                                await searchPage.keyboard.press('Enter')
+                                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Used fallback visible input + Enter', 'log')
+                            } catch (e) {
+                                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Fallback visible input failed, navigating directly', 'warn')
+                                const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+                                await searchPage.goto(url)
+                            }
+                        } else {
+                            // Last resort: try pressing Enter on current focus then direct navigation
+                            try {
+                                await searchPage.keyboard.press('Enter')
+                                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Pressed Enter with no specific input focused (best-effort)', 'warn')
+                                await this.bot.utils.wait(1000)
+                                const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+                                await searchPage.goto(url)
+                            } catch (e) {
+                                const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+                                await searchPage.goto(url)
+                            }
+                        }
+                    }
+                }
+
+                // Try interacting with primary box when present
                 let navigatedDirectly = false
                 try {
                     // Try focusing and filling instead of clicking (more reliable on mobile)
