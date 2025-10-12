@@ -1,3 +1,4 @@
+// src/functions/activities/Search.ts
 import { Page } from 'rebrowser-playwright'
 import { platform } from 'os'
 import axios from 'axios';
@@ -22,7 +23,7 @@ export class Search extends Workers {
     private searchPageURL = ''
 
     public async doSearch(page: Page, data: DashboardData, numSearches?: number) {
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING', `Starting Bing searches${numSearches ? ` (max ${numSearches} this run)` : ''}`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
 
         // Human-like delay before starting searches (1-3 seconds)
         await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000))
@@ -37,139 +38,140 @@ export class Search extends Workers {
             return
         }
 
-        // Initialize or reuse query state for interleaving
-        if (!this.currentQueries || this.currentQueries.length === 0 || this.currentQueryIndex >= this.currentQueries.length) {
-            await this.initializeQueries(data)
+        // Decide how many searches we may need (roughly)
+        const pointsPerSearch = this.bot.config.searchSettings?.pointsPerSearch || 5
+        const neededSearches = Math.ceil(missingPoints / pointsPerSearch)
+        const targetSearchCount = numSearches ? Math.min(numSearches, neededSearches) : neededSearches
+
+        // Generate search queries (LLM first, or Google Trends fallback)
+        const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
+
+        // getSearchQueries tries batch LLM first (if configured), then per-search LLM fallback, then Trends, then local file
+        let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo, targetSearchCount)
+
+        // Final fallbacks: local file
+        if (!googleSearchQueries.length || googleSearchQueries.length < 1) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'No queries from LLM/Trends — falling back to local queries.json', 'warn')
+            try {
+                const local = await import('../queries.json')
+                const sampleSize = Math.max(5, Math.min(25, (local.default || []).length))
+                const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, sampleSize)
+                googleSearchQueries = sampled.map((x: any) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
+            } catch (e) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Failed loading local queries fallback: ' + (e instanceof Error ? e.message : String(e)), 'error')
+            }
         }
 
-        const pointsPerSearch = this.bot.config.searchSettings?.pointsPerSearch || 5
-        const maxNeededSearches = Math.ceil(missingPoints / pointsPerSearch)
+        // Shuffle and dedupe topics
+        googleSearchQueries = this.bot.utils.shuffleArray(googleSearchQueries)
+        const seen = new Set<string>()
+        googleSearchQueries = googleSearchQueries.filter(q => {
+            if (!q || !q.topic) return false
+            const k = q.topic.toLowerCase()
+            if (seen.has(k)) return false
+            seen.add(k)
+            return true
+        })
 
-        // Determine how many searches to do in this chunk
-        const searchesToDo = numSearches ?
-            Math.min(numSearches, maxNeededSearches) :
-            maxNeededSearches
+        // Go to bing
+        await page.goto(this.searchPageURL ? this.searchPageURL : this.bingHome)
+        await this.bot.utils.wait(2000)
+        await this.bot.browser.utils.tryDismissAllMessages(page)
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING',
-            `Doing ${searchesToDo} searches this iteration (${missingPoints} points remaining, ${maxNeededSearches} total needed)`)
+        let stagnation = 0 // consecutive searches without point progress
 
-        let attempts = 0
-        const maxSearchAttempts = Math.min(searchesToDo * 3, this.bot.config.searchSettings.maxSearchAttempts || 100)
-        let stagnation = 0
-        let searchesCompleted = 0
+        const queries: string[] = []
+        // Mobile search doesn't seem to like related queries
+        googleSearchQueries.forEach(x => { this.bot.isMobile ? queries.push(x.topic) : queries.push(x.topic, ...(x.related || [])) })
 
-        while (searchesCompleted < searchesToDo && attempts < maxSearchAttempts && missingPoints > 0) {
-            attempts++
+        // Loop over Google search queries (stop when we've satisfied points or exhausted queries)
+        for (let i = 0; i < queries.length; i++) {
+            const query = queries[i] as string
 
-            // Get next query from our pre-generated list
-            if (this.currentQueryIndex >= this.currentQueries.length) {
-                // If we run out of queries, generate more
-                await this.initializeQueries(data)
-            }
-
-            const query = this.currentQueries[this.currentQueryIndex++]
-            if (!query) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'No query available, skipping', 'warn')
-                continue
-            }
-
-            this.bot.log(this.bot.isMobile, 'SEARCH-BING',
-                `${missingPoints} Points Remaining | Query: ${query} (${searchesCompleted + 1}/${searchesToDo})`)
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING', `${missingPoints} Points Remaining | Query: ${query}`)
 
             searchCounters = await this.bingSearch(page, query)
             const newMissingPoints = this.calculatePoints(searchCounters)
 
+            // If the new point amount is the same as before
             if (newMissingPoints === missingPoints) {
                 stagnation++
             } else {
                 stagnation = 0
-                searchesCompleted++
             }
 
             missingPoints = newMissingPoints
 
             if (missingPoints === 0) break
 
-            // Break conditions for stagnation
+            // Only for mobile searches
             if (stagnation > 5 && this.bot.isMobile) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search stagnation detected on mobile, breaking', 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 5 iterations, likely bad User-Agent', 'warn')
                 break
             }
 
+            // If we didn't gain points for 10 iterations, assume it's stuck
             if (stagnation > 10) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search stagnation detected, breaking', 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Search didn\'t gain point for 10 iterations aborting searches', 'warn')
+                stagnation = 0 // allow fallback loop below
                 break
             }
         }
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING',
-            `Completed ${searchesCompleted} searches this iteration (${missingPoints} points remaining)`)
-    }
-
-    // Add these instance variables to your Search class for state management
-    private currentQueries: string[] = []
-    private currentQueryIndex: number = 0
-
-    /**
-     * Initialize or refresh the query list (replaces the inline query initialization)
-     */
-    private async initializeQueries(data: DashboardData) {
-        const geo = this.bot.config.searchSettings.useGeoLocaleQueries ?
-            (data?.userProfile?.attributes?.country || 'US') : 'US'
-
-        let initialQueries: GoogleSearch[] = []
-
-        // Try Google Trends first (preserving your existing logic)
-        try {
-            initialQueries = await this.getGoogleTrends(geo)
-        } catch {
-            // ignore - we'll fallback to local
+        // Only for mobile searches
+        if (missingPoints > 0 && this.bot.isMobile) {
+            return
         }
 
-        // Fallback to local queries
-        if (!initialQueries.length) {
-            try {
-                const local = await import('../queries.json')
-                initialQueries = (local.default || []).slice(0,
-                    Math.max(5, Math.min(this.bot.config.searchSettings.localFallbackCount || 25,
-                        (local.default || []).length))
-                ).map((x: any) => ({
-                    topic: x.queries?.[0] || x.title,
-                    related: x.queries?.slice(1) || []
-                }))
-            } catch { /* ignore */ }
-        }
+        // If we still got remaining search queries, generate extra ones (related-terms fallback)
+        if (missingPoints > 0) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING', `Search completed but we're missing ${missingPoints} points, generating extra searches`)
 
-        // If we still have no queries, try LLM to generate some initial ones
-        if (!initialQueries.length) {
-            try {
-                const llmQuery = await this.getSingleQueryFromLLM(geo)
-                if (llmQuery) {
-                    initialQueries = [{ topic: llmQuery, related: [] }]
+            let i = 0
+            let fallbackRounds = 0
+            const extraRetries = this.bot.config.searchSettings?.extraFallbackRetries ?? 1
+            while (missingPoints > 0 && fallbackRounds <= extraRetries) {
+                const query = googleSearchQueries[i++] as GoogleSearch
+                if (!query) break
+
+                // Get related search terms to the Google search queries
+                const relatedTerms = await this.getRelatedTerms(query?.topic)
+                if (relatedTerms.length > 3) {
+                    // Search for the first 2 related terms
+                    for (const term of relatedTerms.slice(1, 3)) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-BING-EXTRA', `${missingPoints} Points Remaining | Query: ${term}`)
+
+                        searchCounters = await this.bingSearch(page, term)
+                        const newMissingPoints = this.calculatePoints(searchCounters)
+
+                        // If the new point amount is the same as before
+                        if (newMissingPoints === missingPoints) {
+                            stagnation++
+                        } else {
+                            stagnation = 0
+                        }
+
+                        missingPoints = newMissingPoints
+
+                        // If we satisfied the searches
+                        if (missingPoints === 0) {
+                            break
+                        }
+
+                        // Try 5 more times, then give up for this fallback round
+                        if (stagnation > 5) {
+                            this.bot.log(this.bot.isMobile, 'SEARCH-BING-EXTRA', 'Search didn\'t gain point for 5 iterations aborting searches', 'warn')
+                            return
+                        }
+                    }
+                    fallbackRounds++
                 }
-            } catch (err) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM',
-                    'LLM failed during query initialization: ' + (err instanceof Error ? err.message : String(err)), 'warn')
             }
         }
 
-        // Shuffle & dedupe (preserving your existing logic)
-        initialQueries = this.bot.utils.shuffleArray(initialQueries)
-        const seen = new Set<string>()
-
-        this.currentQueries = initialQueries
-            .map(q => q.topic)
-            .filter((t): t is string => !!t && typeof t === 'string')
-            .filter(t => {
-                const k = t.toLowerCase()
-                if (seen.has(k)) return false
-                seen.add(k)
-                return true
-            })
-
-        this.currentQueryIndex = 0
-        this.bot.log(this.bot.isMobile, 'SEARCH', `Initialized ${this.currentQueries.length} queries for interleaving`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Completed searches')
     }
+
 
     private async bingSearch(searchPage: Page, query: string) {
         const platformControlKey = platform() === 'darwin' ? 'Meta' : 'Control'
@@ -180,19 +182,6 @@ export class Search extends Workers {
                 // Ensure we operate on the latest tab
                 searchPage = await this.bot.browser.utils.getLatestTab(searchPage)
 
-                // If page isn't on bing or search results, navigate there first
-                try {
-                    const url = new URL(searchPage.url())
-                    if (!url.hostname.includes('bing.com')) {
-                        await searchPage.goto(this.searchPageURL ? this.searchPageURL : this.bingHome, { timeout: 30000 })
-                        await this.bot.utils.wait(1500 + Math.random() * 1500)
-                    }
-                } catch {
-                    // If parsing URL fails, just go to bing
-                    await searchPage.goto(this.searchPageURL ? this.searchPageURL : this.bingHome, { timeout: 30000 }).catch(() => { })
-                    await this.bot.utils.wait(1500 + Math.random() * 1500)
-                }
-
                 // Go to top of the page
                 await searchPage.evaluate(() => { window.scrollTo(0, 0) })
                 await this.bot.utils.wait(500)
@@ -200,51 +189,15 @@ export class Search extends Workers {
                 const searchBar = '#sb_form_q'
                 // Prefer attached over visible to avoid strict visibility waits when overlays exist
                 const box = searchPage.locator(searchBar)
+                await box.waitFor({ state: 'attached', timeout: 15000 })
 
-                // Try dismissing overlays before waiting for the control
-                await this.bot.browser.utils.tryDismissAllMessages(searchPage).catch(() => {})
+                // Try dismissing overlays before interacting
+                await this.bot.browser.utils.tryDismissAllMessages(searchPage)
                 await this.bot.utils.wait(200)
 
-                // Wait for the element to be attached. If timeout, fallback to navigating directly to search URL
-                try {
-                    await box.waitFor({ state: 'attached', timeout: 15000 })
-                } catch (waitErr) {
-                    // As fallback, navigate directly to the search URL and mark as navigatedDirectly
-                    const q = encodeURIComponent(query)
-                    const url = `https://www.bing.com/search?q=${q}`
-                    await searchPage.goto(url, { timeout: 30000 }).catch(() => { })
-                    // Short settle
-                    await this.bot.utils.wait(2000)
-                    // Set flag so we don't attempt typing below
-                    // Proceed to result handling below
-                    const resultPage = await this.bot.browser.utils.getLatestTab(searchPage)
-                    this.searchPageURL = new URL(resultPage.url()).href
-
-                    await this.bot.browser.utils.reloadBadPage(resultPage).catch(() => {})
-
-                    if (this.bot.config.searchSettings.scrollRandomResults) {
-                        await this.bot.utils.wait(2000)
-                        await this.randomScroll(resultPage)
-                    }
-
-                    if (this.bot.config.searchSettings.clickRandomResults) {
-                        await this.bot.utils.wait(2000)
-                        await this.clickRandomLink(resultPage)
-                    }
-
-                    // Delay between searches (configurable)
-                    const minDelay = this.bot.utils.stringToMs(this.bot.config.searchSettings.searchDelay.min)
-                    const maxDelay = this.bot.utils.stringToMs(this.bot.config.searchSettings.searchDelay.max)
-                    const adaptivePad = Math.min(4000, Math.max(0, Math.floor(Math.random() * 800)))
-                    await this.bot.utils.wait(Math.floor(this.bot.utils.randomNumber(minDelay, maxDelay)) + adaptivePad)
-
-                    return await this.bot.browser.func.getSearchPoints()
-                }
-
-                // If we reached here, the search box exists. Try focusing and typing.
-                // Try focusing and filling instead of clicking (more reliable on mobile)
                 let navigatedDirectly = false
                 try {
+                    // Try focusing and filling instead of clicking (more reliable on mobile)
                     await box.focus({ timeout: 2000 }).catch(() => { /* ignore focus errors */ })
                     await box.fill('')
                     await this.bot.utils.wait(200)
@@ -270,7 +223,7 @@ export class Search extends Workers {
                 const resultPage = navigatedDirectly ? searchPage : await this.bot.browser.utils.getLatestTab(searchPage)
                 this.searchPageURL = new URL(resultPage.url()).href // Set the results page
 
-                await this.bot.browser.utils.reloadBadPage(resultPage).catch(() => {})
+                await this.bot.browser.utils.reloadBadPage(resultPage)
 
                 if (this.bot.config.searchSettings.scrollRandomResults) {
                     await this.bot.utils.wait(2000)
@@ -314,152 +267,240 @@ export class Search extends Workers {
         return await this.bot.browser.func.getSearchPoints()
     }
 
-    // === SINGLE-QUERY LLM (OpenRouter via openai client) ===
-    private async getSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
-        const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
-        const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
-        const apiKey = envKey || cfgKey;
-        if (!apiKey) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key not configured', 'error')
-            throw new Error('OpenRouter API key not configured');
+    /**
+     * Primary entrypoint to obtain queries.
+     * Behavior:
+     *  - If config.searchSettings.llmMode === 'per-search', we will NOT batch; we will call LLM per search in generateSingleQueryFromLLM during initialization (so list still exists).
+     *  - Default mode is 'batch' — we ask LLM for a JSON array of queries (saves API calls).
+     *  - On failure of LLM batch we attempt single-per-search generation (if configured), otherwise Google Trends fallback.
+     */
+    private async getSearchQueries(geoLocale: string = 'US', desiredCount = 25): Promise<GoogleSearch[]> {
+        const mode = (this.bot.config.searchSettings?.llmMode as 'batch' | 'per-search' | undefined) || 'batch'
+        const useLLMFirst = this.bot.config.searchSettings?.preferLLM ?? true
+
+        if (!useLLMFirst) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM disabled by config, using Google Trends')
+            return this.getGoogleTrends(geoLocale)
         }
 
-        const defaultHeaders: Record<string, string> = {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-        };
-        if (this.bot.config?.openRouter?.referer) {
-            defaultHeaders['HTTP-Referer'] = this.bot.config.openRouter.referer;
-            defaultHeaders['Referer'] = this.bot.config.openRouter.referer;
-        }
-        if (this.bot.config?.openRouter?.title) {
-            defaultHeaders['X-Title'] = this.bot.config.openRouter.title;
-        }
-
-        const openRouterClient = axios.create({
-            baseURL: 'https://openrouter.ai/api/v1',
-            headers: defaultHeaders,
-            proxy: false,
-            timeout: 30_000,
-        });
-
-        try {
-            const payload = {
-                model: 'meta-llama/llama-3.3-70b-instruct:free',
-                messages: [
-                    { role: 'system', content: `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.` },
-                    { role: 'user', content: `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.` }
-                ],
-                max_tokens: 60,
-                temperature: 0.7
-            };
-
-            const resp = await openRouterClient.post('/chat/completions', payload);
-            const completion = resp?.data;
-            const rawContent = completion?.choices?.[0]?.message?.content ?? completion?.choices?.[0]?.text ?? null;
-
-            if (!rawContent) {
-                const serialized = JSON.stringify(completion).slice(0, 2000);
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `No content found in completion. Preview: ${serialized}`, 'error');
-                throw new Error('No content returned from OpenRouter (completion empty)');
-            }
-
-            const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
-            const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
-            const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim();
-            const final = String(candidate).replace(/(^"|"$)/g, '').trim();
-
-            if (!final || final.length < 2) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM returned an invalid/too-short query: "${final}"`, 'warn');
-                return null;
-            }
-            if (final.length > 200) return final.slice(0, 200);
-            return final;
-
-        } catch (err: any) {
-            const message = err?.message || JSON.stringify(err);
-            if (err?.response?.data) {
+        if (mode === 'per-search') {
+            // per-search mode: generate N single queries by calling LLM N times
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Using LLM per-search generation (per-search mode)')
+            const queries: GoogleSearch[] = []
+            for (let i = 0; i < desiredCount; i++) {
                 try {
-                    const body = err.response.data;
-                    if (body?.error) {
-                        const emsg = body.error?.message ?? JSON.stringify(body.error);
-                        const ecode = body.error?.code ?? err?.response?.status;
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter returned error (${ecode}): ${emsg}`, 'error');
-                        throw new Error(`OpenRouter error ${ecode}: ${emsg}`);
-                    }
-                } catch (parseErr) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Error parsing OpenRouter error body: ${parseErr}`, 'warn');
+                    const q = await this.generateSingleQueryFromLLM(geoLocale)
+                    if (q) queries.push({ topic: q, related: [] })
+                } catch (err) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Per-search LLM generation failed at iteration ${i}: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                    // try continue — if many fails, we'll fallback to Trends after loop
                 }
             }
+            if (queries.length) return queries
+            // fall through to Trends
+        } else {
+            // batch mode: request a JSON array of queries in one request (preferred)
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Attempting LLM batch generation for ${desiredCount} queries`)
+            try {
+                const batch = await this.generateQueriesWithLLMBatch(geoLocale, desiredCount)
+                if (Array.isArray(batch) && batch.length) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch returned ${batch.length} queries`)
+                    return batch
+                } else {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM batch returned empty/invalid result, will fallback', 'warn')
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch generation failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                // If batch fails and mode is batch, attempt per-search fallback ONLY if allowed by config
+                if (this.bot.config.searchSettings?.enablePerSearchFallback) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting per-search LLM fallback after batch failure')
+                    const queries: GoogleSearch[] = []
+                    for (let i = 0; i < desiredCount; i++) {
+                        try {
+                            const q = await this.generateSingleQueryFromLLM(geoLocale)
+                            if (q) queries.push({ topic: q, related: [] })
+                        } catch { /* ignore iteration errors */ }
+                    }
+                    if (queries.length) return queries
+                }
+            }
+        }
 
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter request failed: ${message}`, 'error');
-            throw err;
+        // Last attempt: Google Trends
+        try {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Falling back to Google Trends')
+            return await this.getGoogleTrends(geoLocale)
+        } catch (e) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Google Trends fallback failed: ' + (e instanceof Error ? e.message : String(e)), 'error')
+            return []
         }
     }
 
+    /**
+     * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
+     * Returns normalized GoogleSearch[]
+     */
+    private async generateQueriesWithLLMBatch(geoLocale: string, desiredCount = 25): Promise<GoogleSearch[]> {
+        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        if (!apiKey) throw new Error('OpenRouter API key not configured')
+
+        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
+- "topic": a short search query a typical university student might type.
+- "related": an array of 0..6 related searches (short strings).
+
+Return up to ${desiredCount} diverse items if possible. Avoid politically sensitive & adult topics. Output must be valid JSON only (no explanatory text). Use ${geoLocale.toUpperCase()} locale where relevant.`
+
+        const userPrompt = `Generate up to ${desiredCount} short search queries a typical undergraduate would use (games, course topics, campus services, cheap food, debugging help). Output only valid JSON array.`
+
+        const body = {
+            model: 'meta-llama/llama-3.3-70b-instruct:free',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            max_tokens: 1200,
+            temperature: 0.7
+        }
+
+        const requestConfig: AxiosRequestConfig = {
+            url: 'https://openrouter.ai/api/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            data: body,
+            timeout: 20000,
+            proxy: false // ensure no proxy
+        }
+
+        // Use axios.request to guarantee proxy:false honored independently of bot axios instance
+        const resp = await axios.request(requestConfig as any)
+        let content: string | undefined
+
+        const choices = resp?.data?.choices
+        if (Array.isArray(choices) && choices.length) {
+            content = choices[0]?.message?.content || choices[0]?.text
+        } else if (typeof resp?.data === 'string') {
+            content = resp.data
+        } else if (resp?.data?.result?.content) {
+            content = resp.data.result.content
+        }
+
+        if (!content) throw new Error('No content from OpenRouter')
+
+        // Attempt to parse JSON (strip code fences if present)
+        let parsed: any
+        try {
+            parsed = JSON.parse(content)
+        } catch (e) {
+            const trimmed = String(content).replace(/```json|```/g, '').trim()
+            parsed = JSON.parse(trimmed)
+        }
+
+        if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+        const normalized: GoogleSearch[] = parsed.map((item: any) => {
+            const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
+            const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
+            return { topic, related }
+        }).filter(x => x.topic && x.topic.length > 1)
+
+        return normalized
+    }
+
+    /**
+     * Single-query LLM generation (used in per-search mode or per-search fallback).
+     * Returns single string or null.
+     */
+    private async generateSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
+        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        if (!apiKey) throw new Error('OpenRouter API key not configured')
+
+        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string.`
+
+        const userPrompt = `Provide a single concise search query a university undergrad might use.`
+
+        const body = {
+            model: 'meta-llama/llama-3.3-70b-instruct:free',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            max_tokens: 60,
+            temperature: 0.7
+        }
+
+        const requestConfig: AxiosRequestConfig = {
+            url: 'https://openrouter.ai/api/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            data: body,
+            timeout: 15000,
+            proxy: false
+        }
+
+        const resp = await axios.request(requestConfig as any)
+        const choices = resp?.data?.choices
+        let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
+        if (!rawContent) return null
+
+        const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
+        const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
+        const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
+        const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+
+        if (!final || final.length < 2) return null
+        return final.length > 200 ? final.slice(0, 200) : final
+    }
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
         const queryTerms: GoogleSearch[] = []
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries | GeoLocale: ${geoLocale}`);
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
 
-        // Human-like delay before fetching trends (increased for safety)
-        await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000));
+        // Human-like delay before fetching trends (0.5-1.5 seconds)
+        await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
 
         try {
             const request: AxiosRequestConfig = {
                 url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                    'Accept': '*/*',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': 'https://trends.google.com/trends/',
-                    'Origin': 'https://trends.google.com'
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
                 },
                 data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
                 responseType: 'text',
                 timeout: (this.bot.config?.googleTrends?.timeoutMs) || 20000,
-                // IMPORTANT: disable proxy for Trends requests
                 proxy: false
-            };
+            }
 
-            // Try to improve DNS but don't rely on proxies
+            // Optional: set custom https agent to prefer IPv4 (best-effort)
             try {
                 // eslint-disable-next-line @typescript-eslint/no-var-requires
-                const dns = require('dns');
+                const dns = require('dns')
                 const lookup = (hostname: string, options: any, callback: Function) => {
                     dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
-                        if (err) {
-                            dns.lookup(hostname, (err2: any, address2: any, family2: any) => {
-                                callback(err2, address2, family2);
-                            });
-                        } else {
-                            callback(err, address, family);
-                        }
-                    });
-                };
+                        if (err) dns.lookup(hostname, (err2: any, address2: any, family2: any) => callback(err2, address2, family2))
+                        else callback(err, address, family)
+                    })
+                }
                 request.httpsAgent = new (require('https').Agent)({
                     keepAlive: true,
                     lookup,
                     rejectUnauthorized: true
-                });
+                })
             } catch (e) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'DNS agent creation failed, using default: ' + (e instanceof Error ? e.message : String(e)), 'warn');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'DNS agent creation failed, using default: ' + (e instanceof Error ? e.message : String(e)), 'warn')
             }
 
-            // Make the request with explicit proxy disabled
             const response = await axios.request(request as any)
 
-            // Handle different response formats
             let rawText: string
-            if (typeof response.data === 'string') {
-                rawText = response.data
-            } else if (Buffer.isBuffer(response.data)) {
-                rawText = response.data.toString('utf8')
-            } else {
-                rawText = JSON.stringify(response.data)
-            }
+            if (typeof response.data === 'string') rawText = response.data
+            else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8')
+            else rawText = JSON.stringify(response.data)
 
             if (!rawText || rawText.length < 10) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Empty or invalid response from Google Trends', 'warn')
@@ -467,10 +508,8 @@ export class Search extends Workers {
             }
 
             const trendsData = this.extractJsonFromResponse(rawText)
-
             if (!trendsData || !Array.isArray(trendsData)) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse valid trends data from response', 'warn')
-
                 if (geoLocale.toUpperCase() !== 'US') {
                     this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale', 'warn')
                     return this.getGoogleTrends('US')
@@ -478,10 +517,7 @@ export class Search extends Workers {
                 return []
             }
 
-            const mappedTrendsData = trendsData.map((query: any) => [
-                query[0],
-                query[9] ? query[9].slice(1) : []
-            ])
+            const mappedTrendsData = trendsData.map((q: any) => [q[0], q[9] ? q[9].slice(1) : []])
 
             if (mappedTrendsData.length < 50 && geoLocale.toUpperCase() !== 'US') {
                 this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient trends for ${geoLocale} (${mappedTrendsData.length}), falling back to US`, 'warn')
@@ -492,7 +528,7 @@ export class Search extends Workers {
                 if (topic && typeof topic === 'string' && topic.trim().length > 0) {
                     queryTerms.push({
                         topic: topic.trim(),
-                        related: Array.isArray(relatedQueries) ? relatedQueries.filter(q => typeof q === 'string') : []
+                        related: Array.isArray(relatedQueries) ? relatedQueries.filter((r: any) => typeof r === 'string') : []
                     })
                 }
             }
@@ -503,20 +539,13 @@ export class Search extends Workers {
             const errorMessage = error instanceof Error ? error.message : String(error)
             this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Error fetching trends: ' + errorMessage, 'error')
 
-            if (errorMessage.includes('IP address') || errorMessage.includes('Invalid IP')) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Google is blocking requests due to IP issues. Consider:', 'error')
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Using a VPN or proxy rotation', 'error')
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Increasing delays between requests', 'error')
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Reducing request frequency', 'error')
-            }
-
             if (geoLocale.toUpperCase() !== 'US') {
                 this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale after error', 'warn')
                 return this.getGoogleTrends('US')
             }
         }
 
-        return queryTerms
+        return []
     }
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
@@ -531,8 +560,30 @@ export class Search extends Workers {
                 }
             }
         }
-
         return null
+    }
+
+    private async getRelatedTerms(term: string): Promise<string[]> {
+        try {
+            // Human-like delay before fetching related terms (0.5-1.5s)
+            await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
+
+            const request = {
+                url: `https://api.bing.com/osjson.aspx?query=${encodeURIComponent(term)}`,
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                proxy: false
+            }
+
+            const response = await axios.request(request as any)
+            return response.data?.[1] as string[] || []
+        } catch (error) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-BING-RELATED', 'An error occurred:' + (error instanceof Error ? error.message : String(error)), 'error')
+        }
+
+        return []
     }
 
     private async randomScroll(page: Page) {
@@ -552,7 +603,7 @@ export class Search extends Workers {
         }
     }
 
-    // Restored the original working clickRandomLink implementation
+    // Restored working clickRandomLink implementation
     private async clickRandomLink(page: Page) {
         try {
             // Small wait+click to open a result if present
@@ -614,7 +665,6 @@ export class Search extends Workers {
         } catch (error) {
             this.bot.log(this.bot.isMobile, 'SEARCH-CLOSE-TABS', 'An error occurred:' + (error instanceof Error ? error.message : String(error)), 'error')
         }
-
     }
 
     private calculatePoints(counters: Counters) {
