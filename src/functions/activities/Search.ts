@@ -341,7 +341,8 @@ export class Search extends Workers {
      * Returns normalized GoogleSearch[]
      */
     private async generateQueriesWithLLMBatch(geoLocale: string, desiredCount = 25): Promise<GoogleSearch[]> {
-        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        // const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        const apiKey = "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"
         if (!apiKey) throw new Error('OpenRouter API key not configured')
 
         const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
