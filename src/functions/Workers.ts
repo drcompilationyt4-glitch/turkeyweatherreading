@@ -20,43 +20,81 @@ interface BaseActivity {
 
 export class Workers {
     public bot: MicrosoftRewardsBot
-    private jobState: JobState
+    private jobState: JobState | null
 
     constructor(bot: MicrosoftRewardsBot) {
+        if (!bot) throw new Error('Workers requires a bot instance')
+
         this.bot = bot
-        this.jobState = new JobState(this.bot.config)
+
+        // Defensive: ensure config exists before passing to JobState
+        const cfg = (this.bot && (this.bot as any).config) ? (this.bot as any).config : { sessionPath: '.' }
+        try {
+            this.jobState = new JobState(cfg)
+        } catch (err) {
+            // If JobState fails to initialize for any reason, keep going but null it out
+            this.jobState = null
+            this.bot?.log?.(this.bot?.isMobile, 'WORKERS', `JobState initialization failed: ${err instanceof Error ? err.message : err}`, 'warn')
+        }
+
+        // Bind public methods so they keep `this` when used as callbacks
+        this.doDailySet = this.doDailySet.bind(this)
+        this.doPunchCard = this.doPunchCard.bind(this)
+        this.doMorePromotions = this.doMorePromotions.bind(this)
+        this.solveActivities = this.solveActivities.bind(this)
     }
 
     /* =========================
        Utility helpers
        ========================= */
 
-    /**
-     * Return candidate selectors for an activity.
-     * Tries:
-     *  - [data-bi-id^="offerId"] .pointLink:not(.contentContainer .pointLink)
-     *  - [data-bi-id*="namePart"] .pointLink...
-     *  - any .pointLink whose ancestor data-bi-id looks like daily/gamification/global
-     *  - .pointLink with nearby text/title matching activity.title
-     */
+    private isJobStateEnabled(): boolean {
+        try {
+            return !!(this.bot && this.bot.config && this.bot.config.jobState && this.bot.config.jobState.enabled !== false)
+        } catch {
+            return false
+        }
+    }
+
+    private jobStateIsDone(email: string, day: string, offerId?: string): boolean {
+        if (!offerId) return false
+        if (!this.jobState || typeof this.jobState.isDone !== 'function') return false
+        try {
+            return this.jobState.isDone(email, day, offerId)
+        } catch {
+            return false
+        }
+    }
+
+    private jobStateMarkDone(email: string, day: string, offerId?: string) {
+        if (!offerId) return
+        if (!this.jobState || typeof this.jobState.markDone !== 'function') return
+        try {
+            this.jobState.markDone(email, day, offerId)
+        } catch (e) {
+            this.bot?.log?.(this.bot?.isMobile, 'WORKERS', `jobState.markDone failed: ${e instanceof Error ? e.message : e}`, 'warn')
+        }
+    }
+
+    /* =========================
+       Selector builders, overlays, and human utilities
+       ========================= */
+
     private async buildSelectorsForActivity(page: Page, activity: BaseActivity, punchCard?: PunchCard): Promise<string[]> {
         const candidates: string[] = []
 
-        // Preferred pattern from logs and page: data-bi-id^="..."
         if (activity.offerId) {
             candidates.push(`[data-bi-id^="${activity.offerId}"] .pointLink:not(.contentContainer .pointLink)`)
             const esc = (activity.offerId || '').replace(/"/g, '\\"')
             candidates.push(`[data-bi-id^="${esc}"] .pointLink:not(.contentContainer .pointLink)`)
         }
 
-        // If activity.name present, try using it
         if (activity.name) {
             const nameSafe = (activity.name || '').replace(/"/g, '\\"')
             candidates.push(`[data-bi-id^="${nameSafe}"] .pointLink:not(.contentContainer .pointLink)`)
             candidates.push(`[data-bi-id*="${nameSafe}"] .pointLink:not(.contentContainer .pointLink)`)
         }
 
-        // Heuristic: use any .pointLink elements whose ancestor data-bi-id contains daily/gamification/global
         try {
             const heuristic = await page.evaluate(() => {
                 const out: string[] = []
@@ -89,19 +127,12 @@ export class Workers {
             // ignore page-eval errors
         }
 
-        // Fallback: generic .pointLink elements (limited)
         candidates.push('.pointLink:not(.contentContainer .pointLink)')
         candidates.push('.pointLink')
 
-        // final unique list
         return Array.from(new Set(candidates))
     }
 
-    /**
-     * Hide fixed/overlay elements overlapping a selector (best-effort).
-     * Marks hidden elements with data-qa-hidden-temp so we can restore them.
-     * Returns number of elements hidden.
-     */
     protected async hideOverlappingOverlays(page: Page, selector: string): Promise<number> {
         try {
             return await page.evaluate((sel) => {
@@ -137,10 +168,6 @@ export class Workers {
         }
     }
 
-    /**
-     * Restore overlays hidden by hideOverlappingOverlays.
-     * Returns number restored.
-     */
     protected async restoreHiddenOverlays(page: Page): Promise<number> {
         try {
             return await page.evaluate(() => {
@@ -158,10 +185,6 @@ export class Workers {
         }
     }
 
-    /**
-     * Simulate human-like mouse movement to a target element.
-     * Uses bezier curves for natural paths, with randomness in speed and path.
-     */
     private async humanMouseMove(page: Page, selector: string): Promise<void> {
         try {
             const handle = await page.$(selector)
@@ -199,9 +222,6 @@ export class Workers {
         }
     }
 
-    /**
-     * Simulate human-like hover over an element with random duration and small movements.
-     */
     private async humanHover(page: Page, selector: string): Promise<void> {
         await this.humanMouseMove(page, selector)
         const hoverTime = 200 + Math.random() * 800
@@ -218,9 +238,6 @@ export class Workers {
         }
     }
 
-    /**
-     * Simulate human-like scrolling with variable speed, pauses, and overscroll.
-     */
     private async humanScroll(page: Page): Promise<void> {
         try {
             const viewportHeight = (page.viewportSize()?.height || 720) / 2
@@ -237,9 +254,6 @@ export class Workers {
         } catch { /* ignore */ }
     }
 
-    /**
-     * Robust click with human-like behavior, multiple strategies, and popup/navigation detection.
-     */
     private async robustTryClickSelector(page: Page, selector: string, maxAttempts = 3, perAttemptTimeout = 10000): Promise<{ success: boolean; reason?: string; popup?: Page }> {
         const context = page.context ? page.context() : null
 
@@ -377,17 +391,14 @@ export class Workers {
        Public flows (DailySet / PunchCard / MorePromotions)
        ========================= */
 
-    /**
-     * Updated doDailySet with interleaving support
-     */
     async doDailySet(page: Page, data: DashboardData, maxActivities?: number) {
         const today = this.bot.utils.getFormattedDate()
         const todayData = data.dailySetPromotions[today] ?? []
 
         const activitiesUncompleted = (todayData?.filter(x => !x.complete && x.pointProgressMax > 0) ?? []).filter(x => {
-            if (this.bot.config.jobState?.enabled === false) return true
+            if (!this.isJobStateEnabled()) return true
             const email = this.bot.currentAccountEmail || 'unknown'
-            return !this.jobState.isDone(email, today, x.offerId)
+            return !this.jobStateIsDone(email, today, x.offerId)
         })
 
         if (!activitiesUncompleted.length) {
@@ -398,18 +409,16 @@ export class Workers {
         this.bot.log(this.bot.isMobile, 'DAILY-SET',
             `Started solving "Daily Set" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
 
-        // Use chunking if maxActivities is specified
         const activitiesToProcess = maxActivities ?
             activitiesUncompleted.slice(0, maxActivities) :
             activitiesUncompleted
 
         await this.solveActivities(page, activitiesToProcess, undefined, maxActivities)
 
-        if (this.bot.config.jobState?.enabled !== false && !maxActivities) {
-            // Only mark as done if we're completing all activities (not chunking)
+        if (this.isJobStateEnabled() && !maxActivities) {
             const email = this.bot.currentAccountEmail || 'unknown'
             for (const a of activitiesUncompleted) {
-                this.jobState.markDone(email, today, a.offerId)
+                this.jobStateMarkDone(email, today, a.offerId)
             }
         }
 
@@ -423,7 +432,6 @@ export class Workers {
             this.bot.log(this.bot.isMobile, 'DAILY-SET', 'All "Daily Set" items have been completed')
         }
 
-        // Bundle with search only when completing all activities
         if (!this.bot.isMobile && this.bot.config.workers?.bundleDailySetWithSearch &&
             this.bot.config.workers?.doDesktopSearch && !maxActivities) {
             try {
@@ -435,9 +443,6 @@ export class Workers {
         }
     }
 
-    /**
-     * Updated doPunchCard with interleaving support
-     */
     async doPunchCard(page: Page, data: DashboardData, maxActivities?: number) {
         const punchCardsUncompleted = data.punchCards?.filter(x => x.parentPromotion && !x.parentPromotion.complete) ?? []
 
@@ -465,7 +470,6 @@ export class Workers {
             await page.goto(punchCard.parentPromotion.destinationUrl, { referer: this.bot.config.baseURL, timeout: 120000 + Math.random() * 20000 })
             await page.waitForLoadState('networkidle', { timeout: 5000 + Math.random() * 3000 }).catch(() => {})
 
-            // Process all child activities for this punch card (they're usually small sets)
             await this.solveActivities(page, activitiesUncompleted, punchCard)
 
             page = await this.bot.browser.utils.getLatestTab(page)
@@ -481,7 +485,6 @@ export class Workers {
                 `Completed items for punchcard: "${punchCard.parentPromotion.title}"`)
             totalProcessed++
 
-            // If we're chunking and have reached our limit, break early
             if (maxActivities && totalProcessed >= maxActivities) {
                 break
             }
@@ -495,11 +498,8 @@ export class Workers {
         }
     }
 
-    /**
-     * Updated doMorePromotions with interleaving support
-     */
     async doMorePromotions(page: Page, data: DashboardData, maxActivities?: number) {
-        const morePromotions = data.morePromotions
+        const morePromotions = data.morePromotions ?? []
 
         if (data.promotionalItem) {
             morePromotions.push(data.promotionalItem as unknown as MorePromotion)
@@ -517,7 +517,6 @@ export class Workers {
         this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS',
             `Started solving "More Promotions" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
 
-        // Use chunking if maxActivities is specified
         const activitiesToProcess = maxActivities ?
             activitiesUncompleted.slice(0, maxActivities) :
             activitiesUncompleted
@@ -535,9 +534,6 @@ export class Workers {
         }
     }
 
-    /**
-     * UPDATED: solveActivities with chunking support for interleaving
-     */
     public async solveActivities(activityPage: Page, activities: BaseActivity[], punchCard?: PunchCard, maxActivities?: number) {
         const activityInitial = activityPage.url();
 
