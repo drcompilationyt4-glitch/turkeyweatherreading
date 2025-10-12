@@ -1,7 +1,5 @@
-// src/workers/Search.ts
 import { Page } from 'rebrowser-playwright'
 import { platform } from 'os'
-// import OpenAI from 'openai'
 import axios from 'axios';
 
 import { Workers } from '../Workers'
@@ -56,7 +54,7 @@ export class Search extends Workers {
             `Doing ${searchesToDo} searches this iteration (${missingPoints} points remaining, ${maxNeededSearches} total needed)`)
 
         let attempts = 0
-        const maxSearchAttempts = Math.min(searchesToDo * 2, this.bot.config.searchSettings.maxSearchAttempts || 100)
+        const maxSearchAttempts = Math.min(searchesToDo * 3, this.bot.config.searchSettings.maxSearchAttempts || 100)
         let stagnation = 0
         let searchesCompleted = 0
 
@@ -108,7 +106,7 @@ export class Search extends Workers {
             `Completed ${searchesCompleted} searches this iteration (${missingPoints} points remaining)`)
     }
 
-// Add these instance variables to your Search class for state management
+    // Add these instance variables to your Search class for state management
     private currentQueries: string[] = []
     private currentQueryIndex: number = 0
 
@@ -182,6 +180,19 @@ export class Search extends Workers {
                 // Ensure we operate on the latest tab
                 searchPage = await this.bot.browser.utils.getLatestTab(searchPage)
 
+                // If page isn't on bing or search results, navigate there first
+                try {
+                    const url = new URL(searchPage.url())
+                    if (!url.hostname.includes('bing.com')) {
+                        await searchPage.goto(this.searchPageURL ? this.searchPageURL : this.bingHome, { timeout: 30000 })
+                        await this.bot.utils.wait(1500 + Math.random() * 1500)
+                    }
+                } catch {
+                    // If parsing URL fails, just go to bing
+                    await searchPage.goto(this.searchPageURL ? this.searchPageURL : this.bingHome, { timeout: 30000 }).catch(() => { })
+                    await this.bot.utils.wait(1500 + Math.random() * 1500)
+                }
+
                 // Go to top of the page
                 await searchPage.evaluate(() => { window.scrollTo(0, 0) })
                 await this.bot.utils.wait(500)
@@ -189,15 +200,51 @@ export class Search extends Workers {
                 const searchBar = '#sb_form_q'
                 // Prefer attached over visible to avoid strict visibility waits when overlays exist
                 const box = searchPage.locator(searchBar)
-                await box.waitFor({ state: 'attached', timeout: 15000 })
 
-                // Try dismissing overlays before interacting
-                await this.bot.browser.utils.tryDismissAllMessages(searchPage)
+                // Try dismissing overlays before waiting for the control
+                await this.bot.browser.utils.tryDismissAllMessages(searchPage).catch(() => {})
                 await this.bot.utils.wait(200)
 
+                // Wait for the element to be attached. If timeout, fallback to navigating directly to search URL
+                try {
+                    await box.waitFor({ state: 'attached', timeout: 15000 })
+                } catch (waitErr) {
+                    // As fallback, navigate directly to the search URL and mark as navigatedDirectly
+                    const q = encodeURIComponent(query)
+                    const url = `https://www.bing.com/search?q=${q}`
+                    await searchPage.goto(url, { timeout: 30000 }).catch(() => { })
+                    // Short settle
+                    await this.bot.utils.wait(2000)
+                    // Set flag so we don't attempt typing below
+                    // Proceed to result handling below
+                    const resultPage = await this.bot.browser.utils.getLatestTab(searchPage)
+                    this.searchPageURL = new URL(resultPage.url()).href
+
+                    await this.bot.browser.utils.reloadBadPage(resultPage).catch(() => {})
+
+                    if (this.bot.config.searchSettings.scrollRandomResults) {
+                        await this.bot.utils.wait(2000)
+                        await this.randomScroll(resultPage)
+                    }
+
+                    if (this.bot.config.searchSettings.clickRandomResults) {
+                        await this.bot.utils.wait(2000)
+                        await this.clickRandomLink(resultPage)
+                    }
+
+                    // Delay between searches (configurable)
+                    const minDelay = this.bot.utils.stringToMs(this.bot.config.searchSettings.searchDelay.min)
+                    const maxDelay = this.bot.utils.stringToMs(this.bot.config.searchSettings.searchDelay.max)
+                    const adaptivePad = Math.min(4000, Math.max(0, Math.floor(Math.random() * 800)))
+                    await this.bot.utils.wait(Math.floor(this.bot.utils.randomNumber(minDelay, maxDelay)) + adaptivePad)
+
+                    return await this.bot.browser.func.getSearchPoints()
+                }
+
+                // If we reached here, the search box exists. Try focusing and typing.
+                // Try focusing and filling instead of clicking (more reliable on mobile)
                 let navigatedDirectly = false
                 try {
-                    // Try focusing and filling instead of clicking (more reliable on mobile)
                     await box.focus({ timeout: 2000 }).catch(() => { /* ignore focus errors */ })
                     await box.fill('')
                     await this.bot.utils.wait(200)
@@ -223,7 +270,7 @@ export class Search extends Workers {
                 const resultPage = navigatedDirectly ? searchPage : await this.bot.browser.utils.getLatestTab(searchPage)
                 this.searchPageURL = new URL(resultPage.url()).href // Set the results page
 
-                await this.bot.browser.utils.reloadBadPage(resultPage)
+                await this.bot.browser.utils.reloadBadPage(resultPage).catch(() => {})
 
                 if (this.bot.config.searchSettings.scrollRandomResults) {
                     await this.bot.utils.wait(2000)
@@ -268,13 +315,6 @@ export class Search extends Workers {
     }
 
     // === SINGLE-QUERY LLM (OpenRouter via openai client) ===
-    /**
-     * Ask OpenRouter (via the OpenAI-compatible client) for one short student-like search query.
-     * Returns a single short string (or null on failure).
-     */
-    // add at top of file if missing:
-
-
     private async getSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
         const envKey = process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.trim() : undefined;
         const cfgKey = this.bot.config?.openRouterApiKey ? String(this.bot.config.openRouterApiKey).trim() : undefined;
@@ -284,7 +324,6 @@ export class Search extends Workers {
             throw new Error('OpenRouter API key not configured');
         }
 
-        // Build headers (preserve your custom headers)
         const defaultHeaders: Record<string, string> = {
             'Authorization': `Bearer ${apiKey}`,
             'Content-Type': 'application/json'
@@ -297,18 +336,10 @@ export class Search extends Workers {
             defaultHeaders['X-Title'] = this.bot.config.openRouter.title;
         }
 
-        // Prepare payload
-        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.`;
-        const userPrompt = `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.`;
-
-        // Create an axios client that explicitly disables proxy usage.
-        // This ensures this request bypasses any process-level proxy env vars.
         const openRouterClient = axios.create({
             baseURL: 'https://openrouter.ai/api/v1',
             headers: defaultHeaders,
-            // Important: explicitly disable proxying for this client
             proxy: false,
-            // keep default agents (no custom http(s) agent) so Node will use direct socket
             timeout: 30_000,
         });
 
@@ -316,8 +347,8 @@ export class Search extends Workers {
             const payload = {
                 model: 'meta-llama/llama-3.3-70b-instruct:free',
                 messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt }
+                    { role: 'system', content: `You are an assistant that outputs only one short search query (plain text) that a typical undergraduate university student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if location-relevant. Avoid politics & adult content. Output MUST be only the query string and nothing else.` },
+                    { role: 'user', content: `Provide a single concise search query a university undergrad might use (examples: "econ midterm study guide", "cheap pizza near campus", "debug null pointer c++"). Output only the query text.` }
                 ],
                 max_tokens: 60,
                 temperature: 0.7
@@ -325,7 +356,6 @@ export class Search extends Workers {
 
             const resp = await openRouterClient.post('/chat/completions', payload);
             const completion = resp?.data;
-
             const rawContent = completion?.choices?.[0]?.message?.content ?? completion?.choices?.[0]?.text ?? null;
 
             if (!rawContent) {
@@ -334,7 +364,6 @@ export class Search extends Workers {
                 throw new Error('No content returned from OpenRouter (completion empty)');
             }
 
-            // Clean up fences and whitespace, then return single-line query
             const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim();
             const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
             const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim();
@@ -349,8 +378,6 @@ export class Search extends Workers {
 
         } catch (err: any) {
             const message = err?.message || JSON.stringify(err);
-
-            // Try to normalize OpenRouter-style structured error body
             if (err?.response?.data) {
                 try {
                     const body = err.response.data;
@@ -372,14 +399,13 @@ export class Search extends Workers {
 
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        const queryTerms: GoogleSearch[] = [];
+        const queryTerms: GoogleSearch[] = []
         this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries | GeoLocale: ${geoLocale}`);
 
         // Human-like delay before fetching trends (increased for safety)
         await this.bot.utils.wait(this.bot.utils.randomNumber(1000, 3000));
 
         try {
-            // Enhanced request configuration
             const request: AxiosRequestConfig = {
                 url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
                 method: 'POST',
@@ -394,18 +420,17 @@ export class Search extends Workers {
                 data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
                 responseType: 'text',
                 timeout: (this.bot.config?.googleTrends?.timeoutMs) || 20000,
-                // Important: Explicitly handle proxy configuration
-                proxy: this.bot.config?.proxy?.proxyBingTerms || false
+                // IMPORTANT: disable proxy for Trends requests
+                proxy: false
             };
 
-            // Improved DNS handling with better error management
+            // Try to improve DNS but don't rely on proxies
             try {
                 // eslint-disable-next-line @typescript-eslint/no-var-requires
                 const dns = require('dns');
                 const lookup = (hostname: string, options: any, callback: Function) => {
                     dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
                         if (err) {
-                            // Fallback to default lookup if IPv4 fails
                             dns.lookup(hostname, (err2: any, address2: any, family2: any) => {
                                 callback(err2, address2, family2);
                             });
@@ -417,89 +442,81 @@ export class Search extends Workers {
                 request.httpsAgent = new (require('https').Agent)({
                     keepAlive: true,
                     lookup,
-                    // Additional security options
                     rejectUnauthorized: true
                 });
             } catch (e) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'DNS agent creation failed, using default: ' + (e instanceof Error ? e.message : String(e)), 'warn');
             }
 
-            // Make the request with enhanced error handling
-            const response = await this.bot.axios.request(request as any);
+            // Make the request with explicit proxy disabled
+            const response = await axios.request(request as any)
 
             // Handle different response formats
-            let rawText: string;
+            let rawText: string
             if (typeof response.data === 'string') {
-                rawText = response.data;
+                rawText = response.data
             } else if (Buffer.isBuffer(response.data)) {
-                rawText = response.data.toString('utf8');
+                rawText = response.data.toString('utf8')
             } else {
-                rawText = JSON.stringify(response.data);
+                rawText = JSON.stringify(response.data)
             }
 
-            // Check for empty or invalid responses
             if (!rawText || rawText.length < 10) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Empty or invalid response from Google Trends', 'warn');
-                return [];
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Empty or invalid response from Google Trends', 'warn')
+                return []
             }
 
-            const trendsData = this.extractJsonFromResponse(rawText);
+            const trendsData = this.extractJsonFromResponse(rawText)
 
             if (!trendsData || !Array.isArray(trendsData)) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse valid trends data from response', 'warn');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse valid trends data from response', 'warn')
 
-                // Fallback to US locale if original wasn't US
                 if (geoLocale.toUpperCase() !== 'US') {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale', 'warn');
-                    return this.getGoogleTrends('US');
+                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale', 'warn')
+                    return this.getGoogleTrends('US')
                 }
-                return [];
+                return []
             }
 
-            // Process the trends data
             const mappedTrendsData = trendsData.map((query: any) => [
                 query[0],
                 query[9] ? query[9].slice(1) : []
-            ]);
+            ])
 
-            // More generous fallback logic
             if (mappedTrendsData.length < 50 && geoLocale.toUpperCase() !== 'US') {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient trends for ${geoLocale} (${mappedTrendsData.length}), falling back to US`, 'warn');
-                return this.getGoogleTrends('US');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient trends for ${geoLocale} (${mappedTrendsData.length}), falling back to US`, 'warn')
+                return this.getGoogleTrends('US')
             }
 
-            // Build query terms with validation
             for (const [topic, relatedQueries] of mappedTrendsData) {
                 if (topic && typeof topic === 'string' && topic.trim().length > 0) {
                     queryTerms.push({
                         topic: topic.trim(),
                         related: Array.isArray(relatedQueries) ? relatedQueries.filter(q => typeof q === 'string') : []
-                    });
+                    })
                 }
             }
 
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Successfully fetched ${queryTerms.length} search queries`);
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Successfully fetched ${queryTerms.length} search queries`)
 
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Error fetching trends: ' + errorMessage, 'error');
+            const errorMessage = error instanceof Error ? error.message : String(error)
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Error fetching trends: ' + errorMessage, 'error')
 
-            // Specific handling for IP-related errors
             if (errorMessage.includes('IP address') || errorMessage.includes('Invalid IP')) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Google is blocking requests due to IP issues. Consider:', 'error');
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Using a VPN or proxy rotation:cite[1]', 'error');
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Increasing delays between requests:cite[4]', 'error');
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Reducing request frequency:cite[1]', 'error');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Google is blocking requests due to IP issues. Consider:', 'error')
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Using a VPN or proxy rotation', 'error')
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Increasing delays between requests', 'error')
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', '- Reducing request frequency', 'error')
             }
 
-            // Fallback to US locale on any error if original wasn't US
             if (geoLocale.toUpperCase() !== 'US') {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale after error', 'warn');
-                return this.getGoogleTrends('US');
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale after error', 'warn')
+                return this.getGoogleTrends('US')
             }
         }
 
-        return queryTerms;
+        return queryTerms
     }
 
     private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
@@ -508,7 +525,6 @@ export class Search extends Workers {
             const trimmed = line.trim()
             if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
                 try {
-                    // some batchexecute responses are nested JSON; this was the earlier heuristic
                     return JSON.parse(JSON.parse(trimmed)[0][2])[1]
                 } catch {
                     continue
@@ -536,6 +552,7 @@ export class Search extends Workers {
         }
     }
 
+    // Restored the original working clickRandomLink implementation
     private async clickRandomLink(page: Page) {
         try {
             // Small wait+click to open a result if present
