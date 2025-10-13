@@ -1,11 +1,19 @@
 import playwright, { BrowserContext } from 'rebrowser-playwright'
 import { newInjectedContext } from 'fingerprint-injector'
 import { FingerprintGenerator } from 'fingerprint-generator'
+
 import { MicrosoftRewardsBot } from '../index'
 import { loadSessionData, saveFingerprintData } from '../util/Load'
 import { updateFingerprintUserAgent } from '../util/UserAgent'
 import { AccountProxy } from '../interface/Account'
 
+/**
+ * Robust Browser context creator with:
+ *  - retrying browser launch
+ *  - robust fingerprint generation + relaxed fallback
+ *  - retries for fingerprint injection (newInjectedContext)
+ *  - graceful fallback to playwright.newContext when injection fails
+ */
 class Browser {
     private bot: MicrosoftRewardsBot
 
@@ -13,25 +21,21 @@ class Browser {
         this.bot = bot
     }
 
-    /**
-     * Create a Playwright BrowserContext for the given account/email.
-     * Tries to use fingerprint-injector/newInjectedContext. On known errors
-     * (headers-generation, etc.) will attempt relaxed fingerprint generation
-     * and finally fall back to browser.newContext(...) so the worker can continue.
-     */
     async createBrowser(proxy: AccountProxy, email: string): Promise<BrowserContext> {
+        // Optional automatic browser installation (set AUTO_INSTALL_BROWSERS=1)
         if (process.env.AUTO_INSTALL_BROWSERS === '1') {
             try {
                 const { execSync } = await import('child_process')
                 execSync('npx playwright install chromium', { stdio: 'ignore' })
-            } catch { /* ignore */ }
+            } catch { /* silent */ }
         }
 
         const cfgAny = this.bot.config as unknown as Record<string, unknown>
 
-        try { await this.bot.utils.wait(this.bot.utils.randomNumber(200, 800)) } catch { /* ignore */ }
+        // small random wait to reduce thundering herd
+        try { await this.bot.utils.wait(this.bot.utils.randomNumber(100, 600)) } catch { }
 
-        // Launch with retries
+        // --- Launch browser with retries ---
         const maxLaunchAttempts = 3
         let launched: import('rebrowser-playwright').Browser | undefined
         let launchErr: unknown
@@ -93,8 +97,7 @@ class Browser {
         const browser = launched as import('rebrowser-playwright').Browser
 
         // Normalize saveFingerprint config
-        const rawFp = (cfgAny['saveFingerprint']
-            ?? (cfgAny['fingerprinting'] as Record<string, unknown> | undefined)?.['saveFingerprint']) as unknown
+        const rawFp = (cfgAny['saveFingerprint'] ?? (cfgAny['fingerprinting'] as Record<string, unknown> | undefined)?.['saveFingerprint']) as unknown
 
         const saveFingerprintForLoad: { mobile: boolean; desktop: boolean } =
             typeof rawFp === 'boolean'
@@ -114,12 +117,36 @@ class Browser {
 
         // Use persisted fingerprint if present, else generate
         let fingerprint = sessionData.fingerprint ?? undefined
+
         if (!fingerprint) {
-            fingerprint = await this.generateFingerprint()
+            // generate with robust fallback
+            try {
+                fingerprint = await this.generateFingerprintWithRetries({ attempts: 10 })
+            } catch (e) {
+                this.bot.log(this.bot.isMobile, 'BROWSER', `Fingerprint generation failed (final fallback will use minimal fingerprint): ${(e instanceof Error) ? e.message : String(e)}`, 'warn')
+                // fallback to simple deterministic fingerprint (similar to old code)
+                try {
+                    const simpleFp = new FingerprintGenerator().getFingerprint({
+                        devices: this.bot.isMobile ? ['mobile'] : ['desktop'],
+                        operatingSystems: this.bot.isMobile ? ['android'] : ['windows'],
+                        browsers: [{ name: 'edge' }]
+                    })
+                    fingerprint = await updateFingerprintUserAgent(simpleFp, this.bot.isMobile)
+                } catch (ee) {
+                    this.bot.log(this.bot.isMobile, 'BROWSER', `Final simple fingerprint fallback failed: ${(ee instanceof Error) ? ee.message : String(ee)}`, 'warn')
+                    // last resort: use an extremely small, best-effort object so code can continue
+                    fingerprint = { fingerprint: { navigator: { userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' } } } as any
+                }
+            }
         }
 
         // Ensure UA reflects overrides
-        let finalFingerprint = await updateFingerprintUserAgent(fingerprint, this.bot.isMobile)
+        let finalFingerprint = fingerprint
+        try {
+            finalFingerprint = await updateFingerprintUserAgent(fingerprint, this.bot.isMobile)
+        } catch (e) {
+            this.bot.log(this.bot.isMobile, 'BROWSER', `updateFingerprintUserAgent failed (continuing with existing fingerprint): ${(e instanceof Error) ? e.message : String(e)}`, 'warn')
+        }
 
         // Attempt to create injected context, but handle known header-generation failure gracefully
         let context: any | undefined
@@ -142,11 +169,12 @@ class Browser {
                 this.bot.log(this.bot.isMobile, 'BROWSER', `newInjectedContext attempt ${attempt} failed: ${msg}`, 'warn')
 
                 // If it's a headers-generation issue or something clearly fingerprint-related, relax constraints and retry
-                if (typeof msg === 'string' && /header/i.test(msg) || /No headers/.test(msg) || /cannot be generated/i.test(msg)) {
-                    this.bot.log(this.bot.isMobile, 'BROWSER', `Detected headers-generation failure. Regenerating relaxed fingerprint and retrying (attempt ${attempt})`, 'warn')
+                if (typeof msg === 'string' && (/header/i.test(msg) || /No headers/.test(msg) || /cannot be generated/i.test(msg) || /consistent fingerprint/i.test(msg))) {
+                    this.bot.log(this.bot.isMobile, 'BROWSER', `Detected headers-generation / consistency failure. Regenerating relaxed fingerprint and retrying (attempt ${attempt})`, 'warn')
                     try {
-                        finalFingerprint = await this.generateFingerprint({ relax: true })
-                        try { await this.bot.utils.wait(this.bot.utils.randomNumber(150, 400)) } catch { }
+                        finalFingerprint = await this.generateFingerprintWithRetries({ attempts: 5, relax: true })
+                        // small random backoff
+                        try { await this.bot.utils.wait(this.bot.utils.randomNumber(150, 500)) } catch { }
                         continue
                     } catch (genErr) {
                         this.bot.log(this.bot.isMobile, 'BROWSER', `Relaxed fingerprint generation failed: ${(genErr instanceof Error) ? genErr.message : String(genErr)}`, 'warn')
@@ -185,7 +213,6 @@ class Browser {
                     userAgent: ua,
                     viewport,
                     locale: (this.bot.config?.geoLocale?.locale) || undefined,
-                    // Playwright accepts extraHTTPHeaders at context creation
                     extraHTTPHeaders: headers,
                 })
             } catch (ctxErr) {
@@ -232,7 +259,6 @@ class Browser {
                     const headers: Record<string, string> = {}
                     headers['Accept-Language'] = (this.bot.config?.geoLocale?.locale) || 'en-US,en;q=0.9'
                     headers['DNT'] = Math.random() < 0.8 ? '1' : '0'
-                    // don't call setExtraHTTPHeaders if headers object is empty
                     if (Object.keys(headers).length > 0) {
                         try { await page.context().setExtraHTTPHeaders(headers) } catch (e) { /* ignore */ }
                     }
@@ -244,8 +270,11 @@ class Browser {
 
         // restore cookies if present
         try {
-            await (context as any).addCookies(sessionData.cookies || [])
-            try { await this.bot.utils.wait(this.bot.utils.randomNumber(200, 600)) } catch { }
+            const cookies = sessionData.cookies || []
+            if (Array.isArray(cookies) && cookies.length) {
+                await (context as any).addCookies(cookies)
+                try { await this.bot.utils.wait(this.bot.utils.randomNumber(200, 600)) } catch { }
+            }
         } catch (e) {
             this.bot.log(this.bot.isMobile, 'BROWSER', `Failed to restore cookies: ${(e instanceof Error) ? e.message : String(e)}`, 'warn')
         }
@@ -270,18 +299,46 @@ class Browser {
     }
 
     /**
-     * Generate a fingerprint. If {relax: true} is passed we use a broader set
-     * of OS/browser options to avoid impossible combinations that some header
-     * generation libraries reject.
+     * Generate a fingerprint with retries and an optional "relax" mode.
+     * If attempts are exhausted, rejects.
      */
-    async generateFingerprint(opts?: { relax?: boolean }) {
+    private async generateFingerprintWithRetries(opts?: { attempts?: number; relax?: boolean }) {
+        const attempts = (opts && opts.attempts) || 6
         const relax = !!(opts && opts.relax)
+
+        for (let i = 1; i <= attempts; i++) {
+            try {
+                const fp = await this._attemptGenerateFingerprint({ relax })
+                // quick sanity checks
+                if (fp && fp.fingerprint && fp.fingerprint.navigator && fp.fingerprint.navigator.userAgent) {
+                    return fp
+                }
+                throw new Error('Generated fingerprint missing userAgent')
+            } catch (e) {
+                this.bot.log(this.bot.isMobile, 'BROWSER', `Fingerprint generation attempt ${i} failed: ${(e instanceof Error) ? e.message : String(e)}`, 'warn')
+                // small backoff
+                try { await this.bot.utils.wait(this.bot.utils.randomNumber(100, 400)) } catch { }
+                // if this was last attempt, rethrow
+                if (i === attempts) throw e
+            }
+        }
+        throw new Error('Failed to generate fingerprint')
+    }
+
+    /**
+     * Single attempt to generate fingerprint. May throw if underlying library fails.
+     */
+    private async _attemptGenerateFingerprint(opts?: { relax?: boolean }) {
+        const relax = !!(opts && opts.relax)
+
         const osOptions: Array<'android' | 'ios' | 'windows' | 'macos' | 'linux'> = this.bot.isMobile
             ? (relax ? ['android', 'ios'] : ['android', 'ios'])
             : (relax ? ['windows', 'macos', 'linux'] : ['windows', 'macos', 'linux'])
+
         const browserOptions: Array<'edge' | 'chrome' | 'firefox' | 'safari'> = relax
             ? ['edge', 'chrome', 'firefox', 'safari']
             : ['edge', 'chrome', 'firefox']
+
         const screenOptions = this.bot.isMobile
             ? [{ width: 360, height: 780 }, { width: 375, height: 812 }, { width: 412, height: 915 }]
             : [{ width: 1280, height: 800 }, { width: 1366, height: 768 }, { width: 1536, height: 864 }]
@@ -306,13 +363,21 @@ class Browser {
         })
 
         try {
+            // let updateFingerprintUserAgent transform/normalize UA and return a consistent structure
             const updated = await updateFingerprintUserAgent(fp, this.bot.isMobile)
             return updated
         } catch (e) {
-            // fallback: return original fingerprint
-            this.bot.log(this.bot.isMobile, 'BROWSER', `updateFingerprintUserAgent failed, returning raw fingerprint: ${(e instanceof Error) ? e.message : String(e)}`, 'warn')
-            return fp
+            // bubble up, generateFingerprintWithRetries will catch and handle retry/backoff
+            throw e
         }
+    }
+
+    // Keep a public generateFingerprint for compatibility
+    async generateFingerprint(opts?: { relax?: boolean }) {
+        if (opts && opts.relax) {
+            return this.generateFingerprintWithRetries({ attempts: 3, relax: true })
+        }
+        return this.generateFingerprintWithRetries({ attempts: 6 })
     }
 }
 
