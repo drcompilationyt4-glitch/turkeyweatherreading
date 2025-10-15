@@ -21,6 +21,7 @@ type GoogleTrendsResponse = [
 export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
+    private readonly runId = Math.random().toString(36).substring(2, 8); // Unique ID for this run
 
     public async doSearch(page: Page, data: DashboardData, numSearches?: number) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
@@ -43,10 +44,10 @@ export class Search extends Workers {
         const neededSearches = Math.ceil(missingPoints / pointsPerSearch)
         const targetSearchCount = numSearches ? Math.min(numSearches, neededSearches) : neededSearches
 
-        // Generate search queries (LLM first, or Google Trends fallback)
+        // Generate search queries (75% LLM / 25% Trends)
         const geo = this.bot.config.searchSettings.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
 
-        // getSearchQueries tries batch LLM first (if configured), then per-search LLM fallback, then Trends, then local file
+        // Get queries with our improved distribution strategy
         let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo, targetSearchCount)
 
         // Final fallbacks: local file
@@ -67,7 +68,7 @@ export class Search extends Workers {
         const seen = new Set<string>()
         googleSearchQueries = googleSearchQueries.filter(q => {
             if (!q || !q.topic) return false
-            const k = q.topic.toLowerCase()
+            const k = q.topic.toLowerCase().replace(/[^a-z0-9]/g, '')
             if (seen.has(k)) return false
             seen.add(k)
             return true
@@ -364,69 +365,107 @@ export class Search extends Workers {
     /**
      * Primary entrypoint to obtain queries.
      * Behavior:
-     *  - If config.searchSettings.llmMode === 'per-search', we will NOT batch; we will call LLM per search in generateSingleQueryFromLLM during initialization (so list still exists).
-     *  - Default mode is 'batch' — we ask LLM for a JSON array of queries (saves API calls).
+     *  - 75% LLM / 25% Trends distribution
      *  - On failure of LLM batch we attempt single-per-search generation (if configured), otherwise Google Trends fallback.
      */
     private async getSearchQueries(geoLocale: string = 'US', desiredCount = 25): Promise<GoogleSearch[]> {
-        const mode = (this.bot.config.searchSettings?.llmMode as 'batch' | 'per-search' | undefined) || 'batch'
-        const useLLMFirst = this.bot.config.searchSettings?.preferLLM ?? true
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries with 75% LLM / 25% Trends distribution`)
 
-        if (!useLLMFirst) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM disabled by config, using Google Trends')
-            return this.getGoogleTrends(geoLocale)
+        // Calculate exact distribution (75% LLM, 25% Trends)
+        const llmCount = Math.max(1, Math.ceil(desiredCount * 0.75));
+        const trendsCount = Math.max(0, desiredCount - llmCount);
+
+        // Get queries from both sources with human-like context
+        const [llmQueries, trendsQueries] = await Promise.all([
+            this.getEnhancedLLMQueries(geoLocale, llmCount),
+            trendsCount > 0 ? this.getGoogleTrends(geoLocale) : Promise.resolve([])
+        ]);
+
+        // Combine with proper weighting
+        let allQueries = [...llmQueries];
+        if (trendsQueries.length > 0) {
+            const sampledTrends = this.bot.utils.shuffleArray(trendsQueries).slice(0, trendsCount);
+            allQueries = [...allQueries, ...sampledTrends];
         }
 
-        if (mode === 'per-search') {
-            // per-search mode: generate N single queries by calling LLM N times
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Using LLM per-search generation (per-search mode)')
-            const queries: GoogleSearch[] = []
-            for (let i = 0; i < desiredCount; i++) {
-                try {
-                    const q = await this.generateSingleQueryFromLLM(geoLocale)
-                    if (q) queries.push({ topic: q, related: [] })
-                } catch (err) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Per-search LLM generation failed at iteration ${i}: ${err instanceof Error ? err.message : String(err)}`, 'warn')
-                    // try continue — if many fails, we'll fallback to Trends after loop
-                }
-            }
-            if (queries.length) return queries
-            // fall through to Trends
+        // Dedupe while preserving diversity
+        const seen = new Set<string>();
+        allQueries = this.bot.utils.shuffleArray(allQueries).filter(q => {
+            if (!q || !q.topic) return false;
+            const key = q.topic.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+
+        // Final fallbacks only if we're severely short
+        if (allQueries.length < Math.max(5, Math.floor(desiredCount * 0.4))) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Insufficient queries from primary sources, using local fallback', 'warn');
+            return this.getLocalQueriesFallback(desiredCount);
+        }
+
+        return allQueries.slice(0, desiredCount);
+    }
+
+    private getSearchContext(): { mode: string, contextNotes: string } {
+        const now = new Date();
+        const day = now.getDay(); // 0 = Sunday, 6 = Saturday
+        const hour = now.getHours();
+        const isWeekend = day === 0 || day === 6;
+        const isWeekday = !isWeekend;
+
+        // Real user patterns based on Bing statistics
+        const topQueries = isWeekday ?
+            ['how to', 'best way to', 'tutorial', 'assignment help', 'campus resources'] :
+            ['YouTube', 'Netflix', 'games', 'food delivery', 'weekend plans'];
+
+        // Day-based search modes
+        let mode = 'balanced';
+        let contextNotes = '';
+
+        if (isWeekend) {
+            mode = Math.random() < 0.7 ? 'relax' : 'food';
+            contextNotes = `It's ${['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day]} - weekend mode. `;
         } else {
-            // batch mode: request a JSON array of queries in one request (preferred)
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Attempting LLM batch generation for ${desiredCount} queries`)
-            try {
-                const batch = await this.generateQueriesWithLLMBatch(geoLocale, desiredCount)
-                if (Array.isArray(batch) && batch.length) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch returned ${batch.length} queries`)
-                    return batch
-                } else {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'LLM batch returned empty/invalid result, will fallback', 'warn')
-                }
-            } catch (err) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch generation failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
-                // If batch fails and mode is batch, attempt per-search fallback ONLY if allowed by config
-                if (this.bot.config.searchSettings?.enablePerSearchFallback) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting per-search LLM fallback after batch failure')
-                    const queries: GoogleSearch[] = []
-                    for (let i = 0; i < desiredCount; i++) {
-                        try {
-                            const q = await this.generateSingleQueryFromLLM(geoLocale)
-                            if (q) queries.push({ topic: q, related: [] })
-                        } catch { /* ignore iteration errors */ }
-                    }
-                    if (queries.length) return queries
-                }
+            if (hour < 9) {
+                mode = 'news';
+                contextNotes = `Early ${['Mon', 'Tues', 'Wed', 'Thurs', 'Fri'][day-1]} morning - checking news/weather. `;
+            } else if (hour < 17) {
+                mode = Math.random() < 0.65 ? 'study' : 'relax';
+                contextNotes = `Weekday afternoon - ${mode === 'study' ? 'working on assignments' : 'taking a break'}. `;
+            } else {
+                mode = Math.random() < 0.5 ? 'food' : 'gaming';
+                contextNotes = `Evening hours - ${mode} mode active. `;
             }
         }
 
-        // Last attempt: Google Trends
+        // Add real-world context from actual Bing search patterns
+        contextNotes += `Top real Bing queries include "${topQueries[Math.floor(Math.random() * topQueries.length)]}"`;
+
+        return { mode, contextNotes };
+    }
+
+    private async getEnhancedLLMQueries(geoLocale: string, count: number): Promise<GoogleSearch[]> {
+        const { mode, contextNotes } = this.getSearchContext();
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${count} LLM queries in ${mode} mode: ${contextNotes}`);
+
         try {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Falling back to Google Trends')
-            return await this.getGoogleTrends(geoLocale)
+            return await this.generateQueriesWithLLMBatch(geoLocale, count, mode, contextNotes);
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Enhanced LLM generation failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
+            return [];
+        }
+    }
+
+    private async getLocalQueriesFallback(desiredCount: number): Promise<GoogleSearch[]> {
+        try {
+            const local = await import('../queries.json')
+            const sampleSize = Math.max(5, Math.min(25, (local.default || []).length))
+            const sampled = this.bot.utils.shuffleArray(local.default || []).slice(0, sampleSize)
+            return sampled.map((x: any) => ({ topic: x.queries?.[0] || x.title, related: x.queries?.slice(1) || [] }))
         } catch (e) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Google Trends fallback failed: ' + (e instanceof Error ? e.message : String(e)), 'error')
-            return []
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Failed loading local queries fallback: ' + (e instanceof Error ? e.message : String(e)), 'error')
+            return [];
         }
     }
 
@@ -434,17 +473,49 @@ export class Search extends Workers {
      * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
      * Returns normalized GoogleSearch[]
      */
-    private async generateQueriesWithLLMBatch(geoLocale: string, desiredCount = 25): Promise<GoogleSearch[]> {
-        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
-        if (!apiKey) throw new Error('OpenRouter API key not configured')
+    private async generateQueriesWithLLMBatch(
+        geoLocale: string,
+        desiredCount = 25,
+        mode: string = 'balanced',
+        contextNotes: string = ''
+    ): Promise<GoogleSearch[]> {
+        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();
+        if (!apiKey) throw new Error('OpenRouter API key not configured');
 
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
-- "topic": a short search query a typical university student might type.
-- "related": an array of 0..6 related searches (short strings).
+        // Realistic query patterns based on actual Bing usage statistics
+        const realisticPatterns = [
+            'Instead of generic "cheap food near me", use specific examples like "McDonalds delivery promo code" or "best sushi near campus"',
+            'Avoid repetitive phrasing - vary between questions ("How to..."), commands ("Find..."), and specific requests ("Best pizza in [city name]")',
+            'Incorporate day-specific context: weekday = academic/work, weekend = entertainment/leisure',
+            'Add location context naturally: "near campus", "in [city name]", "downtown [city]"'
+        ];
 
-Return up to ${desiredCount} diverse items if possible. Avoid politically sensitive & adult topics. Output must be valid JSON only (no explanatory text). Use ${geoLocale.toUpperCase()} locale where relevant.`
+        // Actual top Bing query examples to guide realistic generation
+        const topBingExamples = [
+            'YouTube', 'Facebook', 'Google', 'Gmail', 'Amazon',
+            'weather', 'news', 'Netflix', 'TikTok', 'Wikipedia'
+        ];
 
-        const userPrompt = `Generate up to ${desiredCount} short search queries a typical undergraduate would use (games, course topics, campus services, cheap food, debugging help). Output only valid JSON array.`
+        const systemPrompt = `You are an assistant generating realistic search queries that reflect how actual people use Bing.
+
+${contextNotes}
+
+Key requirements:
+- Generate ${desiredCount} diverse search queries with ${realisticPatterns[Math.floor(Math.random() * realisticPatterns.length)]}
+- For ${mode} mode: ${this.getModeDescription(mode)}
+- Avoid repetitive patterns - each query should feel unique and human-written
+- Use natural phrasing like real users: "${topBingExamples[Math.floor(Math.random() * 5)]}" is among the most common Bing queries
+- Include specific examples instead of generic terms (e.g., "Uber Eats promo" not "food delivery near me")
+- Queries must reflect ${geoLocale.toUpperCase()} locale appropriately
+- Output ONLY valid JSON array with "topic" and "related" fields (0-6 related terms)
+- No explanations or additional text - JSON only`;
+
+        const userPrompt = `Generate ${desiredCount} natural search queries that:
+- Reflect how real people search on Bing today
+- Avoid these repetitive patterns: ${this.getRepetitivePatternsWarning()}
+- Include run-specific context (Session ID: ${this.runId})
+- For ${mode} mode: ${this.getModeDescription(mode)}
+- Output only valid JSON array with no additional text`;
 
         const body = {
             model: 'meta-llama/llama-3.3-70b-instruct:free',
@@ -502,53 +573,83 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
         return normalized
     }
 
+    private getModeDescription(mode: string): string {
+        const descriptions: Record<string, string> = {
+            study: 'Focus on academic topics, research, and learning resources. Use queries like "calculus 2 practice problems" or "APA citation guide".',
+            relax: 'Focus on entertainment, leisure, and casual browsing. Use queries like "latest Netflix shows" or "DIY room decor ideas".',
+            food: 'Focus on restaurants and food services. Instead of "cheap food near me", use specific examples like "Chipotle catering options" or "best sushi in [city]".',
+            gaming: 'Focus on games and entertainment. Use queries like "Fortnite season 5 release date" or "best settings for Warzone".',
+            news: 'Focus on current events and information. Use queries like "current weather forecast" or "local news updates".',
+            balanced: 'Mix of all categories with natural variation'
+        };
+
+        // Store the default value separately to ensure it's always a string
+        const defaultDescription = 'Mix of all categories with natural variation';
+
+        // Use nullish coalescing to safely return a string
+        return descriptions[mode] ?? defaultDescription;
+    }
+
+
+    private getRepetitivePatternsWarning(): string {
+        const warnings = [
+            '"cheap food near me" → use specific examples like "Chipotle catering options" or "best sushi in [city]"',
+            '"how to" → vary with "tips for", "guide to", "best way to", or just the topic itself',
+            'Always include natural location context when relevant (e.g., "near campus", "downtown", "in [city]")',
+            'Mix question format and direct search terms for diversity'
+        ];
+
+        return warnings[Math.floor(Math.random() * warnings.length)] ?? '';
+    }
+
+
     /**
      * Single-query LLM generation (used in per-search mode or per-search fallback).
      * Returns single string or null.
      */
-    private async generateSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
-        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
-        if (!apiKey) throw new Error('OpenRouter API key not configured')
-
-        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string.`
-
-        const userPrompt = `Provide a single concise search query a university undergrad might use.`
-
-        const body = {
-            model: 'meta-llama/llama-3.3-70b-instruct:free',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ],
-            max_tokens: 60,
-            temperature: 0.7
-        }
-
-        const requestConfig: AxiosRequestConfig = {
-            url: 'https://openrouter.ai/api/v1/chat/completions',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            data: body,
-            timeout: 15000,
-            proxy: false
-        }
-
-        const resp = await axios.request(requestConfig as any)
-        const choices = resp?.data?.choices
-        let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
-        if (!rawContent) return null
-
-        const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
-        const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
-        const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
-        const final = String(candidate).replace(/(^"|"$)/g, '').trim()
-
-        if (!final || final.length < 2) return null
-        return final.length > 200 ? final.slice(0, 200) : final
-    }
+    // private async generateSingleQueryFromLLM(geoLocale: string = 'US'): Promise<string | null> {
+    //     const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();
+    //     if (!apiKey) throw new Error('OpenRouter API key not configured')
+    //
+    //     const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string.`
+    //
+    //     const userPrompt = `Provide a single concise search query a university undergrad might use.`
+    //
+    //     const body = {
+    //         model: 'meta-llama/llama-3.3-70b-instruct:free',
+    //         messages: [
+    //             { role: 'system', content: systemPrompt },
+    //             { role: 'user', content: userPrompt }
+    //         ],
+    //         max_tokens: 60,
+    //         temperature: 0.7
+    //     }
+    //
+    //     const requestConfig: AxiosRequestConfig = {
+    //         url: 'https://openrouter.ai/api/v1/chat/completions',
+    //         method: 'POST',
+    //         headers: {
+    //             'Content-Type': 'application/json',
+    //             'Authorization': `Bearer ${apiKey}`
+    //         },
+    //         data: body,
+    //         timeout: 15000,
+    //         proxy: false
+    //     }
+    //
+    //     const resp = await axios.request(requestConfig as any)
+    //     const choices = resp?.data?.choices
+    //     let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
+    //     if (!rawContent) return null
+    //
+    //     const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
+    //     const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
+    //     const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
+    //     const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+    //
+    //     if (!final || final.length < 2) return null
+    //     return final.length > 200 ? final.slice(0, 200) : final
+    // }
 
     private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
         const queryTerms: GoogleSearch[] = []
