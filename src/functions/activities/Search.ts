@@ -386,51 +386,129 @@ export class Search extends Workers {
         diversityLevel = 0.5,
         runSeed?: number
     ): Promise<GoogleSearch[]> {
-        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries with default 75% LLM / 25% Trends distribution`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (LLM primary, Trends fill; local fills missing)`)
 
-        const mix = this.bot.config.searchSettings?.queryMix || { llmPct: 75 }
-        const llmPct = Math.max(0, Math.min(100, mix.llmPct ?? 75))
-        const llmCount = Math.max(0, Math.round(desiredCount * (llmPct / 100)))
+        // 75% LLM (rounded up), remaining Trends
+        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 75))
+        const llmCount = Math.max(0, Math.ceil(desiredCount * (llmPct / 100)))
         const trendsCount = Math.max(0, desiredCount - llmCount)
 
-        // Fetch both sources in parallel (if counts > 0)
-        const llmPromise = llmCount > 0 ? this.getEnhancedLLMQueries(geoLocale, llmCount, mode, runSeed) : Promise.resolve([] as GoogleSearch[])
-        const trendsPromise = trendsCount > 0 ? this.getGoogleTrends(geoLocale) : Promise.resolve([] as GoogleSearch[])
-
-        const [llmQueries, trendsQueries] = await Promise.all([llmPromise, trendsPromise])
-
-        // Weighting: take up to llmCount from LLM, then fill with trends sample
-        const results: GoogleSearch[] = []
-        if (Array.isArray(llmQueries) && llmQueries.length) results.push(...llmQueries.slice(0, llmCount))
-        if (Array.isArray(trendsQueries) && trendsQueries.length && trendsCount > 0) {
-            const sampledTrends = this.bot.utils.shuffleArray(trendsQueries).slice(0, trendsCount)
-            results.push(...sampledTrends)
-        }
-
-        // If still short, attempt per-search LLM fallback (if enabled)
-        if (results.length < desiredCount && this.bot.config.searchSettings?.enablePerSearchFallback) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting per-search LLM fallback')
-            while (results.length < desiredCount) {
-                try {
-                    const q = await this.generateSingleQueryFromLLM(geoLocale, mode)
-                    if (q) results.push({ topic: q, related: [] })
-                    else break
-                } catch { break }
+        // 1) Attempt LLM batch first
+        let llmQueries: GoogleSearch[] = []
+        try {
+            if (llmCount > 0) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Attempting LLM batch for ${llmCount} queries`)
+                llmQueries = await this.getEnhancedLLMQueries(geoLocale, llmCount, mode, runSeed)
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmQueries.length} items`)
+            }
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+            // per-search fallback if enabled
+            if (this.bot.config.searchSettings?.enablePerSearchFallback) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting per-search LLM fallback')
+                const per: GoogleSearch[] = []
+                for (let i = 0; i < llmCount; i++) {
+                    try {
+                        const q = await this.generateSingleQueryFromLLM(geoLocale, mode)
+                        if (q) per.push({ topic: q, related: [] })
+                    } catch (e) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Per-search LLM iteration failed: ${e instanceof Error ? e.message : String(e)}`, 'warn')
+                    }
+                }
+                llmQueries = per
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Per-search LLM returned ${llmQueries.length} items`)
             }
         }
 
-        // If still short, fallback to local
-        if (results.length < Math.max(5, Math.floor(desiredCount * 0.4))) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Insufficient queries from LLM/Trends, using local fallback', 'warn')
+        // 2) Attempt Trends (only for the number of remaining slots)
+        let trendsQueries: GoogleSearch[] = []
+        if (trendsCount > 0) {
+            try {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsCount})`)
+                const rawTrends = await this.getGoogleTrends(geoLocale)
+                if (Array.isArray(rawTrends) && rawTrends.length) {
+                    // sample trends but we'll only use up to trendsCount (or fewer if llm is short)
+                    trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsCount)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
+                } else {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Trends returned no usable items', 'warn')
+                }
+            } catch (tErr) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
+                // non-fatal — we'll top up from local below
+            }
+        }
+
+        // 3) Combine according to rules:
+        // - If LLM produced items -> keep them as primary.
+        //   * Try to append up to (desiredCount - llmLength) from trends.
+        //   * If trends insufficient, top up the missing slots from local fallback.
+        // - If LLM produced ZERO -> use trends first (if any), then local to fill.
+        const combined: GoogleSearch[] = []
+        const seen = new Set<string>()
+
+        const pushIfUnique = (q: GoogleSearch) => {
+            if (!q?.topic) return false
+            const key = q.topic.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (!key || seen.has(key)) return false
+            seen.add(key)
+            combined.push(q)
+            return true
+        }
+
+        if (llmQueries && llmQueries.length > 0) {
+            // Keep LLM items first (up to desiredCount)
+            for (const q of llmQueries) {
+                if (combined.length >= desiredCount) break
+                pushIfUnique(q)
+            }
+
+            // Now append trends up to remaining slots
+            for (const t of trendsQueries) {
+                if (combined.length >= desiredCount) break
+                pushIfUnique(t)
+            }
+
+            // If still short, fill missing with local queries (do NOT discard LLM)
+            if (combined.length < desiredCount) {
+                const missing = desiredCount - combined.length
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends insufficient — topping up ${missing} from local fallback`)
+                const localCandidates = await this.getLocalQueriesFallback(Math.max(missing, 5))
+                for (const l of localCandidates) {
+                    if (combined.length >= desiredCount) break
+                    pushIfUnique(l)
+                }
+            }
+        } else {
+            // LLM returned nothing — use trends first, then local
+            for (const t of trendsQueries) {
+                if (combined.length >= desiredCount) break
+                pushIfUnique(t)
+            }
+            if (combined.length < desiredCount) {
+                const missing = desiredCount - combined.length
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM empty — filling ${missing} from local fallback`)
+                const localCandidates = await this.getLocalQueriesFallback(Math.max(missing, 5))
+                for (const l of localCandidates) {
+                    if (combined.length >= desiredCount) break
+                    pushIfUnique(l)
+                }
+            }
+        }
+
+        // 4) If still somehow empty (extremely unlikely), return local fallback unconditionally
+        if (combined.length === 0) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'No queries from LLM/Trends/local attempt — using local fallback (final)', 'warn')
             return this.getLocalQueriesFallback(desiredCount)
         }
 
-        // Post-process to diversify / humanize (deterministic if runSeed given)
+        // 5) Final deterministic shuffle/diversify and return up to desiredCount
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
-        const diversified = this.diversifyQueries(results.slice(0, desiredCount), mode, (new Date()).getDay(), rng, diversityLevel)
+        const normalized = this.diversifyQueries(combined, mode, (new Date()).getDay(), rng, diversityLevel)
 
-        return diversified.slice(0, desiredCount)
+        return normalized.slice(0, desiredCount)
     }
+
 
     private async getEnhancedLLMQueries(geoLocale: string, count: number, mode: Mode, runSeed?: number): Promise<GoogleSearch[]> {
         const { mode: ctxMode, contextNotes } = this.determineRunSettings(runSeed)
