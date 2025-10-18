@@ -8,18 +8,14 @@ import { Workers } from '../Workers'
 import { Counters, DashboardData } from '../../interface/DashboardData'
 import { GoogleSearch } from '../../interface/Search'
 
-type GoogleTrendsResponse = [
-    string,
-    [
-        string,
-        ...null[],
-        [string, ...string[]]
-    ][]
-];
-
 export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
+
+    // Lightweight in-memory recent-topic cache to reduce repetition across runs (LRU)
+    private static recentTopicLRU: string[] = []
+    private static recentTopicSet: Set<string> = new Set()
+    private static RECENT_CACHE_LIMIT = 500
 
     public async doSearch(page: Page, data: DashboardData, numSearches?: number) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
@@ -46,20 +42,20 @@ export class Search extends Workers {
         const runSeed = this.getRunSeed()
         const runId = this.getRunId(runSeed)
 
-        const modeCfg = (this.bot.config.searchSettings?.mode as ('auto' | Mode) | undefined) || 'auto'
         const autoSettings = this.determineRunSettings(runSeed)
+        const modeCfg = (this.bot.config.searchSettings?.mode as ('auto' | Mode) | undefined) || 'auto'
         const mode = modeCfg === 'auto' ? autoSettings.mode : (modeCfg as Mode)
         const diversityLevel = typeof this.bot.config.searchSettings?.diversityBase === 'number'
             ? this.bot.config.searchSettings.diversityBase
             : autoSettings.diversityLevel
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-BING', `RunID=${runId} mode=${mode} diversity=${diversityLevel.toFixed(2)}`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-BING', `RunID=${runId} mode=${mode} diversity=${diversityLevel.toFixed(2)} pool=${autoSettings.modesPool.join(',')}`)
 
-        // Generate search queries (75% LLM / 25% Trends by default)
+        // Generate search queries (LLM primary, Trends fill)
         const geo = this.bot.config.searchSettings?.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
 
-        // Get queries with our improved distribution strategy
-        let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo, targetSearchCount, mode, diversityLevel, runSeed)
+        // Pass the run-specific modesPool into query gen so queries can be diversified per-item
+        let googleSearchQueries: GoogleSearch[] = await this.getSearchQueries(geo, targetSearchCount, mode, diversityLevel, runSeed, autoSettings.modesPool)
 
         // Final fallbacks: local file
         if (!googleSearchQueries.length || googleSearchQueries.length < 1) {
@@ -376,15 +372,16 @@ export class Search extends Workers {
     /**
      * Primary entrypoint to obtain queries.
      * Behavior:
-     *  - 75% LLM / 25% Trends distribution (configurable)
-     *  - On failure of LLM batch we attempt single-per-search generation (if configured), otherwise Google Trends fallback.
+     *  - Configurable LLM / Trends mix
+     *  - Per-run modesPool passed to diversification so queries can vary across interleaves
      */
     private async getSearchQueries(
         geoLocale: string = 'US',
         desiredCount = 25,
         mode: Mode = 'balanced',
         diversityLevel = 0.5,
-        runSeed?: number
+        runSeed?: number,
+        modesPool?: Mode[]
     ): Promise<GoogleSearch[]> {
         this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (LLM primary, Trends fill; local fills missing)`)
 
@@ -424,26 +421,22 @@ export class Search extends Workers {
         let trendsQueries: GoogleSearch[] = []
         if (trendsCount > 0) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsCount})`)
-                const rawTrends = await this.getGoogleTrends(geoLocale)
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Trends (Reddit-based) (up to ${trendsCount})`)
+                const rawTrends = await this.getRedditTrends(geoLocale)
                 if (Array.isArray(rawTrends) && rawTrends.length) {
                     // sample trends but we'll only use up to trendsCount (or fewer if llm is short)
                     trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsCount)
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Reddit trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
                 } else {
                     this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Trends returned no usable items', 'warn')
                 }
             } catch (tErr) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
                 // non-fatal — we'll top up from local below
             }
         }
 
         // 3) Combine according to rules:
-        // - If LLM produced items -> keep them as primary.
-        //   * Try to append up to (desiredCount - llmLength) from trends.
-        //   * If trends insufficient, top up the missing slots from local fallback.
-        // - If LLM produced ZERO -> use trends first (if any), then local to fill.
         const combined: GoogleSearch[] = []
         const seen = new Set<string>()
 
@@ -504,7 +497,12 @@ export class Search extends Workers {
 
         // 5) Final deterministic shuffle/diversify and return up to desiredCount
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
-        const normalized = this.diversifyQueries(combined, mode, (new Date()).getDay(), rng, diversityLevel)
+        const normalized = this.diversifyQueries(combined, mode, (new Date()).getDay(), rng, diversityLevel, modesPool)
+
+        // add final keys to recent cache to reduce repetition across runs
+        for (const item of normalized.slice(0, desiredCount)) {
+            this.addToRecentTopics(item.topic || '')
+        }
 
         return normalized.slice(0, desiredCount)
     }
@@ -615,7 +613,7 @@ Output only valid JSON array with "topic" and "related" fields.`
                 try {
                     parsed = JSON.parse(content)
                 } catch (e) {
-                    const trimmed = String(content).replace(/```json|```/g, '').trim()
+                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
                     parsed = JSON.parse(trimmed)
                 }
 
@@ -704,111 +702,89 @@ Output only valid JSON array with "topic" and "related" fields.`
         return final.length > 200 ? final.slice(0, 200) : final
     }
 
-    private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
-        const queryTerms: GoogleSearch[] = []
-        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
+    /**
+     * Replace the previous Google Trends approach with Reddit-based trending fetch.
+     * - Try r/all/top.json?t=day (no auth)
+     * - Fallback to r/all/hot.json
+     * - Produce GoogleSearch[] where topic = post title; related contains subreddit and small variants.
+     */
+    private async getRedditTrends(_geoLocale: string = 'US'): Promise<GoogleSearch[]> {
+        const results: GoogleSearch[] = []
+        this.bot.log(this.bot.isMobile, 'SEARCH-TRENDS-REDDIT', 'Fetching trending topics from Reddit (r/all top/day fallback to hot)')
 
-        // Human-like delay before fetching trends (0.5-1.5 seconds)
+        // human-like delay
         await this.bot.utils.wait(this.bot.utils.randomNumber(500, 1500))
 
-        try {
-            const request: AxiosRequestConfig = {
-                url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
-                },
-                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
-                responseType: 'text',
-                timeout: (this.bot.config?.googleTrends?.timeoutMs) || 20000,
-                proxy: false
-            }
+        const tryEndpoints = [
+            'https://www.reddit.com/r/all/top.json?limit=100&t=day',
+            'https://www.reddit.com/r/all/hot.json?limit=100'
+        ]
 
-            // Optional: set custom https agent to prefer IPv4 (best-effort)
+        for (const url of tryEndpoints) {
             try {
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
-                const dns = require('dns')
-                const lookup = (hostname: string, options: any, callback: Function) => {
-                    dns.lookup(hostname, { family: 4 }, (err: any, address: any, family: any) => {
-                        if (err) dns.lookup(hostname, (err2: any, address2: any, family2: any) => callback(err2, address2, family2))
-                        else callback(err, address, family)
-                    })
+                const req: AxiosRequestConfig = {
+                    url,
+                    method: 'GET',
+                    responseType: 'json',
+                    timeout: (this.bot.config?.googleTrends?.timeoutMs) || 20000,
+                    proxy: false,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (compatible; bot/1.0; +https://example.com)'
+                    }
                 }
-                request.httpsAgent = new (require('https').Agent)({
-                    keepAlive: true,
-                    lookup,
-                    rejectUnauthorized: true
-                })
-            } catch (e) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'DNS agent creation failed, using default: ' + (e instanceof Error ? e.message : String(e)), 'warn')
-            }
-
-            const response = await axios.request(request as any)
-
-            let rawText: string
-            if (typeof response.data === 'string') rawText = response.data
-            else if (Buffer.isBuffer(response.data)) rawText = response.data.toString('utf8')
-            else rawText = JSON.stringify(response.data)
-
-            if (!rawText || rawText.length < 10) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Empty or invalid response from Google Trends', 'warn')
-                return []
-            }
-
-            const trendsData = this.extractJsonFromResponse(rawText)
-            if (!trendsData || !Array.isArray(trendsData)) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse valid trends data from response', 'warn')
-                if (geoLocale.toUpperCase() !== 'US') {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale', 'warn')
-                    return this.getGoogleTrends('US')
-                }
-                return []
-            }
-
-            const mappedTrendsData = trendsData.map((q: any) => [q[0], q[9] ? q[9].slice(1) : []])
-
-            if (mappedTrendsData.length < 50 && geoLocale.toUpperCase() !== 'US') {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient trends for ${geoLocale} (${mappedTrendsData.length}), falling back to US`, 'warn')
-                return this.getGoogleTrends('US')
-            }
-
-            for (const [topic, relatedQueries] of mappedTrendsData) {
-                if (topic && typeof topic === 'string' && topic.trim().length > 0) {
-                    queryTerms.push({
-                        topic: topic.trim(),
-                        related: Array.isArray(relatedQueries) ? relatedQueries.filter((r: any) => typeof r === 'string') : []
-                    })
-                }
-            }
-
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Successfully fetched ${queryTerms.length} search queries`)
-
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error)
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Error fetching trends: ' + errorMessage, 'error')
-
-            if (geoLocale.toUpperCase() !== 'US') {
-                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Falling back to US locale after error', 'warn')
-                return this.getGoogleTrends('US')
-            }
-        }
-
-        return []
-    }
-
-    private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
-        const lines = String(text).split('\n')
-        for (const line of lines) {
-            const trimmed = line.trim()
-            if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-                try {
-                    return JSON.parse(JSON.parse(trimmed)[0][2])[1]
-                } catch {
+                const resp = await axios.request(req as any)
+                const data = resp?.data
+                const children = data?.data?.children
+                if (!Array.isArray(children) || children.length === 0) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-TRENDS-REDDIT', `No items from Reddit endpoint ${url}`, 'warn')
                     continue
                 }
+
+                for (const c of children) {
+                    try {
+                        const d = c?.data
+                        if (!d) continue
+                        // Take title, subreddit and some metadata
+                        const rawTitle = (d.title || '').toString().trim()
+                        if (!rawTitle) continue
+
+                        // Clean up common HTML entities (basic)
+                        const title = rawTitle.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\s+/g, ' ').trim()
+
+                        // Build related suggestions: subreddit, 'discussion', 'review', 'how to'
+                        const subreddit = d.subreddit_name_prefixed || (d.subreddit ? `r/${d.subreddit}` : '')
+                        const related: string[] = []
+                        if (subreddit) related.push(subreddit)
+                        // short variants to help diversify searches
+                        related.push(`${title} discussion`)
+                        related.push(`${title} review`)
+                        // add "how to" only when title suggests tutorial/problem keywords are unlikely
+                        if (title.length < 120) {
+                            related.push(`${title} explained`)
+                        }
+                        // dedupe related
+                        const uniqRelated = Array.from(new Set(related.map(r => (r || '').trim()).filter(Boolean))).slice(0, 4)
+
+                        results.push({ topic: title, related: uniqRelated })
+                    } catch {
+                        // ignore malformed child
+                        continue
+                    }
+                }
+
+                if (results.length) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-TRENDS-REDDIT', `Reddit trends fetched ${results.length} items from ${url}`)
+                    // return moderately sized results, caller will sample
+                    return results
+                }
+            } catch (err) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-TRENDS-REDDIT', `Reddit endpoint ${url} failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                // try next endpoint
             }
         }
-        return null
+
+        // if all failed, return empty array (caller will fallback to local)
+        return []
     }
 
     private async getRelatedTerms(term: string): Promise<string[]> {
@@ -982,7 +958,11 @@ Output only valid JSON array with "topic" and "related" fields.`
         }
     }
 
-    private determineRunSettings(seed?: number): { mode: Mode, diversityLevel: number, contextNotes: string } {
+    /**
+     * Determine run settings.
+     * - weekday biases mode, but we return a pool (modesPool) so per-query mode variation (interleaves) can occur.
+     */
+    private determineRunSettings(seed?: number): { mode: Mode, diversityLevel: number, contextNotes: string, modesPool: Mode[] } {
         const weekday = (new Date()).getDay()
         const rng = this.seededRng(seed ?? this.getRunSeed())
 
@@ -999,19 +979,47 @@ Output only valid JSON array with "topic" and "related" fields.`
         // diversityLevel between 0.1..0.95
         const diversityLevel = Math.max(0.1, Math.min(0.95, (rng() * 0.6) + 0.2 + (configBoost * 0.1)))
 
+        // Build a pool of modes for this run so queries can be interleaved across related modes
+        const allModes: Mode[] = ['balanced', 'relaxed', 'study', 'food', 'gaming', 'news']
+        const modesPool: Mode[] = []
+
+        // Keep primary mode present, then add 1-2 varied modes (weekday/weekend biased)
+        modesPool.push(mode)
+        // Add one complementary mode with some bias
+        if (rng() < 0.6) {
+            const idx = Math.floor(rng() * allModes.length)
+            let choice: Mode = allModes[idx] ?? mode
+            if (choice === mode) {
+                const altIdx = (idx + 1) % allModes.length
+                choice = allModes[altIdx] ?? mode
+            }
+            modesPool.push(choice)
+        }
+        // Occasionally add a third mode to create more interleave diversity
+        if (rng() < 0.25) {
+            const idx = Math.floor(rng() * allModes.length)
+            let choice: Mode = allModes[idx] ?? mode
+            if (modesPool.includes(choice)) {
+                const alt = allModes.find(m => !modesPool.includes(m))
+                choice = (alt || mode)
+            }
+            modesPool.push(choice)
+        }
+
         const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
         const topQueries = (weekday === 0 || weekday === 6) ? ['YouTube', 'Netflix', 'games', 'food delivery', 'weekend plans'] : ['how to', 'best way to', 'tutorial', 'assignment help', 'campus resources']
         const contextNotes = `Auto mode: ${mode}. Day: ${dayNames[weekday]}. Example top query: ${topQueries[Math.floor(rng() * topQueries.length)]}`
 
-        return { mode, diversityLevel, contextNotes }
+        return { mode, diversityLevel, contextNotes, modesPool }
     }
 
     // Diversify queries to reduce repetition and make them feel more "human".
-    private diversifyQueries(input: GoogleSearch[], mode: Mode, weekday: number, rng: () => number, diversityLevel = 0.5): GoogleSearch[] {
+    // Accepts an optional modesPool for per-item mode selection (enables interleaving).
+    private diversifyQueries(input: GoogleSearch[], mode: Mode, weekday: number, rng: () => number, diversityLevel = 0.5, modesPool?: Mode[]): GoogleSearch[] {
         const out: GoogleSearch[] = []
-        const foodExamples = ["McDonald's near me", 'Uber Eats deals', 'cheap pizza near me', 'student meal deals near me', 'KFC coupons']
-        const entertainmentSuffix = ['YouTube', 'best gameplay', 'review', 'trailer']
-        const studySuffix = ['lecture notes', 'past exam', 'Stack Overflow', 'tutorial']
+        const foodExamples = ["McDonald's near me", 'Uber Eats deals', 'cheap pizza near me', 'student meal deals near me', 'Tim Hortons coupons', 'KFC coupons']
+        const entertainmentSuffix = ['YouTube', 'best gameplay', 'review', 'trailer', 'stream']
+        const studySuffix = ['lecture notes', 'past exam', 'Stack Overflow', 'tutorial', 'cheatsheet']
 
         const replaceProbBase = 0.6 * diversityLevel
         const brandAddProbBase = 0.4 * diversityLevel
@@ -1019,38 +1027,69 @@ Output only valid JSON array with "topic" and "related" fields.`
         const weekendBiasBase = 0.35 * diversityLevel
         const relatedAddProbBase = 0.25 * diversityLevel
 
-        for (const item of input) {
+        for (let idx = 0; idx < input.length; idx++) {
+            const item = input[idx]
+            if (!item) continue
             let topic = (item.topic || '').trim()
             if (!topic) continue
 
+            // choose per-item mode: either from modesPool or fall back to global mode
+            const itemMode: Mode = (modesPool && modesPool.length) ? (modesPool[Math.floor(rng() * modesPool.length)] as Mode) : mode
+
+            // Normalize and check against recent topics - attempt variations if we've seen it recently
+            const baseKey = topic.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (Search.recentTopicSet.has(baseKey) && rng() < 0.8) {
+                // try to tweak it: add a suffix, brand, or rewrite up to a few attempts
+                let attempts = 0
+                let tweaked = topic
+                while (attempts < 4 && Search.recentTopicSet.has(tweaked.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+                    attempts++
+                    if (/cheap food/i.test(tweaked) || /cheap meal/i.test(tweaked) || /cheap eats/i.test(tweaked)) {
+                        const choice = foodExamples[Math.floor(rng() * foodExamples.length)]!
+                        tweaked = choice
+                    } else if ((/food near me/i.test(tweaked) || /restaurants near me/i.test(tweaked)) && rng() < brandAddProbBase) {
+                        const brands = ['McDonald\'s', 'Subway', 'Pizza Hut', 'Tim Hortons']
+                        const brandChoice = brands[Math.floor(rng() * brands.length)]!
+                        tweaked = `${tweaked} ${brandChoice}`
+                    } else {
+                        // generic suffix add
+                        if (itemMode === 'relaxed' && rng() < modeTweakProbBase) {
+                            const suffix = entertainmentSuffix[Math.floor(rng() * entertainmentSuffix.length)]
+                            tweaked = `${tweaked} ${suffix}`
+                        } else if (itemMode === 'study' && rng() < (modeTweakProbBase + 0.1)) {
+                            const suffix = studySuffix[Math.floor(rng() * studySuffix.length)]
+                            tweaked = `${tweaked} ${suffix}`
+                        } else {
+                            // try swap words order or add "review" etc.
+                            tweaked = `${tweaked} review`
+                        }
+                    }
+                }
+                topic = tweaked.replace(/\s+/g, ' ').trim()
+            }
+
             // Avoid repetitive generic phrase — replace sometimes
-            if (/cheap food/i.test(topic) || /cheap meal/i.test(topic) || /cheap eats/i.test(topic) || /^cheap food near me$/i.test(topic)) {
+            if (/^cheap food near me$/i.test(topic) || /cheap food/i.test(topic) || /cheap meal/i.test(topic) || /cheap eats/i.test(topic)) {
                 if (rng() < replaceProbBase) {
-                    const idx = Math.floor(rng() * foodExamples.length)
-                    const safeIdx = idx % foodExamples.length
-                    const choice = foodExamples[safeIdx]! // ✅ Safe non-null assertion
-                    topic = choice
+                    const idxChoice = Math.floor(rng() * foodExamples.length)
+                    topic = foodExamples[idxChoice % foodExamples.length]!
                 } else {
                     topic = 'cheap food near me'
                 }
             }
 
-            // If topic is too generic like "food near me" or "restaurants near me", sometimes add brand
-            if ((/food near me/i.test(topic) || /restaurants near me/i.test(topic)) && rng() < brandAddProbBase) {
-                const brands = ['McDonald\'s', 'Subway', 'Pizza Hut', 'Tim Hortons']
-                const bidx = Math.floor(rng() * brands.length)
-                const safeBidx = bidx % brands.length
-                const brandChoice = brands[safeBidx]! // ✅ Safe non-null assertion
-                topic = `${topic} ${brandChoice}`
-            }
-
             // Mode-based tweaks: relaxed -> more YouTube/gaming; study -> more focused study suffix
-            if (mode === 'relaxed' && rng() < modeTweakProbBase) {
+            if (itemMode === 'relaxed' && rng() < modeTweakProbBase) {
                 const suffixIdx = Math.floor(rng() * entertainmentSuffix.length) % entertainmentSuffix.length
                 topic = `${topic} ${entertainmentSuffix[suffixIdx]!}`
-            } else if (mode === 'study' && rng() < (modeTweakProbBase + 0.1)) {
+            } else if (itemMode === 'study' && rng() < (modeTweakProbBase + 0.1)) {
                 const suffixIdx = Math.floor(rng() * studySuffix.length) % studySuffix.length
                 topic = `${topic} ${studySuffix[suffixIdx]!}`
+            } else if (itemMode === 'gaming' && rng() < (modeTweakProbBase + 0.15)) {
+                // gaming specific tweak
+                topic = `${topic} gameplay`
+            } else if (itemMode === 'food' && rng() < (modeTweakProbBase + 0.15)) {
+                topic = `${topic} near campus`
             }
 
             // Weekend bias: more entertainment
@@ -1061,17 +1100,34 @@ Output only valid JSON array with "topic" and "related" fields.`
 
             topic = topic.replace(/\s+/g, ' ').trim()
 
+            // Build related list conservatively
             const related = (item.related || [])
                 .slice(0, 4)
                 .filter(r => typeof r === 'string')
                 .map(r => r.trim())
-                .filter(Boolean) as string[] // Ensure type is string[]
+                .filter(Boolean) as string[]
 
             if (related.length < 2 && rng() < relatedAddProbBase) {
+                // add helpful related
                 related.push(topic + ' review')
             }
 
-            out.push({ topic, related })
+            // final dedupe against per-run output & recent cache
+            const finalKey = topic.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (!Search.recentTopicSet.has(finalKey) && !out.some(o => (o.topic || '').toLowerCase().replace(/[^a-z0-9]/g, '') === finalKey)) {
+                out.push({ topic, related })
+                // tentatively add to recent (but keep order via addToRecentTopics at the end)
+                Search.recentTopicSet.add(finalKey)
+                Search.recentTopicLRU.push(finalKey)
+                // maintain LRU size
+                while (Search.recentTopicLRU.length > Search.RECENT_CACHE_LIMIT) {
+                    const rm = Search.recentTopicLRU.shift()
+                    if (rm) Search.recentTopicSet.delete(rm)
+                }
+            } else {
+                // if duplicate to recent, still push if we have very few items (to avoid zero results); otherwise skip
+                if (out.length < 2) out.push({ topic, related })
+            }
         }
 
         // Deterministic shuffle and dedupe via rng
@@ -1094,6 +1150,29 @@ Output only valid JSON array with "topic" and "related" fields.`
             a[j] = tmp
         }
         return a
+    }
+
+    // add a topic to the recent LRU cache
+    private addToRecentTopics(topic: string) {
+        try {
+            const key = (topic || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (!key) return
+            if (Search.recentTopicSet.has(key)) {
+                // move to back (most recent)
+                const idx = Search.recentTopicLRU.indexOf(key)
+                if (idx >= 0) {
+                    Search.recentTopicLRU.splice(idx, 1)
+                }
+            }
+            Search.recentTopicLRU.push(key)
+            Search.recentTopicSet.add(key)
+            while (Search.recentTopicLRU.length > Search.RECENT_CACHE_LIMIT) {
+                const rm = Search.recentTopicLRU.shift()
+                if (rm) Search.recentTopicSet.delete(rm)
+            }
+        } catch {
+            // swallow
+        }
     }
 }
 
