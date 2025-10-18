@@ -94,33 +94,66 @@ export class Login {
             `button:has-text("Use another account")`,
             `button:has-text("Continue")`,
             `input[type="button"][value="No"]`,
+            // Added for terms update and similar sequential prompts
+            `button:has-text("Next")`,
+            `button:has-text("Yes")`,
+            `button:has-text("Accept")`,
+            `button:has-text("Agree")`,
+            `button:has-text("I accept")`,
+            `button[type="submit"]`,
+            `input[type="submit"]`,
+            `button:has-text("Get started")`,
+            `button:has-text("Let's go")`,
+            `button:has-text("OK")`,
         ];
 
-        for (const sel of tries) {
-            try {
-                const handle = await page.$(sel);
-                if (handle) {
-                    try {
-                        await handle.click();
-                    } catch (e) {
+        let dismissedAny = false;
+        const maxPromptLoops = 10; // Prevent infinite loop, max 10 prompt dismissals
+        let loopCount = 0;
+
+        while (loopCount < maxPromptLoops) {
+            let dismissedThisLoop = false;
+            for (const sel of tries) {
+                try {
+                    const handle = await page.$(sel);
+                    if (handle) {
                         try {
-                            await page.evaluate((s) => {
-                                const el = document.querySelector(s) as HTMLElement | null;
-                                if (el) el.click();
-                            }, sel);
-                        } catch (ee) {
-                            // ignore
+                            await handle.click();
+                            dismissedThisLoop = true;
+                            dismissedAny = true;
+                        } catch (e) {
+                            try {
+                                await page.evaluate((s) => {
+                                    const el = document.querySelector(s) as HTMLElement | null;
+                                    if (el) el.click();
+                                }, sel);
+                                dismissedThisLoop = true;
+                                dismissedAny = true;
+                            } catch (ee) {
+                                // ignore
+                            }
                         }
+                        // Give a short pause for UI changes after each click
+                        await page.waitForTimeout(800);
+                        // Break to re-check all selectors from start in case new prompts appear
+                        break;
                     }
-                    // Give a short pause for UI changes
-                    await page.waitForTimeout(800);
-                    // After dismissing a prompt, wait a randomized long delay to ensure the rewards page has settled.
-                    await this.randomLongWait(page);
-                    // After handling one prompt, continue to check if more prompts appear.
+                } catch (e) {
+                    // ignore and continue
                 }
-            } catch (e) {
-                // ignore and continue
             }
+
+            if (!dismissedThisLoop) {
+                // No more prompts found in this loop, exit
+                break;
+            }
+
+            loopCount++;
+        }
+
+        if (dismissedAny) {
+            // After dismissing any prompt, wait a randomized long delay to ensure the rewards page has settled.
+            await this.randomLongWait(page);
         }
 
         // As a fallback, press Escape if a dialog overlay is detected
@@ -468,7 +501,10 @@ export class Login {
             'button[aria-label="Send code"]',
             '#idDiv_SAOTCS_Proofs',
             'text=/Enter your code/i',
-            'text=/Enter the code we sent/i'
+            'text=/Enter the code we sent/i',
+            'text=Verify your identity',
+            'text=I have a code',
+            'text=Show more verification methods'
         ]
 
         try {
@@ -497,6 +533,14 @@ export class Login {
                     await nextButton.click()
                     await this.bot.utils.wait(1800)
                     this.bot.log(this.bot.isMobile, 'LOGIN', 'Password entered successfully')
+
+                    // Handle potential post-password verification (e.g., email code after password)
+                    await this.bot.utils.wait(3000)
+                    const codeDetectedAfterPw = await this.detectCodeFlow(page, codeFlowSelectors)
+                    if (codeDetectedAfterPw) {
+                        this.bot.log(this.bot.isMobile, 'LOGIN', 'Detected email code verification after password submission')
+                        return await this.handleEmailCodeVerification(page, password)
+                    }
                 } else {
                     this.bot.log(this.bot.isMobile, 'LOGIN', 'Next button not found after password entry', 'warn')
                 }
@@ -579,6 +623,14 @@ export class Login {
                         await nextButton2.click()
                         await this.bot.utils.wait(1800)
                         this.bot.log(this.bot.isMobile, 'LOGIN', 'Password entered successfully (after clicking password-option).')
+
+                        // Handle potential post-password verification (e.g., email code after password)
+                        await this.bot.utils.wait(3000)
+                        const codeDetectedAfterPw = await this.detectCodeFlow(page, codeFlowSelectors)
+                        if (codeDetectedAfterPw) {
+                            this.bot.log(this.bot.isMobile, 'LOGIN', 'Detected email code verification after password submission (post-option)')
+                            return await this.handleEmailCodeVerification(page, password)
+                        }
                     } else {
                         this.bot.log(this.bot.isMobile, 'LOGIN', 'Next button not found after password entry (post password-option click).', 'warn')
                     }
@@ -593,147 +645,9 @@ export class Login {
             // --- existing logic: check code/send-code flow if password path not available ---
             this.bot.log(this.bot.isMobile, 'LOGIN', 'Password field not found - checking for "Get a code to sign in" flow')
 
-            let codeFlowDetected = false
-            for (const sel of codeFlowSelectors) {
-                try {
-                    const loc = page.locator(sel).first()
-                    if (await loc.isVisible().catch(() => false)) {
-                        codeFlowDetected = true
-                        this.bot.log(this.bot.isMobile, 'LOGIN', `Detected code flow using selector: ${sel}`)
-                        break
-                    }
-                } catch { /* ignore */ }
-            }
-
-            if (!codeFlowDetected) {
-                try {
-                    const bigButtons = await page.$$('button')
-                    for (const btn of bigButtons) {
-                        try {
-                            const txt = (await btn.innerText().catch(() => '')).trim().toLowerCase()
-                            if (txt.includes('send code') || txt === 'send' || txt.includes('continue')) {
-                                const visible = await btn.isVisible().catch(() => false)
-                                if (visible) {
-                                    codeFlowDetected = true
-                                    this.bot.log(this.bot.isMobile, 'LOGIN', `Detected code flow by scanning button text: "${txt}"`)
-                                    break
-                                }
-                            }
-                        } catch { /* ignore */ }
-                    }
-                } catch { /* ignore */ }
-            }
-
+            const codeFlowDetected = await this.detectCodeFlow(page, codeFlowSelectors)
             if (codeFlowDetected) {
-                const sendSelectors = [
-                    'button:has-text("Send code")',
-                    'button[aria-label="Send code"]',
-                    'button[data-testid="primaryButton"]',
-                    'button:has-text("Send")',
-                    'button:has-text("Continue")',
-                    'button:has-text("Next")'
-                ]
-
-                let sendClicked = false
-                for (const sel of sendSelectors) {
-                    try {
-                        const btn = await page.waitForSelector(sel, { timeout: 120000 }).catch(() => null)
-                        if (btn) {
-                            await btn.click().catch(() => { })
-                            sendClicked = true
-                            this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked send/confirm button using selector: ${sel}`)
-                            break
-                        }
-                    } catch { /* ignore */ }
-                }
-
-                if (!sendClicked) {
-                    try {
-                        const fallbackBtn = await page.$('button')
-                        if (fallbackBtn && await fallbackBtn.isVisible().catch(() => false)) {
-                            const text = (await fallbackBtn.innerText().catch(() => '')).trim().toLowerCase()
-                            if (text.includes('send') || text.includes('continue')) {
-                                await fallbackBtn.click().catch(() => { })
-                                sendClicked = true
-                                this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked fallback send button with text: "${text}"`)
-                            }
-                        }
-                    } catch { /* ignore */ }
-                }
-
-                const waitMs = (this.bot.config as any)?.emailWaitMs ?? DEFAULT_EMAIL_WAIT_MS
-                if (sendClicked) {
-                    await this.bot.utils.wait(waitMs)
-                } else {
-                    this.bot.log(this.bot.isMobile, 'LOGIN', 'Did not explicitly click a send button but will attempt to fetch code anyway', 'warn')
-                    await this.bot.utils.wait(waitMs)
-                }
-
-                // Wait 3-4 minutes before checking Gmail to allow email delivery
-                const preFetchWait = Math.floor(Math.random() * (MAX_EMAIL_WAIT_BEFORE_FETCH_MS - MIN_EMAIL_WAIT_BEFORE_FETCH_MS + 1)) + MIN_EMAIL_WAIT_BEFORE_FETCH_MS
-                this.bot.log(this.bot.isMobile, 'LOGIN', `Waiting ${Math.round(preFetchWait/60000 * 100)/100} minutes before checking Gmail for the code...`)
-                await this.bot.utils.wait(preFetchWait)
-
-                try {
-                    const code = await this.fetchCodeFromGmail(page, password)
-                    if (code) {
-                        this.bot.log(this.bot.isMobile, 'LOGIN', `Retrieved code from Gmail: ${code}`)
-
-                        const otpFilled = await this.fillOtpInputs(page, code)
-                        if (!otpFilled) {
-                            try {
-                                await page.fill('input[name="otc"], input[type="text"], input[type="tel"]', code).catch(() => { })
-                            } catch { /* ignore */ }
-                        }
-
-                        await page.keyboard.press('Enter').catch(() => { })
-                        await this.bot.utils.wait(3000)
-
-                        // --- explicit checks for OTP rejection / still asking for code ---
-                        const otpErrorSelectors = [
-                            'text=/that code is incorrect/i',
-                            'text=/enter your code/i',
-                            'text=/the code you entered/i',
-                            'text=/check the code and try again/i',
-                            'text=/code.*incorrect/i'
-                        ]
-
-                        for (const sel of otpErrorSelectors) {
-                            try {
-                                if (await page.locator(sel).first().isVisible().catch(() => false)) {
-                                    this.bot.log(this.bot.isMobile, 'LOGIN', `Detected explicit OTP error after submission: ${sel}`, 'warn')
-                                    return false
-                                }
-                            } catch { /* ignore */ }
-                        }
-
-                        const otpInputsPresent = await page.locator('input[name="otc"], input[maxlength="1"], input[type="tel"], input[aria-label*="digit"]').first().isVisible().catch(() => false)
-                        if (otpInputsPresent) {
-                            this.bot.log(this.bot.isMobile, 'LOGIN', 'OTP inputs still present after submission — treating as failure (code rejected or still waiting).', 'warn')
-                            return false
-                        }
-
-                        for (const sel of codeFlowSelectors) {
-                            try {
-                                if (await page.locator(sel).first().isVisible().catch(() => false)) {
-                                    this.bot.log(this.bot.isMobile, 'LOGIN', `After OTP submission, still on code flow (selector present): ${sel}`, 'warn')
-                                    return false
-                                }
-                            } catch { /* ignore */ }
-                        }
-
-                        // If none of the failure signals are present, treat as success
-                        this.bot.log(this.bot.isMobile, 'LOGIN', 'No send-code UI or OTP error detected after submission — treating as successful login.')
-                        return true
-
-                    } else {
-                        this.bot.log(this.bot.isMobile, 'LOGIN', 'Could not retrieve code from Gmail', 'warn')
-                        return false
-                    }
-                } catch (err) {
-                    this.bot.log(this.bot.isMobile, 'LOGIN', `Error fetching code from Gmail: ${err}`, 'error')
-                    return false
-                }
+                return await this.handleEmailCodeVerification(page, password)
             } else {
                 this.bot.log(this.bot.isMobile, 'LOGIN', 'No code flow detected; falling back to standard 2FA handlers')
             }
@@ -783,6 +697,211 @@ export class Login {
 
         } catch (error) {
             this.bot.log(this.bot.isMobile, 'LOGIN', `Password entry failed: ${error}`, 'error')
+            return false
+        }
+    }
+
+    /**
+     * Detects if the page is in email code verification flow.
+     */
+    private async detectCodeFlow(page: Page, codeFlowSelectors: string[]): Promise<boolean> {
+        let codeFlowDetected = false
+        for (const sel of codeFlowSelectors) {
+            try {
+                const loc = page.locator(sel).first()
+                if (await loc.isVisible().catch(() => false)) {
+                    codeFlowDetected = true
+                    this.bot.log(this.bot.isMobile, 'LOGIN', `Detected code flow using selector: ${sel}`)
+                    break
+                }
+            } catch { /* ignore */ }
+        }
+
+        if (!codeFlowDetected) {
+            try {
+                const bigButtons = await page.$$('button')
+                for (const btn of bigButtons) {
+                    try {
+                        const txt = (await btn.innerText().catch(() => '')).trim().toLowerCase()
+                        if (txt.includes('send code') || txt === 'send' || txt.includes('continue')) {
+                            const visible = await btn.isVisible().catch(() => false)
+                            if (visible) {
+                                codeFlowDetected = true
+                                this.bot.log(this.bot.isMobile, 'LOGIN', `Detected code flow by scanning button text: "${txt}"`)
+                                break
+                            }
+                        }
+                    } catch { /* ignore */ }
+                }
+            } catch { /* ignore */ }
+        }
+        return codeFlowDetected
+    }
+
+    /**
+     * Handles the email code verification flow (send code, fetch from Gmail, enter OTP).
+     * Returns true if successful, false otherwise.
+     */
+    private async handleEmailCodeVerification(page: Page, password: string): Promise<boolean> {
+        // First, check if we need to interact with the verification prompt (e.g., click "I have a code" or "Show more")
+        const verificationSelectors = [
+            'text=I have a code',
+            'text=Show more verification methods',
+            'a#signInAnotherWay', // from research
+            'div[data-value="PhoneAppOTP"]' // for TOTP option if available
+        ]
+
+        for (const sel of verificationSelectors) {
+            try {
+                const el = await page.locator(sel).first()
+                if (await el.isVisible().catch(() => false)) {
+                    await el.click().catch(() => {})
+                    this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked verification option: ${sel}`)
+                    await this.bot.utils.wait(1000)
+                }
+            } catch { /* ignore */ }
+        }
+
+        // Now check if OTP input is already visible (code may have been auto-sent)
+        const otpInputSelectors = [
+            'input[name="otc"]',
+            'input#idTxtBx_SAOTCC_OTC', // from research
+            'input[maxlength="1"]', // for multi-digit
+            'input[type="tel"]',
+            'input[aria-label*="digit"]'
+        ]
+
+        let otpInputVisible = false
+        for (const sel of otpInputSelectors) {
+            try {
+                if (await page.locator(sel).first().isVisible().catch(() => false)) {
+                    otpInputVisible = true
+                    break
+                }
+            } catch { /* ignore */ }
+        }
+
+        let sendClicked = false
+        if (!otpInputVisible) {
+            // Try to send the code if input not visible
+            const sendSelectors = [
+                'button:has-text("Send code")',
+                'button[aria-label="Send code"]',
+                'button[data-testid="primaryButton"]',
+                'button:has-text("Send")',
+                'button:has-text("Continue")',
+                'button:has-text("Next")'
+            ]
+
+            for (const sel of sendSelectors) {
+                try {
+                    const btn = await page.waitForSelector(sel, { timeout: 120000 }).catch(() => null)
+                    if (btn) {
+                        await btn.click().catch(() => { })
+                        sendClicked = true
+                        this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked send/confirm button using selector: ${sel}`)
+                        break
+                    }
+                } catch { /* ignore */ }
+            }
+
+            if (!sendClicked) {
+                try {
+                    const fallbackBtn = await page.$('button')
+                    if (fallbackBtn && await fallbackBtn.isVisible().catch(() => false)) {
+                        const text = (await fallbackBtn.innerText().catch(() => '')).trim().toLowerCase()
+                        if (text.includes('send') || text.includes('continue')) {
+                            await fallbackBtn.click().catch(() => { })
+                            sendClicked = true
+                            this.bot.log(this.bot.isMobile, 'LOGIN', `Clicked fallback send button with text: "${text}"`)
+                        }
+                    }
+                } catch { /* ignore */ }
+            }
+        } else {
+            this.bot.log(this.bot.isMobile, 'LOGIN', 'OTP input already visible — assuming code was auto-sent, proceeding to fetch.')
+        }
+
+        const waitMs = (this.bot.config as any)?.emailWaitMs ?? DEFAULT_EMAIL_WAIT_MS
+        if (sendClicked || otpInputVisible) {
+            await this.bot.utils.wait(waitMs)
+        } else {
+            this.bot.log(this.bot.isMobile, 'LOGIN', 'Did not click send or detect OTP input but will attempt to fetch code anyway', 'warn')
+            await this.bot.utils.wait(waitMs)
+        }
+
+        // Wait 3-4 minutes before checking Gmail to allow email delivery
+        const preFetchWait = Math.floor(Math.random() * (MAX_EMAIL_WAIT_BEFORE_FETCH_MS - MIN_EMAIL_WAIT_BEFORE_FETCH_MS + 1)) + MIN_EMAIL_WAIT_BEFORE_FETCH_MS
+        this.bot.log(this.bot.isMobile, 'LOGIN', `Waiting ${Math.round(preFetchWait/60000 * 100)/100} minutes before checking Gmail for the code...`)
+        await this.bot.utils.wait(preFetchWait)
+
+        try {
+            const code = await this.fetchCodeFromGmail(page, password)
+            if (code) {
+                this.bot.log(this.bot.isMobile, 'LOGIN', `Retrieved code from Gmail: ${code}`)
+
+                const otpFilled = await this.fillOtpInputs(page, code)
+                if (!otpFilled) {
+                    try {
+                        await page.fill('input[name="otc"], input[type="text"], input[type="tel"]', code).catch(() => { })
+                    } catch { /* ignore */ }
+                }
+
+                await page.keyboard.press('Enter').catch(() => { })
+                await this.bot.utils.wait(3000)
+
+                // --- explicit checks for OTP rejection / still asking for code ---
+                const otpErrorSelectors = [
+                    'text=/that code is incorrect/i',
+                    'text=/enter your code/i',
+                    'text=/the code you entered/i',
+                    'text=/check the code and try again/i',
+                    'text=/code.*incorrect/i'
+                ]
+
+                for (const sel of otpErrorSelectors) {
+                    try {
+                        if (await page.locator(sel).first().isVisible().catch(() => false)) {
+                            this.bot.log(this.bot.isMobile, 'LOGIN', `Detected explicit OTP error after submission: ${sel}`, 'warn')
+                            return false
+                        }
+                    } catch { /* ignore */ }
+                }
+
+                const otpInputsPresent = await page.locator('input[name="otc"], input[maxlength="1"], input[type="tel"], input[aria-label*="digit"]').first().isVisible().catch(() => false)
+                if (otpInputsPresent) {
+                    this.bot.log(this.bot.isMobile, 'LOGIN', 'OTP inputs still present after submission — treating as failure (code rejected or still waiting).', 'warn')
+                    return false
+                }
+
+                const codeFlowSelectors = [
+                    'text=Get a code to sign in',
+                    'button:has-text("Send code")',
+                    'button:has-text("Send")',
+                    'button[aria-label="Send code"]',
+                    '#idDiv_SAOTCS_Proofs',
+                    'text=/Enter your code/i',
+                    'text=/Enter the code we sent/i'
+                ]
+                for (const sel of codeFlowSelectors) {
+                    try {
+                        if (await page.locator(sel).first().isVisible().catch(() => false)) {
+                            this.bot.log(this.bot.isMobile, 'LOGIN', `After OTP submission, still on code flow (selector present): ${sel}`, 'warn')
+                            return false
+                        }
+                    } catch { /* ignore */ }
+                }
+
+                // If none of the failure signals are present, treat as success
+                this.bot.log(this.bot.isMobile, 'LOGIN', 'No send-code UI or OTP error detected after submission — treating as successful login.')
+                return true
+
+            } else {
+                this.bot.log(this.bot.isMobile, 'LOGIN', 'Could not retrieve code from Gmail', 'warn')
+                return false
+            }
+        } catch (err) {
+            this.bot.log(this.bot.isMobile, 'LOGIN', `Error fetching code from Gmail: ${err}`, 'error')
             return false
         }
     }
@@ -1215,15 +1334,28 @@ export class Login {
         const targetHostname = 'rewards.bing.com'
         const targetPathname = '/'
 
-        while (true) {
+        const maxAttempts = 120; // 120 seconds max (1s per iteration)
+        let attempts = 0;
+
+        while (attempts < maxAttempts) {
             await this.dismissLoginMessages(page)
             // Try dismissing occasional post-login onboarding/welcome modals
             await this.dismissWelcomeModal(page)
+            // Actively handle optional prompts during the wait loop
+            await this.handleOptionalPrompts(page)
 
             const currentURL = new URL(page.url())
             if (currentURL.hostname === targetHostname && currentURL.pathname === targetPathname) {
                 break
             }
+
+            attempts++;
+            await this.bot.utils.wait(1000);
+        }
+
+        if (attempts >= maxAttempts) {
+            this.bot.log(this.bot.isMobile, 'LOGIN', 'Timeout waiting for rewards portal after login attempts', 'error');
+            throw new Error('Login redirect timeout');
         }
 
         await page.waitForSelector('html[data-role-name="RewardsPortal"]', { timeout: 120000 })
@@ -1267,6 +1399,36 @@ export class Login {
                     await page.waitForTimeout(1000);
                     return;
                 }
+            }
+
+            // Handle "Verify your identity" prompt
+            const verifyIdentityDetected = await page.evaluate(() => {
+                const titleText = document.body.textContent || '';
+                return /verify your identity/i.test(titleText);
+            });
+
+            if (verifyIdentityDetected) {
+                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Detected "Verify your identity" prompt');
+                // Try to handle by clicking email option or "I have a code"
+                const verifyOptions = [
+                    'text=Email',
+                    'text=I have a code',
+                    'text=Show more verification methods',
+                    'a#signInAnotherWay'
+                ];
+                for (const sel of verifyOptions) {
+                    try {
+                        const el = await page.locator(sel).first();
+                        if (await el.isVisible().catch(() => false)) {
+                            await el.click({ delay: 50 });
+                            this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', `Clicked verification option: ${sel}`);
+                            await page.waitForTimeout(1000);
+                            break;
+                        }
+                    } catch { /* ignore */ }
+                }
+                // After clicking, the code flow should proceed; let enterPassword handle it
+                return;
             }
 
             // 2. Handle "Keep me signed in" with more precision
@@ -1604,7 +1766,7 @@ export class Login {
         try {
             this.bot.log(this.bot.isMobile, 'LOGIN-BING', 'Verifying Bing login')
             await page.goto('https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F', {
-                    timeout: 120000 // 2 minutes (in milliseconds)
+                timeout: 120000 // 2 minutes (in milliseconds)
             })
 
             const maxIterations = 5
@@ -2129,6 +2291,7 @@ export class Login {
         if (!bodyText || typeof bodyText !== 'string') return null
         const txt = bodyText.replace(/\u00A0/g, ' ').replace(/\r/g, ' ').replace(/\n+/g, '\n')
         const patterns: Array<{ re: RegExp, name: string }> = [
+            { re: /Microsoft\s+verification\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'Microsoft verification code' },
             { re: /your\s+single[-\s]?use\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'your single-use code is' },
             { re: /single[-\s]?use\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'single-use code' },
             { re: /your\s+one[-\s]?time\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'one-time code' },
