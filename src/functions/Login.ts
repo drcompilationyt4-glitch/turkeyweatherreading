@@ -93,13 +93,18 @@ export class Login {
             `button:has-text("Not now")`,
             `button:has-text("Use another account")`,
             `button:has-text("Continue")`,
+            `input[type="button"][value="No"]`,
+            // Added for terms update and similar sequential prompts
             `button:has-text("Next")`,
             `button:has-text("Yes")`,
             `button:has-text("Accept")`,
             `button:has-text("Agree")`,
-            `input[type="button"][value="No"]`,
-            `input[type="button"][value="Next"]`,
-            `input[type="button"][value="Accept"]`,
+            `button:has-text("I accept")`,
+            `button[type="submit"]`,
+            `input[type="submit"]`,
+            `button:has-text("Get started")`,
+            `button:has-text("Let's go")`,
+            `button:has-text("OK")`,
         ];
 
         let dismissedAny = false;
@@ -179,9 +184,6 @@ export class Login {
             await page.goto('https://rewards.bing.com/signin', {
                 timeout: 120000, // 2 minutes (in milliseconds)
             })
-
-            // Dismiss any initial popups/terms before checking login status
-            await this.handleOptionalPrompts(page);
 
             // Disable FIDO support in login request
             await page.route('**/GetCredentialType.srf*', (route) => {
@@ -277,17 +279,11 @@ export class Login {
                     this.bot.log(this.bot.isMobile, 'LOGIN', `Could not navigate current page to signin: ${err}`, 'warn')
                 }
 
-                // Dismiss any initial popups before entering email
-                await this.handleOptionalPrompts(currentPage);
-
                 // Enter email and password/2FA
                 await this.enterEmail(currentPage, email)
                 await this.bot.utils.wait(1200)
                 await this.bot.browser.utils.reloadBadPage(currentPage)
                 await this.bot.utils.wait(1200)
-
-                // Dismiss again after email, in case prompts appear
-                await this.handleOptionalPrompts(currentPage);
 
                 const passResult = await this.enterPassword(currentPage, password)
                 if (passResult) {
@@ -505,7 +501,10 @@ export class Login {
             'button[aria-label="Send code"]',
             '#idDiv_SAOTCS_Proofs',
             'text=/Enter your code/i',
-            'text=/Enter the code we sent/i'
+            'text=/Enter the code we sent/i',
+            'text=Verify your identity',
+            'text=I have a code',
+            'text=Show more verification methods'
         ]
 
         try {
@@ -1432,33 +1431,6 @@ export class Login {
                 return;
             }
 
-            // Handle terms update or privacy prompts
-            const termsPromptDetected = await page.evaluate(() => {
-                const titleText = document.body.textContent || '';
-                return /update|terms|service|agreement|privacy|policy/i.test(titleText);
-            });
-
-            if (termsPromptDetected) {
-                const acceptButtons = [
-                    'button:has-text("Accept")',
-                    'button:has-text("Agree")',
-                    'button:has-text("Next")',
-                    'button:has-text("Continue")',
-                    'button[id="acceptButton"]'
-                ];
-                for (const sel of acceptButtons) {
-                    try {
-                        const btn = await page.locator(sel).first();
-                        if (await btn.isVisible().catch(() => false)) {
-                            await btn.click({ delay: 50 });
-                            this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', `Accepted terms/privacy prompt with: ${sel}`);
-                            await page.waitForTimeout(1000);
-                            return;
-                        }
-                    } catch { /* ignore */ }
-                }
-            }
-
             // 2. Handle "Keep me signed in" with more precision
             const kmsiPromptDetected = await page.evaluate(() => {
                 const titleEl = document.querySelector('[data-testid="title"]');
@@ -1794,7 +1766,7 @@ export class Login {
         try {
             this.bot.log(this.bot.isMobile, 'LOGIN-BING', 'Verifying Bing login')
             await page.goto('https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F', {
-                    timeout: 120000 // 2 minutes (in milliseconds)
+                timeout: 120000 // 2 minutes (in milliseconds)
             })
 
             const maxIterations = 5
@@ -2319,6 +2291,7 @@ export class Login {
         if (!bodyText || typeof bodyText !== 'string') return null
         const txt = bodyText.replace(/\u00A0/g, ' ').replace(/\r/g, ' ').replace(/\n+/g, '\n')
         const patterns: Array<{ re: RegExp, name: string }> = [
+            { re: /Microsoft\s+verification\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'Microsoft verification code' },
             { re: /your\s+single[-\s]?use\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'your single-use code is' },
             { re: /single[-\s]?use\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'single-use code' },
             { re: /your\s+one[-\s]?time\s+code\s*(?:is|:)?\s*[:\-\s]*([0-9]{4,8})/i, name: 'one-time code' },
