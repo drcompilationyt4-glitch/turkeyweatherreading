@@ -26,6 +26,10 @@ export class Search extends Workers {
     private static recentTopicSet: Set<string> = new Set()
     private static RECENT_CACHE_LIMIT = 500
 
+    // Google Trends cache with timestamp
+    private static googleTrendsCache: { queries: GoogleSearch[], timestamp: number, geoLocale: string } | null = null
+    private static TRENDS_CACHE_TTL = 3600000 // 1 hour in milliseconds
+
     public async doSearch(page: Page, data: DashboardData, numSearches?: number) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
 
@@ -60,7 +64,7 @@ export class Search extends Workers {
 
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', `RunID=${runId} mode=${mode} diversity=${diversityLevel.toFixed(2)} pool=${autoSettings.modesPool.join(',')}`)
 
-        // Generate search queries (LLM primary, Trends fill)
+        // Generate search queries (50/50 LLM and Trends)
         const geo = this.bot.config.searchSettings?.useGeoLocaleQueries ? (data?.userProfile?.attributes?.country || 'US') : 'US'
 
         // Pass the run-specific modesPool into query gen so queries can be diversified per-item
@@ -381,7 +385,8 @@ export class Search extends Workers {
     /**
      * Primary entrypoint to obtain queries.
      * Behavior:
-     *  - Configurable LLM / Trends mix
+     *  - 50/50 LLM / Trends mix
+     *  - Google Trends caching with TTL
      *  - Per-run modesPool passed to diversification so queries can vary across interleaves
      */
     private async getSearchQueries(
@@ -392,10 +397,10 @@ export class Search extends Workers {
         runSeed?: number,
         modesPool?: Mode[]
     ): Promise<GoogleSearch[]> {
-        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (LLM primary, Trends fill; local fills missing)`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (50/50 LLM/Trends; local fills missing)`)
 
-        // 75% LLM (rounded up), remaining Trends
-        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 75))
+        // 50% LLM, 50% Trends (changed from 75/25)
+        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 50))
         const llmCount = Math.max(0, Math.ceil(desiredCount * (llmPct / 100)))
         const trendsCount = Math.max(0, desiredCount - llmCount)
 
@@ -426,15 +431,21 @@ export class Search extends Workers {
             }
         }
 
-        // 2) Attempt Trends (only for the number of remaining slots)
+        // 2) Attempt Trends with caching (only for the number of remaining slots)
         let trendsQueries: GoogleSearch[] = []
         if (trendsCount > 0) {
             try {
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsCount})`)
-                const gt = await this.getGoogleTrends(geoLocale)
+                const gt = await this.getCachedGoogleTrends(geoLocale)
                 if (gt.length) {
                     trendsQueries = this.bot.utils.shuffleArray(gt).slice(0, trendsCount)
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google trends returned ${gt.length} items, sampled ${trendsQueries.length}`)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google trends cache returned ${gt.length} items, sampled ${trendsQueries.length}`)
+
+                    // Remove used queries from cache to avoid reuse
+                    if (Search.googleTrendsCache && Search.googleTrendsCache.geoLocale === geoLocale) {
+                        const remainingQueries = gt.filter(item => !trendsQueries.includes(item))
+                        Search.googleTrendsCache.queries = remainingQueries
+                    }
                 } else {
                     throw new Error('No usable Google trends')
                 }
@@ -527,6 +538,35 @@ export class Search extends Workers {
         return normalized.slice(0, desiredCount)
     }
 
+    /**
+     * Get Google Trends with caching - pop from cache if available, otherwise fetch new
+     */
+    private async getCachedGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
+        const now = Date.now()
+
+        // Check if we have valid cached data
+        if (Search.googleTrendsCache &&
+            Search.googleTrendsCache.geoLocale === geoLocale &&
+            (now - Search.googleTrendsCache.timestamp) < Search.TRENDS_CACHE_TTL &&
+            Search.googleTrendsCache.queries.length > 0) {
+
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Using cached Google Trends with ${Search.googleTrendsCache.queries.length} queries remaining`)
+            return [...Search.googleTrendsCache.queries] // Return copy to prevent mutation issues
+        }
+
+        // Cache is empty/expired, fetch new data
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Cache empty/expired, fetching fresh Google Trends data')
+        const freshQueries = await this.getGoogleTrends(geoLocale)
+
+        // Update cache
+        Search.googleTrendsCache = {
+            queries: freshQueries,
+            timestamp: now,
+            geoLocale
+        }
+
+        return freshQueries
+    }
 
     private async getEnhancedLLMQueries(geoLocale: string, count: number, mode: Mode, runSeed?: number): Promise<GoogleSearch[]> {
         const { mode: ctxMode, contextNotes } = this.determineRunSettings(runSeed)
@@ -1091,6 +1131,8 @@ export class Search extends Workers {
     /**
      * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
      * Returns normalized GoogleSearch[]
+     *
+     * FIXED: Better error handling for MiniMax "No content from LLM" issue
      */
     private async generateQueriesWithLLMBatch(
         geoLocale: string,
@@ -1099,7 +1141,6 @@ export class Search extends Workers {
         contextNotes: string = '',
         runSeed?: number
     ): Promise<GoogleSearch[]> {
-        // --- START: Updated to support two OpenRouter API keys and preferred/fallback models ---
         const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
 
@@ -1109,12 +1150,9 @@ export class Search extends Workers {
             throw new Error('OpenRouter API key not configured')
         }
 
-        // Preferred (better but less stable) model and fallback (original) model.
-        // You can override via bot.config.openRouterPreferredModel / openRouterFallbackModel
         const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
-        // Use runSeed to choose examples deterministically
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
         const realisticPatterns = [
             'Instead of generic "cheap food near me", use specific examples like "McDonald\'s delivery promo" or "best sushi near campus"',
@@ -1131,7 +1169,6 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
 
         const userPrompt = `Generate up to ${desiredCount} concise search queries a university undergrad might use.`
 
-        // Build the messages and body template (we'll swap model)
         const baseMessages = [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -1139,7 +1176,7 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
 
         const maxTokens = Math.min(1600, 90 * desiredCount)
 
-        // Helper to send one request with given key+model
+        // Improved request function with better error handling
         const sendOnce = async (apiKey: string, model: string) => {
             const body = {
                 model,
@@ -1153,50 +1190,103 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': 'https://github.com/tourdefrance',
+                    'X-Title': 'TourDeFrance Search Bot'
                 },
                 data: body,
-                timeout: 25000,
-                proxy: false // ensure no proxy
+                timeout: 30000, // Increased timeout
+                proxy: false
             }
 
-            const resp = await axios.request(requestConfig as any)
-            let content: string | undefined
-            const choices = resp?.data?.choices
-            if (Array.isArray(choices) && choices.length) {
-                content = choices[0]?.message?.content || choices[0]?.text
-            } else if (typeof resp?.data === 'string') {
-                content = resp.data
-            } else if (resp?.data?.result?.content) {
-                content = resp.data.result.content
-            }
+            try {
+                const resp = await axios.request(requestConfig as any)
 
-            if (!content) throw new Error('No content from LLM')
-            return content
+                // Better response parsing with more fallbacks
+                let content: string | undefined
+                const choices = resp?.data?.choices
+
+                if (Array.isArray(choices) && choices.length) {
+                    content = choices[0]?.message?.content || choices[0]?.text
+                } else if (typeof resp?.data === 'string') {
+                    content = resp.data
+                } else if (resp?.data?.result?.content) {
+                    content = resp.data.result.content
+                } else if (resp?.data?.content) {
+                    content = resp.data.content
+                }
+
+                if (!content || content.trim().length === 0) {
+                    throw new Error('No content from LLM (empty response)')
+                }
+                return content
+            } catch (error: any) {
+                // More specific error handling
+                if (error.response) {
+                    const status = error.response.status
+                    const data = error.response.data
+                    throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
+                } else if (error.code === 'ECONNABORTED') {
+                    throw new Error('Request timeout')
+                } else if (error.message.includes('No content')) {
+                    throw error // Re-throw our specific error
+                } else {
+                    throw new Error(`Request failed: ${error.message}`)
+                }
+            }
         }
 
-        // Sequence: preferredModel with key1, preferredModel with key2, fallbackModel with key1, fallbackModel with key2
+        // Try preferred model with both keys
         let lastErr: any = null
         for (const key of keys) {
             try {
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} with one of the API keys`)
                 const content = await sendOnce(key, preferredModel)
-                // parse & normalize result (same logic as before)
+
+                // Improved parsing with better error recovery
                 let parsed: any
+
                 try {
+                    // First try direct JSON parse
                     parsed = JSON.parse(String(content))
                 } catch (e) {
-                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
-                    parsed = JSON.parse(trimmed)
+                    // If that fails, try to extract JSON from markdown code blocks
+                    const trimmed = String(content)
+                        .replace(/```json\s*/g, '')
+                        .replace(/```\s*/g, '')
+                        .replace(/^\[/, '[') // Ensure it starts properly
+                        .trim()
+
+                    try {
+                        parsed = JSON.parse(trimmed)
+                    } catch (e2) {
+                        // If still failing, try to find JSON array in the text
+                        const jsonMatch = String(content).match(/\[[\s\S]*\]/)
+                        if (jsonMatch) {
+                            try {
+                                parsed = JSON.parse(jsonMatch[0])
+                            } catch (e3) {
+                                throw new Error('Failed to parse LLM response as JSON after multiple attempts')
+                            }
+                        } else {
+                            throw new Error('No JSON array found in LLM response')
+                        }
+                    }
                 }
 
-                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+                if (!Array.isArray(parsed)) {
+                    throw new Error('LLM returned non-array JSON')
+                }
 
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
                     const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
                     const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-                    return { topic, related }
+                    return { topic: topic.trim(), related }
                 }).filter(x => x.topic && x.topic.length > 1)
+
+                if (normalized.length === 0) {
+                    throw new Error('LLM returned empty or invalid queries after normalization')
+                }
 
                 return normalized
             } catch (err) {
@@ -1211,59 +1301,51 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
             try {
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} with one of the API keys`)
                 const content = await sendOnce(key, fallbackModel)
-                // parse & normalize result (same logic as before)
+
+                // Same improved parsing logic
                 let parsed: any
                 try {
                     parsed = JSON.parse(String(content))
                 } catch (e) {
-                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
+                    const trimmed = String(content)
+                        .replace(/```json\s*/g, '')
+                        .replace(/```\s*/g, '')
+                        .trim()
                     parsed = JSON.parse(trimmed)
                 }
 
-                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+                if (!Array.isArray(parsed)) {
+                    throw new Error('LLM returned non-array JSON')
+                }
 
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
                     const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
                     const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-                    return { topic, related }
+                    return { topic: topic.trim(), related }
                 }).filter(x => x.topic && x.topic.length > 1)
+
+                if (normalized.length === 0) {
+                    throw new Error('LLM returned empty or invalid queries after normalization')
+                }
 
                 return normalized
             } catch (err) {
                 lastErr = err
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model attempt with a key failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
-                // try next key
             }
         }
 
         this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All OpenRouter attempts failed, throwing to allow fallback', 'error')
         throw lastErr || new Error('LLM failed')
-        // --- END: Updated ---
     }
-
-    // private getRepetitivePatternsWarning(rng?: () => number): string {
-    //     const warnings = [
-    //         '"cheap food near me" → use specific examples like "Chipotle catering options" or "best sushi in [city]"',
-    //         '"how to" → vary with "tips for", "guide to", "best way to", or just the topic itself',
-    //         'Always include natural location context when relevant (e.g., "near campus", "downtown", "in [city]")',
-    //         'Mix question format and direct search terms for diversity'
-    //     ];
-    //
-    //     if (!warnings.length) return ''
-    //
-    //     const idx = typeof rng === 'function'
-    //         ? Math.floor(Math.max(0, Math.min(0.999999, rng())) * warnings.length)
-    //         : Math.floor(Math.random() * warnings.length)
-    //
-    //     return (warnings[idx] ?? warnings[0]) as string
-    // }
 
     /**
      * Single-query LLM generation (used in per-search mode or per-search fallback).
      * Returns single string or null.
+     *
+     * FIXED: Better error handling for MiniMax "No content from LLM" issue
      */
     private async generateSingleQueryFromLLM(geoLocale: string = 'US', mode: Mode = 'balanced'): Promise<string | null> {
-        // --- START: Updated to support two API keys + preferred/fallback model sequence ---
         const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
         const keys = [envKey1, envKey2].filter(k => !!k)
@@ -1272,7 +1354,7 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
         const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
-        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string. Mode hint: ${mode}.`
+        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might use. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string. Mode hint: ${mode}.`
         const userPrompt = `Provide a single concise search query a university undergrad might use.`
 
         const makeBody = (model: string) => ({
@@ -1291,16 +1373,22 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': 'https://github.com/tourdefrance',
+                    'X-Title': 'TourDeFrance Search Bot'
                 },
                 data: makeBody(model),
-                timeout: 15000,
+                timeout: 20000,
                 proxy: false
             }
+
             const resp = await axios.request(requestConfig as any)
             const choices = resp?.data?.choices
             let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
-            if (!rawContent) throw new Error('No content from LLM')
+
+            if (!rawContent || String(rawContent).trim().length === 0) {
+                throw new Error('No content from LLM (empty response)')
+            }
             return String(rawContent)
         }
 
@@ -1340,7 +1428,6 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
         }
 
         throw lastErr || new Error('LLM single-query failed')
-        // --- END: Updated ---
     }
 }
 
