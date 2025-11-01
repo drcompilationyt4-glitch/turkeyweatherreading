@@ -1,10 +1,10 @@
+// src/Workers.ts
 import { Page } from 'rebrowser-playwright'
 import { DashboardData, MorePromotion, PromotionalItem, PunchCard } from '../interface/DashboardData'
 import { MicrosoftRewardsBot } from '../index'
 import JobState from '../util/JobState'
 import { AdaptiveThrottler } from '../util/AdaptiveThrottler'
 
-// Common interface for shared properties
 interface BaseActivity {
     title: string;
     offerId?: string;
@@ -22,31 +22,25 @@ export class Workers {
 
     constructor(bot: MicrosoftRewardsBot) {
         if (!bot) throw new Error('Workers requires a bot instance')
-
         this.bot = bot
 
-        // Defensive: ensure config exists before passing to JobState
-        const cfg = (this.bot && (this.bot as any).config) ? (this.bot as any).config : { sessionPath: '.' }
+        // Defensive JobState init (it might not exist or fail)
         try {
-            this.jobState = new JobState(cfg)
+            this.jobState = new JobState(this.bot.config)
         } catch (err) {
-            // If JobState fails to initialize for any reason, keep going but null it out
             this.jobState = null
-            this.bot?.log?.(this.bot?.isMobile, 'WORKERS', `JobState initialization failed: ${err instanceof Error ? err.message : err}`, 'warn')
+            this.bot?.log?.(this.bot?.isMobile, 'WORKERS', `JobState init failed: ${err instanceof Error ? err.message : err}`, 'warn')
         }
 
-        // Bind public methods so they keep `this` when used as callbacks
+        // bind commonly passed methods to preserve `this` when used as callbacks
         this.doDailySet = this.doDailySet.bind(this)
         this.doPunchCard = this.doPunchCard.bind(this)
         this.doMorePromotions = this.doMorePromotions.bind(this)
         this.solveActivities = this.solveActivities.bind(this)
-        this.tryCompleteAll = this.tryCompleteAll.bind(this)
-        this.ensureSelectorVisible = this.ensureSelectorVisible.bind(this)
-        this.findAndScrollToSelector = this.findAndScrollToSelector.bind(this)
     }
 
     /* =========================
-       Utility helpers
+       JobState helpers
        ========================= */
 
     private isJobStateEnabled(): boolean {
@@ -78,7 +72,7 @@ export class Workers {
     }
 
     /* =========================
-       Selector builders, overlays, and human utilities
+       Selector builders & overlays
        ========================= */
 
     private async buildSelectorsForActivity(page: Page, activity: BaseActivity, punchCard?: PunchCard): Promise<string[]> {
@@ -148,6 +142,7 @@ export class Workers {
             }
         }
 
+        // generic fallbacks
         candidates.push('.pointLink:not(.contentContainer .pointLink)')
         candidates.push('.pointLink')
         candidates.push('a:not(.contentContainer a)')
@@ -180,9 +175,7 @@ export class Workers {
                         el.setAttribute('data-qa-hidden-temp', 'true')
                         el.style.setProperty('display', 'none', 'important')
                         hidden++
-                    } catch {
-                        // ignore element-level errors
-                    }
+                    } catch { /* ignore per-element errors */ }
                 }
                 return hidden
             }, selector)
@@ -208,11 +201,14 @@ export class Workers {
         }
     }
 
+    /* =========================
+       Humanization helpers
+       ========================= */
+
     private async humanMouseMove(page: Page, selector: string): Promise<void> {
         try {
             const handle = await page.$(selector)
             if (!handle) return
-
             const box = await handle.boundingBox()
             if (!box) return
 
@@ -267,9 +263,7 @@ export class Workers {
             const scrollAmount = viewportHeight * (0.5 + Math.random() * 0.5)
             const direction = Math.random() > 0.5 ? 1 : -1
             await page.evaluate((amount) => window.scrollBy(0, amount), scrollAmount * direction)
-
             await this.bot.utils.wait(300 + Math.random() * 700)
-
             if (Math.random() < 0.3) {
                 await page.evaluate((amount) => window.scrollBy(0, amount), -scrollAmount * direction * 0.2)
                 await this.bot.utils.wait(100 + Math.random() * 200)
@@ -277,13 +271,10 @@ export class Workers {
         } catch { /* ignore */ }
     }
 
-    /**
-     * Ensure selector is visible by:
-     *  - trying el.scrollIntoView()
-     *  - scrolling the nearest scrollable parent if present
-     *  - progressively scrolling the window to trigger lazy-load
-     *  - reloading near the end if required
-     */
+    /* =========================
+       Visibility & scroll helpers
+       ========================= */
+
     private async ensureSelectorVisible(page: Page, selector: string, maxTries = 4): Promise<void> {
         for (let attempt = 1; attempt <= maxTries; attempt++) {
             try {
@@ -342,13 +333,8 @@ export class Workers {
         this.bot.log(this.bot.isMobile, 'ACTIVITY', `ensureSelectorVisible: selector "${selector}" not visible after ${maxTries} tries`, 'log')
     }
 
-    /**
-     * Aggressively scroll the page progressively until locator matches count>0.
-     * Returns true if selector was found and scrolled into view.
-     */
     private async findAndScrollToSelector(page: Page, selector: string, maxSteps = 20): Promise<boolean> {
         try {
-            // quick check before heavy scrolling
             let count = await page.locator(selector).count().catch(() => 0)
             if (count > 0) {
                 await page.locator(selector).first().scrollIntoViewIfNeeded().catch(() => {})
@@ -359,34 +345,25 @@ export class Workers {
             const step = Math.max(200, Math.floor(viewport.height * 0.6))
             let prevScroll = -1
             for (let i = 0; i < maxSteps; i++) {
-                // scroll down by step
                 await page.evaluate((s) => window.scrollBy(0, s), step).catch(() => {})
                 await this.bot.utils.waitRandom(250, 700)
-
                 count = await page.locator(selector).count().catch(() => 0)
                 if (count > 0) {
                     await page.locator(selector).first().scrollIntoViewIfNeeded().catch(() => {})
                     await this.bot.utils.waitRandom(200, 500)
                     return true
                 }
-
-                // if at bottom, break early
                 const pos = await page.evaluate(() => ({ y: window.scrollY, max: document.documentElement.scrollHeight - window.innerHeight }))
                 if (pos && typeof pos.y === 'number' && typeof pos.max === 'number' && pos.y >= pos.max - 2) break
-
-                // slight random small scroll up occasionally to trigger lazy loads
                 if (i % 3 === 2) {
                     await page.evaluate((s) => window.scrollBy(0, -Math.floor(s / 4)), step).catch(() => {})
                     await this.bot.utils.waitRandom(150, 400)
                 }
-
-                // safety: if no progress in scroll position, break
                 const curr = await page.evaluate(() => window.scrollY).catch(() => 0)
                 if (curr === prevScroll) break
                 prevScroll = curr
             }
 
-            // final attempt: scroll to bottom and re-check
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {})
             await this.bot.utils.waitRandom(500, 900)
             const finalCount = await page.locator(selector).count().catch(() => 0)
@@ -401,9 +378,10 @@ export class Workers {
         return false
     }
 
-    /**
-     * robustTryClickSelector default attempts reduced to 2 (per your request).
-     */
+    /* =========================
+       Robust click helper (used by solveActivities)
+       ========================= */
+
     private async robustTryClickSelector(page: Page, selector: string, maxAttempts = 2, perAttemptTimeout = 10000): Promise<{ success: boolean; reason?: string; popup?: Page }> {
         const context = page.context ? page.context() : null
 
@@ -411,13 +389,8 @@ export class Workers {
             await this.bot.utils.waitRandom(300, 900)
 
             // ensure selector is present/visible - try to find and scroll to it first
-            try {
-                await this.findAndScrollToSelector(page, sel, 12)
-            } catch { /* continue */ }
-
-            try {
-                await page.waitForSelector(sel, { state: 'attached', timeout: Math.min(2000, timeout) + Math.random() * 500 }).catch(() => {})
-            } catch { /* continue */ }
+            try { await this.findAndScrollToSelector(page, sel, 12) } catch { /* continue */ }
+            try { await page.waitForSelector(sel, { state: 'attached', timeout: Math.min(2000, timeout) + Math.random() * 500 }).catch(() => {}) } catch { /* continue */ }
 
             try {
                 const handle = await page.$(sel)
@@ -503,9 +476,7 @@ export class Workers {
             }
 
             await this.bot.utils.waitRandom(200, 600)
-            try {
-                await this.restoreHiddenOverlays(page)
-            } catch { /* ignore */ }
+            try { await this.restoreHiddenOverlays(page) } catch { /* ignore */ }
 
             if (!clickedOk) {
                 try {
@@ -521,14 +492,11 @@ export class Workers {
             const nav = await navPromise
 
             if (popup) {
-                try {
-                    await popup.waitForLoadState('domcontentloaded', { timeout: 10000 + Math.random() * 2000 })
-                } catch {}
+                try { await popup.waitForLoadState('domcontentloaded', { timeout: 10000 + Math.random() * 2000 }) } catch {}
                 return { success: true, popup }
             }
 
             if (nav) return { success: true }
-
             return { success: true }
         }
 
@@ -547,25 +515,21 @@ export class Workers {
     }
 
     /* =========================
-       Bounded re-run helper (hard-coded: 2 passes, no config)
+       Bounded re-run helper (2 passes)
        ========================= */
 
     private async tryCompleteAll(page: Page, activities: BaseActivity[], punchCard?: PunchCard): Promise<{ completedOfferIds: string[], remainingActivities: BaseActivity[] }> {
-        const maxPasses = 2 // hard-coded per your request
-        const giveUp = false  // do NOT mark remaining as done automatically
+        const maxPasses = 2
+        const giveUp = false
         let remaining = [...activities]
         const completedSet = new Set<string>()
 
         for (let pass = 1; pass <= maxPasses && remaining.length > 0; pass++) {
             this.bot.log(this.bot.isMobile, 'WORKERS', `Attempt pass ${pass} to complete ${remaining.length} remaining activities`, 'log')
-            const completedThisPass = await this.solveActivities(page, remaining, punchCard)
+            const completedThisPass = await this.solveActivities(page, remaining as any, punchCard)
             for (const id of completedThisPass) completedSet.add(id)
-
-            // filter out completed items
             remaining = remaining.filter(a => !(a.offerId && completedSet.has(a.offerId)))
-
             if (remaining.length > 0 && pass < maxPasses) {
-                // small randomized delay before next pass
                 await this.bot.utils.waitRandom(800, 1800)
             }
         }
@@ -593,7 +557,7 @@ export class Workers {
     }
 
     /* =========================
-       Public flows (DailySet / PunchCard / MorePromotions)
+       Public flows
        ========================= */
 
     async doDailySet(page: Page, data: DashboardData, maxActivities?: number) {
@@ -614,13 +578,11 @@ export class Workers {
         this.bot.log(this.bot.isMobile, 'DAILY-SET',
             `Started solving "Daily Set" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
 
-        const activitiesToProcess = maxActivities ?
-            activitiesUncompleted.slice(0, maxActivities) :
-            activitiesUncompleted
+        const activitiesToProcess = maxActivities ? activitiesUncompleted.slice(0, maxActivities) : activitiesUncompleted
 
-        // Use bounded re-run helper (2 passes hard-coded)
         const { completedOfferIds, remainingActivities } = await this.tryCompleteAll(page, activitiesToProcess, undefined)
         this.bot.log(this.bot.isMobile, 'WORKERS', `remainingActivities: ${remainingActivities.map(a => a.title).join(', ')}`, 'log')
+
         if (this.isJobStateEnabled() && !maxActivities && completedOfferIds.length) {
             const email = this.bot.currentAccountEmail || 'unknown'
             for (const offerId of completedOfferIds) {
@@ -652,7 +614,6 @@ export class Workers {
 
     async doPunchCard(page: Page, data: DashboardData, maxActivities?: number) {
         const punchCardsUncompleted = data.punchCards?.filter(x => x.parentPromotion && !x.parentPromotion.complete) ?? []
-
         if (!punchCardsUncompleted.length) {
             this.bot.log(this.bot.isMobile, 'PUNCH-CARD', 'All "Punch Cards" have already been completed')
             return
@@ -668,19 +629,15 @@ export class Workers {
             }
 
             page = await this.bot.browser.utils.getLatestTab(page)
-
             const activitiesUncompleted = punchCard.childPromotions.filter(x => !x.complete)
-
             this.bot.log(this.bot.isMobile, 'PUNCH-CARD',
                 `Started solving "Punch Card" items for punchcard: "${punchCard.parentPromotion.title}"`)
 
             await page.goto(punchCard.parentPromotion.destinationUrl, { referer: this.bot.config.baseURL, timeout: 120000 + Math.random() * 20000 })
             await page.waitForLoadState('networkidle', { timeout: 5000 + Math.random() * 3000 }).catch(() => {})
 
-            // Use bounded re-run helper; pass punchCard to allow derived selector usage inside solveActivities
             const { completedOfferIds, remainingActivities } = await this.tryCompleteAll(page, activitiesUncompleted, punchCard)
 
-            // mark jobState for items that actually completed
             if (this.isJobStateEnabled() && !maxActivities && completedOfferIds.length) {
                 const email = this.bot.currentAccountEmail || 'unknown'
                 const today = this.bot.utils.getFormattedDate()
@@ -692,7 +649,6 @@ export class Workers {
 
             page = await this.bot.browser.utils.getLatestTab(page)
             const pages = page.context().pages()
-
             if (pages.length > 3) {
                 await page.close()
             } else {
@@ -702,10 +658,7 @@ export class Workers {
             this.bot.log(this.bot.isMobile, 'PUNCH-CARD',
                 `Completed items for punchcard: "${punchCard.parentPromotion.title}" (completed ${completedOfferIds.length}, remaining ${remainingActivities.length})`)
             totalProcessed++
-
-            if (maxActivities && totalProcessed >= maxActivities) {
-                break
-            }
+            if (maxActivities && totalProcessed >= maxActivities) break
         }
 
         if (maxActivities && totalProcessed < punchCardsUncompleted.length) {
@@ -718,10 +671,7 @@ export class Workers {
 
     async doMorePromotions(page: Page, data: DashboardData, maxActivities?: number) {
         const morePromotions = data.morePromotions ?? []
-
-        if (data.promotionalItem) {
-            morePromotions.push(data.promotionalItem as unknown as MorePromotion)
-        }
+        if (data.promotionalItem) morePromotions.push(data.promotionalItem as unknown as MorePromotion)
 
         const activitiesUncompleted = morePromotions
             ?.filter(x => !x.complete && x.pointProgressMax > 0 && x.exclusiveLockedFeatureStatus !== 'locked')
@@ -735,12 +685,9 @@ export class Workers {
         this.bot.log(this.bot.isMobile, 'MORE-PROMOTIONS',
             `Started solving "More Promotions" items${maxActivities ? ` (max ${maxActivities} this run)` : ''}`)
 
-        const activitiesToProcess = maxActivities ?
-            activitiesUncompleted.slice(0, maxActivities) :
-            activitiesUncompleted
+        const activitiesToProcess = maxActivities ? activitiesUncompleted.slice(0, maxActivities) : activitiesUncompleted
 
         page = await this.bot.browser.utils.getLatestTab(page)
-        // use bounded re-run helper (2 passes)
         const { completedOfferIds, remainingActivities } = await this.tryCompleteAll(page, activitiesToProcess, undefined)
         page = await this.bot.browser.utils.getLatestTab(page)
         await this.bot.browser.func.goHome(page)
@@ -769,100 +716,91 @@ export class Workers {
 
     /**
      * solveActivities returns an array of offerIds that actually completed successfully.
-     * Activity-run attempts limited to 2 attempts per activity (no heavy retry).
+     * This is the merged, robust implementation.
      */
-    public async solveActivities(activityPage: Page, activities: BaseActivity[], punchCard?: PunchCard, maxActivities?: number): Promise<string[]> {
-        const activityInitial = activityPage.url();
+    public async solveActivities(activityPage: Page, activities: BaseActivity[] | PromotionalItem[] | MorePromotion[], punchCard?: PunchCard, maxActivities?: number): Promise<string[]> {
+        const activityInitial = activityPage.url()
+        const throttle = new AdaptiveThrottler()
 
-        // still keep adaptive throttler
-        const throttle = new AdaptiveThrottler();
-
-        let activitiesToProcess = [...activities].sort(() => Math.random() - 0.5);
+        let activitiesToProcess = [...activities].sort(() => Math.random() - 0.5)
         if (maxActivities && maxActivities > 0) {
-            activitiesToProcess = activitiesToProcess.slice(0, maxActivities);
-            this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                `Processing ${activitiesToProcess.length} of ${activities.length} activities this iteration`);
+            activitiesToProcess = activitiesToProcess.slice(0, maxActivities)
+            this.bot.log(this.bot.isMobile, 'ACTIVITY', `Processing ${activitiesToProcess.length} of ${activities.length} activities this iteration`)
         }
 
-        let processedCount = 0;
-        const completedOfferIds: string[] = [];
+        let processedCount = 0
+        const completedOfferIds: string[] = []
 
         for (const activity of activitiesToProcess) {
-            processedCount++;
+            processedCount++
             try {
-                activityPage = await this.bot.browser.utils.getLatestTab(activityPage);
-
-                const pages = activityPage.context().pages();
+                activityPage = await this.bot.browser.utils.getLatestTab(activityPage)
+                const pages = activityPage.context().pages()
                 if (pages.length > 3) {
-                    await activityPage.close();
-                    activityPage = await this.bot.browser.utils.getLatestTab(activityPage);
+                    await activityPage.close()
+                    activityPage = await this.bot.browser.utils.getLatestTab(activityPage)
                 }
 
-                await this.bot.browser.utils.humanizePage(activityPage);
-                const m1 = throttle.getDelayMultiplier();
-                await this.bot.utils.waitRandom(Math.floor(700 * m1), Math.floor(1300 * m1));
+                await this.bot.browser.utils.humanizePage(activityPage)
+                const m1 = throttle.getDelayMultiplier()
+                await this.bot.utils.waitRandom(Math.floor(700 * m1), Math.floor(1300 * m1))
 
                 if (activityPage.url() !== activityInitial) {
-                    await activityPage.goto(activityInitial, { timeout: 30000 + Math.random() * 10000 }).catch(() => {});
-                    await this.bot.utils.waitRandom(800, 2000);
+                    await activityPage.goto(activityInitial, { timeout: 30000 + Math.random() * 10000 }).catch(() => {})
+                    await this.bot.utils.waitRandom(800, 2000)
                 }
 
                 for (let i = 0; i < Math.floor(1 + Math.random() * 2); i++) {
-                    await this.humanScroll(activityPage);
-                    await this.bot.utils.waitRandom(400, 1200);
+                    await this.humanScroll(activityPage)
+                    await this.bot.utils.waitRandom(400, 1200)
                 }
 
-                let selectors: string[] = [];
+                let selectors: string[] = []
                 if (punchCard) {
                     try {
-                        const derived = await this.bot.browser.func.getPunchCardActivity(activityPage, activity as PromotionalItem);
-                        if (derived) selectors.push(derived);
+                        const derived = await this.bot.browser.func.getPunchCardActivity(activityPage, activity as PromotionalItem)
+                        if (derived) selectors.push(derived)
                     } catch { /* ignore */ }
                 }
 
-                const built = await this.buildSelectorsForActivity(activityPage, activity, punchCard);
-                selectors = selectors.concat(built);
-                selectors = Array.from(new Set(selectors)).filter(Boolean);
+                const built = await this.buildSelectorsForActivity(activityPage, activity as BaseActivity, punchCard)
+                selectors = selectors.concat(built)
+                selectors = Array.from(new Set(selectors)).filter(Boolean)
 
-                await activityPage.waitForLoadState('networkidle', { timeout: 5000 + Math.random() * 2000 }).catch(() => {});
-                await this.bot.utils.wait(800 + Math.random() * 800);
+                await activityPage.waitForLoadState('networkidle', { timeout: 5000 + Math.random() * 2000 }).catch(() => {})
+                await this.bot.utils.waitRandom(800, 1600)
 
-                // diagnostic: log counts using locator.count() (safe)
                 for (const sel of selectors) {
                     try {
                         const count = await activityPage.locator(sel).count().catch(() => 0)
-                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Selector "${sel}" matches ${count} elements`, 'log');
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Selector "${sel}" matches ${count} elements`, 'log')
                     } catch {
-                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Selector "${sel}" count failed`, 'log');
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Selector "${sel}" count failed`, 'log')
                     }
                 }
 
-                let clickedResult: { success: boolean; reason?: string; popup?: Page } | null = null;
-                const maxCandidatesToTry = 6;
-                let candidateCount = 0;
+                let clickedResult: { success: boolean; reason?: string; popup?: Page } | null = null
+                const maxCandidatesToTry = 6
+                let candidateCount = 0
 
                 for (const sel of selectors) {
-                    if (candidateCount >= maxCandidatesToTry) break;
-                    candidateCount++;
+                    if (candidateCount >= maxCandidatesToTry) break
+                    candidateCount++
 
-                    // aggressively find by scrolling page until selector appears
                     const found = await this.findAndScrollToSelector(activityPage, sel, 18)
                     if (!found) {
                         this.bot.log(this.bot.isMobile, 'ACTIVITY', `Selector "${sel}" not found after scrolling`, 'log')
                     }
 
-                    await this.humanHover(activityPage, sel);
+                    await this.humanHover(activityPage, sel)
 
-                    // use at most 2 click attempts
-                    const res = await this.robustTryClickSelector(activityPage, sel, 2, 10000);
+                    const res = await this.robustTryClickSelector(activityPage, sel, 2, 10000)
                     if (res.success) {
-                        clickedResult = res;
-                        break;
+                        clickedResult = res
+                        break
                     } else {
-                        this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                            `Could not click selector "${sel}" for "${activity.title}" | reason: ${res.reason}`, 'warn');
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Could not click selector "${sel}" for "${(activity as any).title}" | reason: ${res.reason}`, 'warn')
 
-                        // fallback to container selectors (2 attempts)
                         try {
                             if (sel.includes('.pointLink') || sel.includes('[data-bi-id')) {
                                 const containerSelMatch = sel.match(/^\s*([^\s\.]+?\[data-bi-id[^\]]+\][^\s]*)/i)
@@ -880,7 +818,7 @@ export class Workers {
                                         break
                                     } else {
                                         this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                                            `Fallback container click also failed "${containerSel}" for "${activity.title}" | reason: ${res2.reason}`, 'warn')
+                                            `Fallback container click also failed "${containerSel}" for "${(activity as any).title}" | reason: ${res2.reason}`, 'warn')
                                     }
                                 }
                             }
@@ -890,32 +828,29 @@ export class Workers {
 
                 if (!clickedResult || !clickedResult.success) {
                     this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                        `Skipped activity "${activity.title}" | Reason: Could not click any selectors (tried ${candidateCount})`, 'warn');
-                    await this.bot.utils.wait(400 + Math.random() * 400);
-                    throttle.record(false);
-                    continue;
+                        `Skipped activity "${(activity as any).title}" | Reason: Could not click any selectors (tried ${candidateCount})`, 'warn')
+                    await this.bot.utils.wait(400 + Math.random() * 400)
+                    throttle.record(false)
+                    continue
                 }
 
                 if (clickedResult.popup) {
-                    activityPage = clickedResult.popup;
-                    await this.bot.utils.wait(this.bot.utils.randomNumber(900, 2000) + Math.random() * 800);
+                    activityPage = clickedResult.popup
+                    await this.bot.utils.wait(this.bot.utils.randomNumber(900, 2000) + Math.random() * 800)
                 } else {
-                    activityPage = await this.bot.browser.utils.getLatestTab(activityPage);
-                    await this.bot.utils.wait(800 + Math.random() * 900);
+                    activityPage = await this.bot.browser.utils.getLatestTab(activityPage)
+                    await this.bot.utils.wait(800 + Math.random() * 900)
                 }
 
-                await this.bot.utils.waitRandom(700, 1600);
-                if (Math.random() < 0.7) await this.humanScroll(activityPage);
+                await this.bot.utils.waitRandom(700, 1600)
+                if (Math.random() < 0.7) await this.humanScroll(activityPage)
 
-                const typeLabel = this.bot.activities?.getTypeLabel ?
-                    this.bot.activities.getTypeLabel(activity as PromotionalItem | MorePromotion) :
-                    activity.promotionType || 'unknown';
+                const typeLabel = this.bot.activities?.getTypeLabel ? this.bot.activities.getTypeLabel(activity as PromotionalItem | MorePromotion) : (activity as any).promotionType || 'unknown'
 
                 if (typeLabel !== 'Unsupported') {
                     this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                        `Processing activity ${processedCount}/${activitiesToProcess.length}: "${typeLabel}" - "${activity.title}"`);
+                        `Processing activity ${processedCount}/${activitiesToProcess.length}: "${typeLabel}" - "${(activity as any).title}"`)
 
-                    // limit activity.run attempts to 2
                     let succeeded = false
                     for (let attempt = 1; attempt <= 2 && !succeeded; attempt++) {
                         try {
@@ -928,39 +863,37 @@ export class Workers {
                             throttle.record(true)
                             succeeded = true
                         } catch (e) {
-                            await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_timeout_${activity.title || activity.offerId || 'unknown'}`)
+                            await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_timeout_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
                             throttle.record(false)
                             if (attempt < 2) {
                                 await this.bot.utils.waitRandom(500, 1200)
                             } else {
-                                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Activity "${activity.title}" failed after 2 attempts: ${e instanceof Error ? e.message : e}`, 'error')
+                                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Activity "${(activity as any).title}" failed after 2 attempts: ${e instanceof Error ? e.message : e}`, 'error')
                             }
                         }
                     }
 
-                    if (succeeded && activity.offerId) {
-                        completedOfferIds.push(activity.offerId)
-                    }
+                    if (succeeded && (activity as any).offerId) completedOfferIds.push((activity as any).offerId)
                 } else {
                     this.bot.log(this.bot.isMobile, 'ACTIVITY',
-                        `Skipped activity "${activity.title}" | Reason: Unsupported type: "${activity.promotionType}"!`, 'warn');
+                        `Skipped activity "${(activity as any).title}" | Reason: Unsupported type: "${(activity as any).promotionType}"!`, 'warn')
                 }
 
-                await this.bot.browser.utils.humanizePage(activityPage);
+                await this.bot.browser.utils.humanizePage(activityPage)
                 {
-                    const m = throttle.getDelayMultiplier();
-                    await this.bot.utils.waitRandom(Math.floor(1000 * m), Math.floor(2000 * m));
+                    const m = throttle.getDelayMultiplier()
+                    await this.bot.utils.waitRandom(Math.floor(1000 * m), Math.floor(2000 * m))
                 }
-                if (Math.random() < 0.4) await this.humanHover(activityPage, 'body');
+                if (Math.random() < 0.4) await this.humanHover(activityPage, 'body')
             } catch (error) {
-                await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_error_${activity.title || activity.offerId || 'unknown'}`);
-                this.bot.log(this.bot.isMobile, 'ACTIVITY', `An error occurred: ${error}`, 'error');
+                await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_error_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
+                this.bot.log(this.bot.isMobile, 'ACTIVITY', `An error occurred: ${error}`, 'error')
             }
         }
 
         this.bot.log(this.bot.isMobile, 'ACTIVITY',
-            `Completed processing ${processedCount} activities this iteration`);
+            `Completed processing ${processedCount} activities this iteration`)
 
-        return completedOfferIds;
+        return completedOfferIds
     }
 }

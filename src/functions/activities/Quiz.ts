@@ -1,10 +1,16 @@
 import { Page } from 'rebrowser-playwright'
 
 import { Workers } from '../Workers'
+import { RETRY_LIMITS, TIMEOUTS, DELAYS } from '../../constants'
 
 export class Quiz extends Workers {
+    // Timeouts / defaults if constants are missing
+    private static readonly DEFAULT_WAIT = (TIMEOUTS && typeof TIMEOUTS.MEDIUM_LONG === 'number') ? TIMEOUTS.MEDIUM_LONG : 2000
+    private static readonly DEFAULT_LONG = (TIMEOUTS && typeof TIMEOUTS.VERY_LONG === 'number') ? TIMEOUTS.VERY_LONG : 120000
+    private static readonly DEFAULT_SHORT_POLL = 1500
+
     /**
-     * Helper: hide any fixed/overlay elements that visually cover `sel` (temporary).
+     * Hide any fixed/overlay elements that visually cover `sel` (temporary).
      * Returns number of elements hidden.
      */
     private async hideBlockingOverlays(page: Page, sel: string): Promise<number> {
@@ -105,9 +111,9 @@ export class Quiz extends Workers {
     private async clickWithRetries(page: Page, selector: string, maxAttempts = 3, perAttemptTimeout = 10000): Promise<{ success: boolean, reason?: string, popup?: Page }> {
         const isVisibleAndClickable = async (sel: string) => {
             try {
-                const handle = await page.$(sel);
+                const handle = await page.$(sel as any);
                 if (!handle) return { ok: false, reason: 'not-found' };
-                try { await handle.scrollIntoViewIfNeeded?.({ timeout: 120000 }); } catch {
+                try { await handle.scrollIntoViewIfNeeded?.({ timeout: Quiz.DEFAULT_LONG }).catch(() => null); } catch {
                     await page.evaluate((s) => {
                         const el = document.querySelector(s) as HTMLElement | null;
                         if (el) el.scrollIntoView({ block: 'center', inline: 'center' });
@@ -137,10 +143,8 @@ export class Quiz extends Workers {
 
         const tryClickOnce = async (sel: string, timeout: number): Promise<{ success: boolean, reason?: string, popup?: Page }> => {
             try {
-                await page.waitForSelector(sel, { state: 'attached', timeout: Math.min(3000, timeout) });
-            } catch {
-                // not attached quickly; continue
-            }
+                await page.waitForSelector(sel, { state: 'attached', timeout: Math.min(3000, timeout) }).catch(() => null);
+            } catch { /* ignore */ }
 
             const visibility = await isVisibleAndClickable(sel);
             if (!visibility.ok) {
@@ -157,13 +161,13 @@ export class Quiz extends Workers {
 
             let popupPromise: Promise<Page | null> | null = null;
             if (context) {
-                popupPromise = context.waitForEvent('page', { timeout: 120000 }).catch(() => null);
+                popupPromise = context.waitForEvent('page', { timeout: Quiz.DEFAULT_LONG }).catch(() => null);
             }
-            const navigationPromise = page.waitForNavigation({ timeout: 120000 }).catch(() => null);
+            const navigationPromise = page.waitForNavigation({ timeout: Quiz.DEFAULT_LONG }).catch(() => null);
 
             try {
-                const locator = page.locator(sel).first();
-                await locator.scrollIntoViewIfNeeded?.({ timeout: 120000 }).catch(() => null);
+                const locator = page.locator(selector).first();
+                await locator.scrollIntoViewIfNeeded?.({ timeout: Quiz.DEFAULT_LONG }).catch(() => null);
                 await locator.click({ timeout }).catch(async (err) => {
                     this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: locator.click failed for ${sel} - trying evaluate click (${err})`, 'warn');
                     const clicked = await page.evaluate((s) => {
@@ -173,7 +177,7 @@ export class Quiz extends Workers {
                         return true;
                     }, sel).catch(() => false);
                     if (!clicked) {
-                        const h = await page.$(sel);
+                        const h = await page.$(sel as any);
                         if (h) {
                             const box = await h.boundingBox();
                             if (box) {
@@ -189,7 +193,7 @@ export class Quiz extends Workers {
             } catch (err) {
                 this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: page click fallback for ${sel}: ${err}`, 'warn');
                 try {
-                    const locator = page.locator(sel).first();
+                    const locator = page.locator(selector).first();
                     await locator.click({ timeout, force: true }).catch(() => { throw new Error('force-click-failed'); });
                 } catch (err2) {
                     this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: all click attempts failed for ${sel}: ${err2}`, 'error');
@@ -201,7 +205,7 @@ export class Quiz extends Workers {
             const nav = await navigationPromise;
 
             if (popup) {
-                try { await popup.waitForLoadState('domcontentloaded', { timeout: 120000 }).catch(() => null); } catch {}
+                try { await popup.waitForLoadState('domcontentloaded', { timeout: Quiz.DEFAULT_LONG }).catch(() => null); } catch {}
                 this.bot.log(this.bot.isMobile, 'QUIZ', `clickWithRetries: click opened popup for ${sel}`);
                 return { success: true, popup };
             }
@@ -215,7 +219,7 @@ export class Quiz extends Workers {
             return { success: true };
         };
 
-        // 1) First, try the selector the caller provided
+        // 1) Try the selector the caller provided
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             const res = await tryClickOnce(selector, perAttemptTimeout);
             if (res.success) return res;
@@ -363,7 +367,7 @@ export class Quiz extends Workers {
 
             if (quizData) return quizData;
 
-            // If window.rewardsQuizRenderInfo is not available, try to extract data from DOM elements
+            // DOM fallback
             const quizDataFromDOM = await page.evaluate(() => {
                 const creditsElement = document.querySelector('#rqHeaderCredits .rqECredits') as HTMLElement | null;
                 const maxCreditsElement = document.querySelector('#rqHeaderCredits .rqMCredits') as HTMLElement | null;
@@ -413,7 +417,7 @@ export class Quiz extends Workers {
     }
 
     /**
-     * Heuristic: detect quiz completion using multiple signals (text patterns, element classes, absence of answer options).
+     * Detect quiz completion using multiple signals.
      */
     private async isQuizComplete(page: Page): Promise<{ complete: boolean, reason?: string }> {
         try {
@@ -452,9 +456,6 @@ export class Quiz extends Workers {
         }
     }
 
-    /**
-     * Read current answer option states: visible & enabled heuristics.
-     */
     private async getOptionStates(page: Page): Promise<Array<{ id: string, visible: boolean, enabled: boolean }>> {
         try {
             const states = await page.evaluate(() => {
@@ -487,7 +488,7 @@ export class Quiz extends Workers {
      */
     private async bruteForceAnswers(page: Page): Promise<boolean> {
         try {
-            const maxTotalAttempts = 40; // global cap
+            const maxTotalAttempts = (RETRY_LIMITS && typeof RETRY_LIMITS.ANSWER_CAP === 'number') ? RETRY_LIMITS.ANSWER_CAP : 40;
             let attempts = 0;
             const tried = new Set<string>();
 
@@ -579,14 +580,15 @@ export class Quiz extends Workers {
     }
 
     /**
-     * Main runner for quiz.
+     * Main runner for quiz. Combines main-branch constants-driven flow and feature-branch robustness.
      */
     async doQuiz(page: Page) {
         this.bot.log(this.bot.isMobile, 'QUIZ', 'Trying to complete quiz')
 
         try {
             // Attempt to click start if available (robust)
-            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: 120000 }).then(() => true).catch(() => false)
+            const startTimeout = (TIMEOUTS && typeof TIMEOUTS.MEDIUM_LONG === 'number') ? TIMEOUTS.MEDIUM_LONG : Quiz.DEFAULT_WAIT;
+            const quizNotStarted = await page.waitForSelector('#rqStartQuiz', { state: 'visible', timeout: startTimeout }).then(() => true).catch(() => false)
             if (quizNotStarted) {
                 const startClick = await this.clickWithRetries(page, '#rqStartQuiz', 3, 10000);
                 if (!startClick.success) {
@@ -599,10 +601,10 @@ export class Quiz extends Workers {
                 this.bot.log(this.bot.isMobile, 'QUIZ', 'Quiz has already been started, trying to finish it')
             }
 
-            await this.bot.utils.wait(2000)
+            await this.bot.utils.wait(Quiz.DEFAULT_SHORT_POLL)
 
             // Prefer the global helper if present (external func)
-            let quizData = null
+            let quizData: any = null
             try { quizData = await this.bot.browser.func.getQuizData(page) } catch { quizData = null }
 
             // If not found, try class-local extractors
@@ -625,10 +627,10 @@ export class Quiz extends Workers {
                 return;
             }
 
-            let questionsRemaining = quizData.maxQuestions - quizData.CorrectlyAnsweredQuestionCount // Amount of questions remaining
+            // number of questions remaining
+            let questionsRemaining = quizData.maxQuestions - quizData.CorrectlyAnsweredQuestionCount
 
-            // All questions
-            for (let question = 0; question < questionsRemaining; question++) {
+            for (let qIndex = 0; qIndex < questionsRemaining; qIndex++) {
                 // refresh quizData at top of loop to pick up changes
                 quizData = await this.bot.browser.func.getQuizData(page).catch(() => null) || await this.fetchQuizData(page, 1500) || quizData;
 
@@ -637,13 +639,14 @@ export class Quiz extends Workers {
                     break;
                 }
 
+                // 8-option multi-choice (often check all correct marks)
                 if (quizData.numberOfOptions === 8) {
                     const answers: string[] = []
 
                     for (let i = 0; i < quizData.numberOfOptions; i++) {
                         const sel = `#rqAnswerOption${i}`
-                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
-                        const answerAttribute = await answerHandle?.evaluate((el: Element) => el.getAttribute('iscorrectoption')).catch(() => null)
+                        const handle = await page.waitForSelector(sel, { state: 'visible', timeout: Quiz.DEFAULT_LONG }).catch(() => null)
+                        const answerAttribute = await handle?.evaluate((el: Element) => el.getAttribute('iscorrectoption')).catch(() => null)
 
                         if (answerAttribute && answerAttribute.toLowerCase() === 'true') {
                             answers.push(sel)
@@ -652,9 +655,6 @@ export class Quiz extends Workers {
 
                     // Click the answers
                     for (const answer of answers) {
-                        await page.waitForSelector(answer, { state: 'visible', timeout: 120000 }).catch(() => null)
-
-                        // Click the answer using robust helper
                         const clickRes = await this.clickWithRetries(page, answer, 3, 12000);
                         if (!clickRes.success) {
                             this.bot.log(this.bot.isMobile, 'QUIZ', `Failed to click multi-answer ${answer}: ${clickRes.reason}`, 'warn');
@@ -662,7 +662,7 @@ export class Quiz extends Workers {
                         }
                         if (clickRes.popup) page = clickRes.popup;
 
-                        const refreshSuccess = await this.bot.browser.func.waitForQuizRefresh(page)
+                        const refreshSuccess = await this.bot.browser.func.waitForQuizRefresh(page).catch(() => false)
                         if (!refreshSuccess) {
                             await page.close()
                             this.bot.log(this.bot.isMobile, 'QUIZ', 'An error occurred, refresh was unsuccessful', 'error')
@@ -670,14 +670,14 @@ export class Quiz extends Workers {
                         }
                     }
 
-                } else if ([2, 3, 4].includes(quizData.numberOfOptions)) {
+                } else if ([2,3,4].includes(quizData.numberOfOptions)) {
                     quizData = await this.bot.browser.func.getQuizData(page).catch(() => null) || quizData // Refresh Quiz Data
                     const correctOption = quizData.correctAnswer
 
                     let answeredThisRound = false
                     for (let i = 0; i < quizData.numberOfOptions; i++) {
                         const sel = `#rqAnswerOption${i}`
-                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: 120000 }).catch(() => null)
+                        const answerHandle = await page.waitForSelector(sel, { state: 'visible', timeout: Quiz.DEFAULT_LONG }).catch(() => null)
                         const dataOption = await answerHandle?.evaluate((el: Element) => el.getAttribute('data-option')).catch(() => null)
 
                         if (dataOption === correctOption) {
@@ -696,7 +696,7 @@ export class Quiz extends Workers {
                                 if (clickRes.popup) page = clickRes.popup;
                             }
 
-                            const refreshSuccess = await this.bot.browser.func.waitForQuizRefresh(page)
+                            const refreshSuccess = await this.bot.browser.func.waitForQuizRefresh(page).catch(() => false)
                             if (!refreshSuccess) {
                                 await page.close()
                                 this.bot.log(this.bot.isMobile, 'QUIZ', 'An error occurred, refresh was unsuccessful', 'error')
@@ -713,7 +713,8 @@ export class Quiz extends Workers {
                         if (!bf) break;
                     }
 
-                    await this.bot.utils.wait(2000)
+                    await this.bot.utils.wait((DELAYS && typeof DELAYS.QUIZ_ANSWER_WAIT === 'number') ? DELAYS.QUIZ_ANSWER_WAIT : 2000)
+
                 } else {
                     this.bot.log(this.bot.isMobile, 'QUIZ', `Unsupported or unknown numberOfOptions: ${quizData.numberOfOptions} - attempting brute-force fallback`, 'warn');
                     const bf2 = await this.bruteForceAnswers(page);
@@ -722,7 +723,7 @@ export class Quiz extends Workers {
             }
 
             // Done with
-            await this.bot.utils.wait(2000)
+            await this.bot.utils.wait((DELAYS && typeof DELAYS.QUIZ_ANSWER_WAIT === 'number') ? DELAYS.QUIZ_ANSWER_WAIT : 2000)
             try { await page.close() } catch {}
             this.bot.log(this.bot.isMobile, 'QUIZ', 'Completed the quiz successfully')
         } catch (error) {

@@ -1,5 +1,7 @@
 import { Page } from 'rebrowser-playwright'
+
 import { Workers } from '../Workers'
+import { RETRY_LIMITS, TIMEOUTS } from '../../constants'
 // Preferred: use Playwright types (install playwright as a devDependency if needed).
 // npm i -D playwright
 import type { Locator } from 'playwright' // <-- changed from '@playwright/test'
@@ -15,57 +17,73 @@ export class ABC extends Workers {
     async doABC(page: Page) {
         this.bot.log(this.bot.isMobile, 'ABC', 'Trying to complete poll')
 
+        const maxIterations = (RETRY_LIMITS && typeof RETRY_LIMITS.ABC_MAX === 'number') ? RETRY_LIMITS.ABC_MAX : 15
+        const dashboardWait = (TIMEOUTS && typeof TIMEOUTS.DASHBOARD_WAIT === 'number') ? TIMEOUTS.DASHBOARD_WAIT : 120000
+        const longTimeout = (TIMEOUTS && typeof TIMEOUTS.LONG === 'number') ? TIMEOUTS.LONG : 5000
+
         try {
             let $ = await this.bot.browser.func.loadInCheerio(page)
 
-            // Don't loop more than 15 in case unable to solve, would lock otherwise
-            const maxIterations = 15
             let i
             for (i = 0; i < maxIterations && !$('span.rw_icon').length; i++) {
                 // Random human-like pause before interacting
                 await this.randomSleep()
 
-                // Wait briefly for answer options to appear — but don't block long
+                // Wait for answer options to appear
                 try {
-                    await page.waitForSelector('.wk_OptionClickClass', { state: 'attached', timeout: 120000 })
-                } catch {
-                    // Not fatal — we'll check count below
-                }
+                    await page.waitForSelector('.wk_OptionClickClass', { state: 'attached', timeout: dashboardWait })
+                } catch { /* non-fatal, will re-check below */ }
 
-                // Load answers via Playwright (robust)
+                // Prefer Playwright locator (more robust) but fall back to Cheerio if needed
                 let answersLocator = page.locator('.wk_OptionClickClass')
                 let answerCount = (await answersLocator.count()) || 0
 
                 if (answerCount === 0) {
-                    this.bot.log(this.bot.isMobile, 'ABC', 'No answers found on question — retrying', 'warn')
-                    await this.bot.utils.wait(1000)
-                    page = await this.bot.browser.utils.getLatestTab(page)
-                    $ = await this.bot.browser.func.loadInCheerio(page)
-                    continue
-                }
+                    // Try Cheerio approach (legacy main branch) to find ids
+                    const answers = $('.wk_OptionClickClass')
+                    if (answers && answers.length) {
+                        // If cheerio found answers but Playwright did not, try clicking by id
+                        const idx = this.bot.utils.randomNumber(0, Math.min(answers.length - 1, 2))
+                        const answerId = answers[idx]?.attribs?.['id']
+                        if (answerId) {
+                            try {
+                                await page.waitForSelector(`#${answerId}`, { state: 'visible', timeout: dashboardWait })
+                                await this.clickBySelectorRobust(page, `#${answerId}`)
+                            } catch {
+                                this.bot.log(this.bot.isMobile, 'ABC', `Failed to click answer by id ${answerId}`, 'warn')
+                            }
+                        }
+                    } else {
+                        this.bot.log(this.bot.isMobile, 'ABC', 'No answers found on question — retrying', 'warn')
+                        await this.bot.utils.wait(1000)
+                        page = await this.bot.browser.utils.getLatestTab(page)
+                        $ = await this.bot.browser.func.loadInCheerio(page)
+                        continue
+                    }
+                } else {
+                    // Choose a random answer index from what's actually present
+                    const idx = this.bot.utils.randomNumber(0, Math.max(0, answerCount - 1))
+                    const chosenAnswer = answersLocator.nth(idx)
 
-                // Choose a random answer index from what's actually present
-                const idx = this.bot.utils.randomNumber(0, Math.max(0, answerCount - 1))
-                const chosenAnswer = answersLocator.nth(idx)
-
-                // Try to click the answer robustly (bounded retries)
-                const clicked = await this.clickLocatorRobust(page, chosenAnswer, 3)
-                if (!clicked) {
-                    this.bot.log(this.bot.isMobile, 'ABC',
-                        `Chosen answer could not be clicked after 3 attempts (idx=${idx}) — skipping question`, 'warn')
-                    // refresh and continue to avoid getting stuck on the same question
-                    await this.bot.utils.wait(500)
-                    page = await this.bot.browser.utils.getLatestTab(page)
-                    $ = await this.bot.browser.func.loadInCheerio(page)
-                    continue
+                    // Try to click the answer robustly (bounded retries)
+                    const clicked = await this.clickLocatorRobust(page, chosenAnswer, 3)
+                    if (!clicked) {
+                        this.bot.log(this.bot.isMobile, 'ABC',
+                            `Chosen answer could not be clicked after 3 attempts (idx=${idx}) — skipping question`, 'warn')
+                        // refresh and continue to avoid getting stuck on the same question
+                        await this.bot.utils.wait(500)
+                        page = await this.bot.browser.utils.getLatestTab(page)
+                        $ = await this.bot.browser.func.loadInCheerio(page)
+                        continue
+                    }
                 }
 
                 // small random pause after clicking an answer
                 await this.randomSleep()
 
                 // Click the "next" / submit button robustly
-                const nextBtn = page.locator('div.wk_button').first()
-                const nextClicked = await this.clickLocatorRobust(page, nextBtn, 3)
+                const nextBtnLocator = page.locator('div.wk_button').first()
+                const nextClicked = await this.clickLocatorRobust(page, nextBtnLocator, 3)
                 if (!nextClicked) {
                     this.bot.log(this.bot.isMobile, 'ABC',
                         'Next button could not be clicked after 3 attempts — attempting to continue', 'warn')
@@ -80,11 +98,11 @@ export class ABC extends Workers {
             }
 
             // final wait + close
-            await this.bot.utils.wait(4000)
+            await this.bot.utils.wait(longTimeout + 1000)
             try { await page.close() } catch { /* ignore */ }
 
             if (i === maxIterations) {
-                this.bot.log(this.bot.isMobile, 'ABC', 'Failed to solve quiz, exceeded max iterations of 15', 'warn')
+                this.bot.log(this.bot.isMobile, 'ABC', `Failed to solve quiz, exceeded max iterations of ${maxIterations}`, 'warn')
             } else {
                 this.bot.log(this.bot.isMobile, 'ABC', 'Completed the ABC successfully')
             }
@@ -96,11 +114,7 @@ export class ABC extends Workers {
     }
 
     /**
-     * Try to click a Playwright Locator robustly:
-     * - scrollIntoViewIfNeeded()
-     * - verify it's visible / not covered (elementFromPoint)
-     * - attempt up to `maxAttempts` times
-     * - try to close common overlays between attempts
+     * Try to click a Playwright Locator robustly.
      */
     private async clickLocatorRobust(page: Page, locator: Locator, maxAttempts = 3): Promise<boolean> {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -150,7 +164,7 @@ export class ABC extends Workers {
                     continue
                 }
 
-                // try clicking with a short timeout so we don't block for 30s
+                // try clicking with a short timeout
                 await locator.first().click({ timeout: 5000 })
                 return true
             } catch (err) {
@@ -166,10 +180,22 @@ export class ABC extends Workers {
         return false
     }
 
+    private async clickBySelectorRobust(page: Page, selector: string, maxAttempts = 3): Promise<boolean> {
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                await page.waitForSelector(selector, { state: 'visible', timeout: 2000 })
+                await page.click(selector, { timeout: 5000 }).catch(() => { throw new Error('click failed') })
+                return true
+            } catch (e) {
+                await this.tryCloseOverlays(page)
+                await this.bot.utils.wait(200 + this.bot.utils.randomNumber(0, 600))
+            }
+        }
+        return false
+    }
+
     /**
      * Best-effort overlay / popup closer.
-     * Attempts a small set of common overlay selectors and close buttons.
-     * This is intentionally conservative — it won't destructively modify the page.
      */
     private async tryCloseOverlays(page: Page) {
         try {
@@ -191,7 +217,6 @@ export class ABC extends Workers {
                     if (await loc.count()) {
                         if (await loc.isVisible()) {
                             try { await loc.click({ timeout: 2000 }) } catch { /* ignore */ }
-                            // small wait after attempting a close
                             await this.bot.utils.wait(200)
                         }
                     }
@@ -199,15 +224,12 @@ export class ABC extends Workers {
             }
 
             // Extra: click outside to dismiss small popovers (click page corner)
-            try {
-                await page.mouse.click(10, 10)
-            } catch { /* ignore */ }
+            try { await page.mouse.click(10, 10) } catch { /* ignore */ }
         } catch { /* swallow */ }
     }
 
     /**
      * Sleep for a random (longer) interval between actions.
-     * Configurable via this.bot.config.abcMinDelayMs / abcMaxDelayMs (ms).
      */
     private async randomSleep() {
         const minMs = (this.bot.config as any)?.abcMinDelayMs ?? ABC.DEFAULT_MIN_DELAY_MS

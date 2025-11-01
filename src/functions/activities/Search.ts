@@ -8,6 +8,15 @@ import { Workers } from '../Workers'
 import { Counters, DashboardData } from '../../interface/DashboardData'
 import { GoogleSearch } from '../../interface/Search'
 
+type GoogleTrendsResponse = [
+    string,
+    [
+        string,
+        ...null[],
+        [string, ...string[]]
+    ][]
+];
+
 export class Search extends Workers {
     private bingHome = 'https://bing.com'
     private searchPageURL = ''
@@ -421,18 +430,29 @@ export class Search extends Workers {
         let trendsQueries: GoogleSearch[] = []
         if (trendsCount > 0) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Trends (Reddit-based) (up to ${trendsCount})`)
-                const rawTrends = await this.getRedditTrends(geoLocale)
-                if (Array.isArray(rawTrends) && rawTrends.length) {
-                    // sample trends but we'll only use up to trendsCount (or fewer if llm is short)
-                    trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsCount)
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Reddit trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsCount})`)
+                const gt = await this.getGoogleTrends(geoLocale)
+                if (gt.length) {
+                    trendsQueries = this.bot.utils.shuffleArray(gt).slice(0, trendsCount)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google trends returned ${gt.length} items, sampled ${trendsQueries.length}`)
                 } else {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Trends returned no usable items', 'warn')
+                    throw new Error('No usable Google trends')
                 }
             } catch (tErr) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
-                // non-fatal — we'll top up from local below
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
+                // Fallback to Reddit if Google Trends fails
+                try {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Falling back to Reddit Trends (up to ${trendsCount})`)
+                    const rawTrends = await this.getRedditTrends(geoLocale)
+                    if (Array.isArray(rawTrends) && rawTrends.length) {
+                        trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsCount)
+                        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Reddit trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
+                    } else {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Reddit trends returned no usable items', 'warn')
+                    }
+                } catch (rErr) {
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Reddit Trends fetch failed (non-fatal): ${rErr instanceof Error ? rErr.message : String(rErr)}`, 'warn')
+                }
             }
         }
 
@@ -533,173 +553,66 @@ export class Search extends Workers {
         }
     }
 
-    /**
-     * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
-     * Returns normalized GoogleSearch[]
-     */
-    private async generateQueriesWithLLMBatch(
-        geoLocale: string,
-        desiredCount = 25,
-        mode: Mode = 'balanced',
-        contextNotes: string = '',
-        runSeed?: number
-    ): Promise<GoogleSearch[]> {
-        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
-        if (!apiKey) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key missing. Set OPENROUTER_API_KEY or bot.config.openRouterApiKey', 'error')
-            throw new Error('OpenRouter API key not configured')
+    private async getGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
+        const queryTerms: GoogleSearch[] = []
+        this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries, can take a while! | GeoLocale: ${geoLocale}`)
+
+        try {
+            const request: AxiosRequestConfig = {
+                url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                },
+                data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`,
+                proxy: false
+            }
+
+            const response = await axios.request(request as any)
+            const rawText = response.data
+
+            const trendsData = this.extractJsonFromResponse(rawText)
+            if (!trendsData) {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Failed to parse Google Trends response', 'error')
+                return queryTerms
+            }
+
+            const mappedTrendsData = trendsData.map(query => [query[0], query[9]!.slice(1)])
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Found ${mappedTrendsData.length} search queries for ${geoLocale}`)
+
+            if (mappedTrendsData.length < 30 && geoLocale.toUpperCase() !== 'US') {
+                this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Insufficient search queries (${mappedTrendsData.length} < 30), falling back to US`, 'warn')
+                return this.getGoogleTrends()
+            }
+
+            for (const [topic, relatedQueries] of mappedTrendsData) {
+                queryTerms.push({
+                    topic: topic as string,
+                    related: relatedQueries as string[]
+                })
+            }
+
+        } catch (error) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'An error occurred:' + error, 'error')
         }
 
-        // Use runSeed to choose examples deterministically
-        const rng = this.seededRng(runSeed ?? this.getRunSeed())
-        const realisticPatterns = [
-            'Instead of generic "cheap food near me", use specific examples like "McDonald\'s delivery promo" or "best sushi near campus"',
-            'Avoid repetitive phrasing - vary between questions ("How to..."), commands ("Find..."), and direct requests ("Best pizza in [city]")',
-            'Incorporate day-specific context: weekday = academic/work, weekend = entertainment/leisure',
-            'Add location context naturally: "near campus", "downtown", "in [city]"'
-        ]
+        return queryTerms
+    }
 
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
-- "topic": a short search query a typical university student might type.
-- "related": an array of 0..6 related searches (short strings).
-
-Return up to ${desiredCount} diverse items if possible. Avoid politically sensitive & adult topics. Output must be valid JSON only (no explanatory text). Use ${geoLocale.toUpperCase()} locale where relevant. Be varied and avoid repeating the same simple phrases (e.g., don't output "cheap food near me" repeatedly). This request context: ${contextNotes}. Use the style guidance: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
-
-        const userPrompt = `Generate up to ${desiredCount} concise search queries a typical undergraduate would use (games, course topics, campus services, cheap food, debugging help, YouTube searches, study resources).
-Avoid repetitive patterns: ${this.getRepetitivePatternsWarning(rng)}
-Output only valid JSON array with "topic" and "related" fields.`
-
-        const body = {
-            model: 'meta-llama/llama-3.3-70b-instruct:free',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ],
-            max_tokens: Math.min(1600, 90 * desiredCount),
-            temperature: 0.8
-        }
-
-        const requestConfig: AxiosRequestConfig = {
-            url: 'https://openrouter.ai/api/v1/chat/completions',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            data: body,
-            timeout: 25000,
-            proxy: false // ensure no proxy
-        }
-
-        // Try with a couple of attempts for transient errors
-        let lastErr: any = null
-        for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-                const resp = await axios.request(requestConfig as any)
-                let content: string | undefined
-                const choices = resp?.data?.choices
-                if (Array.isArray(choices) && choices.length) {
-                    content = choices[0]?.message?.content || choices[0]?.text
-                } else if (typeof resp?.data === 'string') {
-                    content = resp.data
-                } else if (resp?.data?.result?.content) {
-                    content = resp.data.result.content
-                }
-
-                if (!content) throw new Error('No content from LLM')
-
-                // Attempt to parse JSON (strip code fences if present)
-                let parsed: any
+    private extractJsonFromResponse(text: string): GoogleTrendsResponse[1] | null {
+        const lines = text.split('\n')
+        for (const line of lines) {
+            const trimmed = line.trim()
+            if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
                 try {
-                    parsed = JSON.parse(content)
-                } catch (e) {
-                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
-                    parsed = JSON.parse(trimmed)
+                    return JSON.parse(JSON.parse(trimmed)[0][2])[1]
+                } catch {
+                    continue
                 }
-
-                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
-
-                const normalized: GoogleSearch[] = parsed.map((item: any) => {
-                    const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
-                    const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-                    return { topic, related }
-                }).filter(x => x.topic && x.topic.length > 1)
-
-                return normalized
-            } catch (err) {
-                lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `LLM attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
-                // backoff
-                await this.bot.utils.wait(1000 * (attempt + 1))
             }
         }
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All LLM attempts failed, throwing to allow fallback', 'error')
-        throw lastErr || new Error('LLM failed')
-    }
-
-    private getRepetitivePatternsWarning(rng?: () => number): string {
-        const warnings = [
-            '"cheap food near me" → use specific examples like "Chipotle catering options" or "best sushi in [city]"',
-            '"how to" → vary with "tips for", "guide to", "best way to", or just the topic itself',
-            'Always include natural location context when relevant (e.g., "near campus", "downtown", "in [city]")',
-            'Mix question format and direct search terms for diversity'
-        ];
-
-        if (!warnings.length) return ''
-
-        const idx = typeof rng === 'function'
-            ? Math.floor(Math.max(0, Math.min(0.999999, rng())) * warnings.length)
-            : Math.floor(Math.random() * warnings.length)
-
-        return (warnings[idx] ?? warnings[0]) as string
-    }
-
-    /**
-     * Single-query LLM generation (used in per-search mode or per-search fallback).
-     * Returns single string or null.
-     */
-    private async generateSingleQueryFromLLM(geoLocale: string = 'US', mode: Mode = 'balanced'): Promise<string | null> {
-        const apiKey = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
-        if (!apiKey) throw new Error('OpenRouter API key not configured')
-
-        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string. Mode hint: ${mode}.`
-        const userPrompt = `Provide a single concise search query a university undergrad might use.`
-
-        const body = {
-            model: 'meta-llama/llama-3.3-70b-instruct:free',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ],
-            max_tokens: 60,
-            temperature: 0.8
-        }
-
-        const requestConfig: AxiosRequestConfig = {
-            url: 'https://openrouter.ai/api/v1/chat/completions',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            data: body,
-            timeout: 15000,
-            proxy: false
-        }
-
-        const resp = await axios.request(requestConfig as any)
-        const choices = resp?.data?.choices
-        let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
-        if (!rawContent) return null
-
-        const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
-        const cleanedLines = stripFences(rawContent).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
-        const candidate = cleanedLines.length ? cleanedLines[0] : String(rawContent).trim()
-        const final = String(candidate).replace(/(^"|"$)/g, '').trim()
-
-        if (!final || final.length < 2) return null
-        return final.length > 200 ? final.slice(0, 200) : final
+        return null
     }
 
     /**
@@ -960,7 +873,7 @@ Output only valid JSON array with "topic" and "related" fields.`
 
     /**
      * Determine run settings.
-     * - weekday biases mode, but we return a pool (modesPool) so per-query mode variation (interleaves) can occur.
+     * - weekday biases mode, but we return a pool (modesPool) so per-query mode selection (enables interleaving).
      */
     private determineRunSettings(seed?: number): { mode: Mode, diversityLevel: number, contextNotes: string, modesPool: Mode[] } {
         const weekday = (new Date()).getDay()
@@ -1173,6 +1086,261 @@ Output only valid JSON array with "topic" and "related" fields.`
         } catch {
             // swallow
         }
+    }
+
+    /**
+     * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
+     * Returns normalized GoogleSearch[]
+     */
+    private async generateQueriesWithLLMBatch(
+        geoLocale: string,
+        desiredCount = 25,
+        mode: Mode = 'balanced',
+        contextNotes: string = '',
+        runSeed?: number
+    ): Promise<GoogleSearch[]> {
+        // --- START: Updated to support two OpenRouter API keys and preferred/fallback models ---
+        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
+
+        const keys = [envKey1, envKey2].filter(k => !!k)
+        if (!keys.length) {
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key(s) missing. Set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2 or bot.config.openRouterApiKey', 'error')
+            throw new Error('OpenRouter API key not configured')
+        }
+
+        // Preferred (better but less stable) model and fallback (original) model.
+        // You can override via bot.config.openRouterPreferredModel / openRouterFallbackModel
+        const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
+        const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
+
+        // Use runSeed to choose examples deterministically
+        const rng = this.seededRng(runSeed ?? this.getRunSeed())
+        const realisticPatterns = [
+            'Instead of generic "cheap food near me", use specific examples like "McDonald\'s delivery promo" or "best sushi near campus"',
+            'Avoid repetitive phrasing - vary between questions ("How to..."), commands ("Find..."), and direct requests ("Best pizza in [city]")',
+            'Incorporate day-specific context: weekday = academic/work, weekend = entertainment/leisure',
+            'Add location context naturally: "near campus", "downtown", "in [city]"'
+        ]
+
+        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
+- "topic": a short search query a typical university student might type.
+- "related": an array of 0..6 related searches (short strings).
+
+Return up to ${desiredCount} diverse items if possible. Avoid politically sensitive & adult topics. Output must be valid JSON only (no explanatory text). Use ${geoLocale.toUpperCase()} locale where relevant. Be varied and avoid repeating the same simple phrases (e.g., don't output "cheap food near me" repeatedly). This request context: ${contextNotes}. Use the style guidance: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
+
+        const userPrompt = `Generate up to ${desiredCount} concise search queries a university undergrad might use.`
+
+        // Build the messages and body template (we'll swap model)
+        const baseMessages = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ]
+
+        const maxTokens = Math.min(1600, 90 * desiredCount)
+
+        // Helper to send one request with given key+model
+        const sendOnce = async (apiKey: string, model: string) => {
+            const body = {
+                model,
+                messages: baseMessages,
+                max_tokens: maxTokens,
+                temperature: 0.8
+            }
+
+            const requestConfig: AxiosRequestConfig = {
+                url: 'https://openrouter.ai/api/v1/chat/completions',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                data: body,
+                timeout: 25000,
+                proxy: false // ensure no proxy
+            }
+
+            const resp = await axios.request(requestConfig as any)
+            let content: string | undefined
+            const choices = resp?.data?.choices
+            if (Array.isArray(choices) && choices.length) {
+                content = choices[0]?.message?.content || choices[0]?.text
+            } else if (typeof resp?.data === 'string') {
+                content = resp.data
+            } else if (resp?.data?.result?.content) {
+                content = resp.data.result.content
+            }
+
+            if (!content) throw new Error('No content from LLM')
+            return content
+        }
+
+        // Sequence: preferredModel with key1, preferredModel with key2, fallbackModel with key1, fallbackModel with key2
+        let lastErr: any = null
+        for (const key of keys) {
+            try {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} with one of the API keys`)
+                const content = await sendOnce(key, preferredModel)
+                // parse & normalize result (same logic as before)
+                let parsed: any
+                try {
+                    parsed = JSON.parse(String(content))
+                } catch (e) {
+                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
+                    parsed = JSON.parse(trimmed)
+                }
+
+                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+
+                const normalized: GoogleSearch[] = parsed.map((item: any) => {
+                    const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
+                    const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
+                    return { topic, related }
+                }).filter(x => x.topic && x.topic.length > 1)
+
+                return normalized
+            } catch (err) {
+                lastErr = err
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred model attempt with a key failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                // try next key
+            }
+        }
+
+        // If preferred model failed for both keys, try fallback model
+        for (const key of keys) {
+            try {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} with one of the API keys`)
+                const content = await sendOnce(key, fallbackModel)
+                // parse & normalize result (same logic as before)
+                let parsed: any
+                try {
+                    parsed = JSON.parse(String(content))
+                } catch (e) {
+                    const trimmed = String(content).replace(/```json(?:\n)?/g, '').replace(/```/g, '')
+                    parsed = JSON.parse(trimmed)
+                }
+
+                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
+
+                const normalized: GoogleSearch[] = parsed.map((item: any) => {
+                    const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
+                    const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
+                    return { topic, related }
+                }).filter(x => x.topic && x.topic.length > 1)
+
+                return normalized
+            } catch (err) {
+                lastErr = err
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model attempt with a key failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                // try next key
+            }
+        }
+
+        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All OpenRouter attempts failed, throwing to allow fallback', 'error')
+        throw lastErr || new Error('LLM failed')
+        // --- END: Updated ---
+    }
+
+    // private getRepetitivePatternsWarning(rng?: () => number): string {
+    //     const warnings = [
+    //         '"cheap food near me" → use specific examples like "Chipotle catering options" or "best sushi in [city]"',
+    //         '"how to" → vary with "tips for", "guide to", "best way to", or just the topic itself',
+    //         'Always include natural location context when relevant (e.g., "near campus", "downtown", "in [city]")',
+    //         'Mix question format and direct search terms for diversity'
+    //     ];
+    //
+    //     if (!warnings.length) return ''
+    //
+    //     const idx = typeof rng === 'function'
+    //         ? Math.floor(Math.max(0, Math.min(0.999999, rng())) * warnings.length)
+    //         : Math.floor(Math.random() * warnings.length)
+    //
+    //     return (warnings[idx] ?? warnings[0]) as string
+    // }
+
+    /**
+     * Single-query LLM generation (used in per-search mode or per-search fallback).
+     * Returns single string or null.
+     */
+    private async generateSingleQueryFromLLM(geoLocale: string = 'US', mode: Mode = 'balanced'): Promise<string | null> {
+        // --- START: Updated to support two API keys + preferred/fallback model sequence ---
+        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
+        const keys = [envKey1, envKey2].filter(k => !!k)
+        if (!keys.length) throw new Error('OpenRouter API key not configured')
+
+        const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
+        const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
+
+        const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might type. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string. Mode hint: ${mode}.`
+        const userPrompt = `Provide a single concise search query a university undergrad might use.`
+
+        const makeBody = (model: string) => ({
+            model,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            max_tokens: 60,
+            temperature: 0.8
+        })
+
+        const sendOnce = async (apiKey: string, model: string) => {
+            const requestConfig: AxiosRequestConfig = {
+                url: 'https://openrouter.ai/api/v1/chat/completions',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                data: makeBody(model),
+                timeout: 15000,
+                proxy: false
+            }
+            const resp = await axios.request(requestConfig as any)
+            const choices = resp?.data?.choices
+            let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
+            if (!rawContent) throw new Error('No content from LLM')
+            return String(rawContent)
+        }
+
+        // Try preferred model with key1 then key2
+        let lastErr: any = null
+        for (const key of keys) {
+            try {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} for single-query with a key`)
+                const raw = await sendOnce(key, preferredModel)
+                const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
+                const cleanedLines = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
+                const candidate = cleanedLines.length ? cleanedLines[0] : String(raw).trim()
+                const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+                if (!final || final.length < 2) throw new Error('Parsed query too short')
+                return final.length > 200 ? final.slice(0, 200) : final
+            } catch (err) {
+                lastErr = err
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred single-query attempt failed with a key: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+            }
+        }
+
+        // Try fallback model with key1 then key2
+        for (const key of keys) {
+            try {
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} for single-query with a key`)
+                const raw = await sendOnce(key, fallbackModel)
+                const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
+                const cleanedLines = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
+                const candidate = cleanedLines.length ? cleanedLines[0] : String(raw).trim()
+                const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+                if (!final || final.length < 2) throw new Error('Parsed query too short')
+                return final.length > 200 ? final.slice(0, 200) : final
+            } catch (err) {
+                lastErr = err
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback single-query attempt failed with a key: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+            }
+        }
+
+        throw lastErr || new Error('LLM single-query failed')
+        // --- END: Updated ---
     }
 }
 

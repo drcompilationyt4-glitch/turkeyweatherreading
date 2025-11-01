@@ -9,6 +9,8 @@ import axios from 'axios';
 // import 'dotenv/config'
 
 import { Workers } from '../Workers'
+
+
 import { MorePromotion, PromotionalItem } from '../../interface/DashboardData'
 import { AxiosRequestConfig } from 'axios'
 
@@ -136,7 +138,8 @@ export class SearchOnBing extends Workers {
                     method: 'GET',
                     url: 'https://raw.githubusercontent.com/TheNetsky/Microsoft-Rewards-Script/refs/heads/main/src/functions/queries.json',
                     timeout: 8000,
-                    responseType: 'text'
+                    responseType: 'text',
+                    proxy: false // Added proxy false as per instructions
                 }
 
                 const response = await this.bot.axios.request(axiosReq).catch(() => ({ data: null }))

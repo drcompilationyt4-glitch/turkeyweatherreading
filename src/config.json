@@ -2,21 +2,17 @@
   "baseURL": "https://rewards.bing.com",
   "sessionPath": "sessions",
 
-  "headless": true,
-  "globalTimeout": "100s",
-  "parallel": false,
-  "runOnZeroPoints": false,
-  "clusters": 3,
-  "passesPerRun": 1,
-
-  "saveFingerprint": {
-    "mobile": false,
-    "desktop": false
-  },
-
+  // ========== YOUR / PRESERVED SETTINGS ==========
   "browser": {
     "headless": true,
     "globalTimeout": "100s"
+  },
+
+  "fingerprinting": {
+    "saveFingerprint": {
+      "mobile": false,
+      "desktop": false
+    }
   },
 
   "execution": {
@@ -26,15 +22,10 @@
     "passesPerRun": 1
   },
 
+  "passesPerRun": 1,
+
   "buyMode": {
     "maxMinutes": 45
-  },
-
-  "fingerprinting": {
-    "saveFingerprint": {
-      "mobile": false,
-      "desktop": false
-    }
   },
 
   "workers": {
@@ -46,19 +37,6 @@
     "doDailyCheckIn": true,
     "doReadToEarn": true,
     "bundleDailySetWithSearch": false
-  },
-
-  "searchOnBingLocalQueries": false,
-
-  "searchSettings": {
-    "useGeoLocaleQueries": false,
-    "scrollRandomResults": true,
-    "clickRandomResults": true,
-    "searchDelay": {
-      "min": "3min",
-      "max": "5min"
-    },
-    "retryMobileSearchAmount": 2
   },
 
   "search": {
@@ -75,24 +53,32 @@
     }
   },
 
+  "searchOnBingLocalQueries": false,
+
   "proxy": {
     "proxyGoogleTrends": true,
     "proxyBingTerms": true
   },
 
+  // Top-level (legacy) webhook kept for backward compatibility; prefer notifications.webhook
   "webhook": {
     "enabled": false,
     "url": ""
   },
 
+  // Notifications (newer/nested)
   "notifications": {
     "webhook": {
       "enabled": false,
-      "url": ""
+      "url": "",
+      "username": "Live Logs",
+      "avatarUrl": "https://media.discordapp.net/attachments/1421163952972369931/1421929950377939125/Gc.png"
     },
     "conclusionWebhook": {
       "enabled": false,
-      "url": ""
+      "url": "",
+      "username": "Microsoft Rewards",
+      "avatarUrl": "https://media.discordapp.net/attachments/1421163952972369931/1421929950377939125/Gc.png"
     },
     "ntfy": {
       "enabled": false,
@@ -102,6 +88,7 @@
     }
   },
 
+  // Keep legacy arrays for exclude lists (preserve your values)
   "logExcludeFunc": [
     "SEARCH-CLOSE-TABS"
   ],
@@ -123,7 +110,9 @@
     "live": {
       "enabled": false,
       "redactEmails": true
-    }
+    },
+    // top-level compact redact flag also supported by logger
+    "redactEmails": true
   },
 
   "diagnostics": {
@@ -182,7 +171,9 @@
   "update": {
     "git": true,
     "docker": false,
-    "scriptPath": "setup/update/update.mjs"
+    "scriptPath": "setup/update/update.mjs",
+    "autoUpdateConfig": true,
+    "autoUpdateAccounts": true
   },
 
   "shuffleAccounts": true,
@@ -195,5 +186,44 @@
   "gmailNavWaitMs": 2500,
   "gmailSearchRetries": 3,
   "gmailSearchDelayMs": 1200,
-  "passwordFillDelayMs": 600
+  "passwordFillDelayMs": 600,
+
+  // ========== NEW FEATURES / FIELDS FROM MAIN (sensible defaults) ==========
+  "dryRun": false,
+
+  "queryDiversity": {
+    "enabled": true,
+    "sources": ["google-trends", "reddit", "local-fallback"],
+    "maxQueriesPerSource": 10,
+    "cacheMinutes": 30
+  },
+
+  "riskManagement": {
+    "enabled": true,
+    "autoAdjustDelays": true,
+    "stopOnCritical": false,
+    "banPrediction": true,
+    "riskThreshold": 75
+  },
+
+  "analytics": {
+    "enabled": true,
+    "retentionDays": 30,
+    "exportMarkdown": true,
+    "webhookSummary": true
+  },
+
+  // Keep compatibility with both old "proxy" and new nested proxy options
+  "proxySettings": {
+    "proxyGoogleTrends": true,
+    "proxyBingTerms": true
+  },
+
+  // Additional optional fields (defaults from main)
+  "diagnosticsSettings": {
+    "enabled": true
+  },
+
+  // Keep the older flat keys if any legacy code references them
+  "baseTimeout": "100s"
 }

@@ -1,7 +1,13 @@
 import { Page } from 'rebrowser-playwright'
+
 import { Workers } from '../Workers'
+import { TIMEOUTS } from '../../constants'
 
 export class Poll extends Workers {
+
+    // Default fallbacks if TIMEOUTS isn't available in the consumer project
+    private static readonly DEFAULT_SELECTOR_TIMEOUT = (TIMEOUTS && typeof TIMEOUTS.DASHBOARD_WAIT === 'number') ? TIMEOUTS.DASHBOARD_WAIT : 50000
+
 
     async doPoll(page: Page) {
         this.bot.log(this.bot.isMobile, 'POLL', 'Trying to complete poll')
@@ -30,30 +36,49 @@ export class Poll extends Workers {
                 // Try each candidate selector until we find clickable options
                 for (const sel of candidates) {
                     // quick presence check (short timeout)
-                    const present = await page.waitForSelector(sel, { state: 'attached', timeout: 50000 }).then(() => true).catch(() => false)
+                    const present = await page.waitForSelector(sel, { state: 'attached', timeout: Poll.DEFAULT_SELECTOR_TIMEOUT }).then(() => true).catch(() => false)
                     if (!present) continue
 
-                    // gather matching elements
-                    const handles = await page.$$(sel)
+                    // Prefer Playwright locator where possible for consistency
+                    const locator = page.locator(sel)
+                    const count = await locator.count().catch(() => 0)
+
+                    // If no locator nodes, fallback to element handles
+                    let handles = [] as any[]
+                    if (count && count > 0) {
+                        for (let i = 0; i < count; i++) {
+                            const node = locator.nth(i)
+                            const handle = await node.elementHandle().catch(() => null)
+                            if (handle) handles.push({ handle, nodeIndex: i })
+                        }
+                    } else {
+                        // If locator not helpful, try legacy $$ API
+                        handles = await page.$$(sel).catch(() => [])
+                        handles = handles.map((h: any, idx: number) => ({ handle: h, nodeIndex: idx }))
+                    }
+
                     if (!handles || handles.length === 0) continue
 
                     // prefer buttons/inputs that are visible and have size
-                    const visibleHandles: any[] = []
-                    for (const h of handles) {
+                    const visibleHandles: Array<{ handle: any, box: any, idx: number }> = []
+                    for (const hrec of handles) {
                         try {
+                            const h = hrec.handle
                             const box = await h.boundingBox()
                             if (!box || box.width === 0 || box.height === 0) continue
 
-                            // check computed style (display/visibility/opacity/hidden attr)
-                            // Accept 'any' here to satisfy TS overloads when passing ElementHandle
                             const cs = await page.evaluate((el: any) => {
-                                const style = window.getComputedStyle(el as Element)
-                                return { display: style.display, visibility: style.visibility, opacity: style.opacity, hidden: (el as Element).hasAttribute && (el as Element).hasAttribute('hidden') }
+                                try {
+                                    const style = window.getComputedStyle(el as Element)
+                                    return { display: style.display, visibility: style.visibility, opacity: style.opacity, hidden: (el as Element).hasAttribute && (el as Element).hasAttribute('hidden') }
+                                } catch {
+                                    return { display: '', visibility: '', opacity: '1', hidden: false }
+                                }
                             }, h)
 
                             if (cs.hidden || cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0) continue
 
-                            visibleHandles.push({ handle: h, box })
+                            visibleHandles.push({ handle: h, box, idx: hrec.nodeIndex })
                         } catch {
                             continue
                         }
@@ -61,7 +86,7 @@ export class Poll extends Workers {
 
                     if (visibleHandles.length === 0) continue
 
-                    // pick a random visible option (unless the selector was an explicit id)
+                    // pick a random visible option (unless the selector was an explicit id - then prefer first)
                     const pickIndex = (sel.startsWith('#btoption')) ? 0 : this.bot.utils.randomNumber(0, visibleHandles.length - 1)
                     const picked = visibleHandles[pickIndex]
                     if (!picked) continue
@@ -71,11 +96,11 @@ export class Poll extends Workers {
 
                     // ensure scrolled into view
                     try {
-                        // some Playwright versions support scrollIntoViewIfNeeded on handle
+                        // elementHandle.scrollIntoViewIfNeeded exists on some versions
                         // @ts-ignore
                         if (typeof h.scrollIntoViewIfNeeded === 'function') {
                             // @ts-ignore
-                            await h.scrollIntoViewIfNeeded({ timeout: 50000 })
+                            await h.scrollIntoViewIfNeeded({ timeout: 2000 })
                         } else {
                             await page.evaluate((b: { x: number, y: number, width: number, height: number }) => {
                                 const elems = document.elementsFromPoint(b.x + b.width / 2, b.y + b.height / 2)
@@ -93,11 +118,16 @@ export class Poll extends Workers {
                     // coverage check using elementFromPoint center
                     const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
                     const topMatch = await page.evaluate(({ x, y, sel }: { x: number, y: number, sel: string }) => {
-                        const top = document.elementFromPoint(x, y)
-                        if (!top) return 'none'
-                        const target = document.querySelector(sel)
-                        if (!target) return 'none'
-                        return (top === target || target.contains(top)) ? 'self-or-contained' : 'covered'
+                        try {
+                            const top = document.elementFromPoint(x, y)
+                            if (!top) return 'none'
+                            const all = Array.from(document.querySelectorAll(sel))
+                            const el = all[0] as Element | undefined
+                            if (!el) return 'none'
+                            return (top === el || el.contains(top)) ? 'self-or-contained' : 'covered'
+                        } catch {
+                            return 'none'
+                        }
                     }, { x: center.x, y: center.y, sel })
 
                     if (topMatch !== 'self-or-contained') {
@@ -111,7 +141,8 @@ export class Poll extends Workers {
                     // attempt click (short timeout), fallback to DOM click
                     let clicked = false
                     try {
-                        await h.click({ timeout: 50000 })
+                        // Preferred: attempt Playwright click from element handle
+                        await h.click({ timeout: Poll.DEFAULT_SELECTOR_TIMEOUT }).catch(() => { throw new Error('native click failed') })
                         clicked = true
                     } catch (err) {
                         this.bot.log(this.bot.isMobile, 'POLL', `Native click failed for selector "${sel}" — trying DOM fallback`, 'warn')
@@ -122,7 +153,7 @@ export class Poll extends Workers {
                                 if (!el) return false
                                 el.click()
                                 return true
-                            }, { sel, idx: pickIndex })
+                            }, { sel, idx: picked.idx })
                             clicked = !!fallback
                         } catch (e) {
                             this.bot.log(this.bot.isMobile, 'POLL', `DOM fallback click threw: ${e}`, 'warn')
@@ -139,7 +170,7 @@ export class Poll extends Workers {
                     await this.bot.utils.wait(this.bot.utils.randomNumber(800, 2200))
 
                     // optional: detect if poll moved to results/next step — quick check for common "result" selectors
-                    const resultPresent = await page.waitForSelector('.result, .poll-result, .thankyou, .wk_OptionResult', { state: 'attached', timeout: 50000 }).then(() => true).catch(() => false)
+                    const resultPresent = await page.waitForSelector('.result, .poll-result, .thankyou, .wk_OptionResult', { state: 'attached', timeout: 2000 }).then(() => true).catch(() => false)
                     if (resultPresent) {
                         this.bot.log(this.bot.isMobile, 'POLL', 'Poll appears to have completed (result detected)', 'log')
                     } else {
@@ -187,9 +218,11 @@ export class Poll extends Workers {
             for (const sel of overlayCloseSelectors) {
                 try {
                     const loc = page.locator(sel).first()
-                    if (await loc.count()) {
-                        if (await loc.isVisible()) {
-                            try { await loc.click({ timeout: 50000 }) } catch { /* ignore */ }
+                    const nodeCount = await loc.count().catch(() => 0)
+                    if (nodeCount) {
+                        const vis = await loc.isVisible().catch(() => false)
+                        if (vis) {
+                            try { await loc.click({ timeout: 2000 }) } catch { /* ignore */ }
                             await this.bot.utils.wait(120)
                         }
                     }
