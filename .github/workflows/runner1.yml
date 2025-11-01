@@ -22,6 +22,7 @@ jobs:
       TARGET_HOUR_TORONTO: '9'
       MAX_JITTER_SECONDS: '1500'
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
 
     steps:
       - name: Checkout repo
