@@ -1,19 +1,21 @@
-// src/Workers.ts
+// src/functions/Workers.ts
+import fs from 'fs'
 import { Page } from 'rebrowser-playwright'
 import { DashboardData, MorePromotion, PromotionalItem, PunchCard } from '../interface/DashboardData'
 import { MicrosoftRewardsBot } from '../index'
 import JobState from '../util/JobState'
+import Retry from '../util/Retry'
 import { AdaptiveThrottler } from '../util/AdaptiveThrottler'
 
 interface BaseActivity {
-    title: string;
-    offerId?: string;
-    name?: string;
-    complete: boolean;
-    pointProgressMax: number;
-    promotionType?: string;
-    destinationUrl?: string;
-    exclusiveLockedFeatureStatus?: string;
+    title: string
+    offerId?: string
+    name?: string
+    complete: boolean
+    pointProgressMax: number
+    promotionType?: string
+    destinationUrl?: string
+    exclusiveLockedFeatureStatus?: string
 }
 
 export class Workers {
@@ -53,9 +55,9 @@ export class Workers {
 
     private jobStateIsDone(email: string, day: string, offerId?: string): boolean {
         if (!offerId) return false
-        if (!this.jobState || typeof this.jobState.isDone !== 'function') return false
+        if (!this.jobState || typeof (this.jobState as any).isDone !== 'function') return false
         try {
-            return this.jobState.isDone(email, day, offerId)
+            return (this.jobState as any).isDone(email, day, offerId)
         } catch {
             return false
         }
@@ -63,16 +65,16 @@ export class Workers {
 
     private jobStateMarkDone(email: string, day: string, offerId?: string) {
         if (!offerId) return
-        if (!this.jobState || typeof this.jobState.markDone !== 'function') return
+        if (!this.jobState || typeof (this.jobState as any).markDone !== 'function') return
         try {
-            this.jobState.markDone(email, day, offerId)
+            ;(this.jobState as any).markDone(email, day, offerId)
         } catch (e) {
             this.bot?.log?.(this.bot?.isMobile, 'WORKERS', `jobState.markDone failed: ${e instanceof Error ? e.message : e}`, 'warn')
         }
     }
 
     /* =========================
-       Selector builders & overlays
+       Selector builders & overlays (advanced)
        ========================= */
 
     private async buildSelectorsForActivity(page: Page, activity: BaseActivity, punchCard?: PunchCard): Promise<string[]> {
@@ -237,7 +239,7 @@ export class Workers {
                 await this.bot.utils.wait(stepTime * (0.8 + Math.random() * 0.4))
             }
         } catch {
-            await page.mouse.move(0, 0)
+            await page.mouse.move(0, 0).catch(() => {})
         }
     }
 
@@ -482,7 +484,7 @@ export class Workers {
                 try {
                     await page.screenshot({ path: `debug_click_failed_${Date.now()}.png`, fullPage: false }).catch(() => {})
                     const html = await page.evaluate(() => document.documentElement.outerHTML).catch(() => '')
-                    require('fs').writeFileSync(`debug_page_${Date.now()}.html`, html)
+                    fs.writeFileSync(`debug_page_${Date.now()}.html`, html)
                 } catch { /* ignore */ }
                 return { success: false, reason: 'click-failed' }
             }
@@ -508,7 +510,7 @@ export class Workers {
 
         try {
             const html = await page.evaluate(() => document.documentElement.outerHTML).catch(() => '')
-            require('fs').writeFileSync(`debug_page_final_${Date.now()}.html`, html)
+            fs.writeFileSync(`debug_page_final_${Date.now()}.html`, html)
         } catch { /* ignore */ }
 
         return { success: false, reason: 'max-retries' }
@@ -518,7 +520,7 @@ export class Workers {
        Bounded re-run helper (2 passes)
        ========================= */
 
-    private async tryCompleteAll(page: Page, activities: BaseActivity[], punchCard?: PunchCard): Promise<{ completedOfferIds: string[], remainingActivities: BaseActivity[] }> {
+    private async tryCompleteAll(page: Page, activities: BaseActivity[], punchCard?: PunchCard): Promise<{ completedOfferIds: string[]; remainingActivities: BaseActivity[] }> {
         const maxPasses = 2
         const giveUp = false
         let remaining = [...activities]
@@ -557,7 +559,7 @@ export class Workers {
     }
 
     /* =========================
-       Public flows
+       Public flows (merged & robust)
        ========================= */
 
     async doDailySet(page: Page, data: DashboardData, maxActivities?: number) {
@@ -734,27 +736,20 @@ export class Workers {
         for (const activity of activitiesToProcess) {
             processedCount++
             try {
-                activityPage = await this.bot.browser.utils.getLatestTab(activityPage)
-                const pages = activityPage.context().pages()
-                if (pages.length > 3) {
-                    await activityPage.close()
-                    activityPage = await this.bot.browser.utils.getLatestTab(activityPage)
-                }
+                // Use centralized tab lifecycle management (main branch style)
+                activityPage = await this.manageTabLifecycle(activityPage, activityInitial)
 
+                // Humanize + initial throttle (main branch style)
                 await this.bot.browser.utils.humanizePage(activityPage)
-                const m1 = throttle.getDelayMultiplier()
-                await this.bot.utils.waitRandom(Math.floor(700 * m1), Math.floor(1300 * m1))
+                await this.applyThrottle(throttle, 700, 1300)
 
-                if (activityPage.url() !== activityInitial) {
-                    await activityPage.goto(activityInitial, { timeout: 30000 + Math.random() * 10000 }).catch(() => {})
-                    await this.bot.utils.waitRandom(800, 2000)
-                }
-
+                // occasional small scrolls
                 for (let i = 0; i < Math.floor(1 + Math.random() * 2); i++) {
                     await this.humanScroll(activityPage)
                     await this.bot.utils.waitRandom(400, 1200)
                 }
 
+                // Build selectors (use punchCard helper if provided)
                 let selectors: string[] = []
                 if (punchCard) {
                     try {
@@ -851,7 +846,9 @@ export class Workers {
                     this.bot.log(this.bot.isMobile, 'ACTIVITY',
                         `Processing activity ${processedCount}/${activitiesToProcess.length}: "${typeLabel}" - "${(activity as any).title}"`)
 
+                    const retry = new Retry(this.bot.config.retryPolicy)
                     let succeeded = false
+
                     for (let attempt = 1; attempt <= 2 && !succeeded; attempt++) {
                         try {
                             const timeoutMs = this.bot.utils.stringToMs(this.bot.config?.globalTimeout ?? '30s') * 2 + Math.random() * 8000
@@ -859,11 +856,21 @@ export class Workers {
                                 p,
                                 new Promise<void>((_, rej) => setTimeout(() => rej(new Error('activity-timeout')), timeoutMs))
                             ])
-                            await runWithTimeout(this.bot.activities.run(activityPage, activity as PromotionalItem | MorePromotion))
-                            throttle.record(true)
+
+                            await retry.run(async () => {
+                                try {
+                                    await runWithTimeout(this.bot.activities.run(activityPage, activity as PromotionalItem | MorePromotion))
+                                    throttle.record(true)
+                                } catch (e) {
+                                    await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_timeout_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
+                                    throttle.record(false)
+                                    throw e
+                                }
+                            }, () => true)
+
                             succeeded = true
                         } catch (e) {
-                            await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_timeout_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
+                            await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_error_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
                             throttle.record(false)
                             if (attempt < 2) {
                                 await this.bot.utils.waitRandom(500, 1200)
@@ -879,11 +886,10 @@ export class Workers {
                         `Skipped activity "${(activity as any).title}" | Reason: Unsupported type: "${(activity as any).promotionType}"!`, 'warn')
                 }
 
+                // humanize and a stable throttle pause (use helper)
                 await this.bot.browser.utils.humanizePage(activityPage)
-                {
-                    const m = throttle.getDelayMultiplier()
-                    await this.bot.utils.waitRandom(Math.floor(1000 * m), Math.floor(2000 * m))
-                }
+                await this.applyThrottle(throttle, 1000, 2000)
+
                 if (Math.random() < 0.4) await this.humanHover(activityPage, 'body')
             } catch (error) {
                 await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_error_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
@@ -895,5 +901,32 @@ export class Workers {
             `Completed processing ${processedCount} activities this iteration`)
 
         return completedOfferIds
+    }
+
+    /* =========================
+       Helpful small flow helpers (from main branch)
+       ========================= */
+
+    private async manageTabLifecycle(page: Page, initialUrl: string): Promise<Page> {
+        page = await this.bot.browser.utils.getLatestTab(page)
+
+        const pages = page.context().pages()
+        if (pages.length > 3) {
+            await page.close()
+            page = await this.bot.browser.utils.getLatestTab(page)
+        }
+
+        if (page.url() !== initialUrl) {
+            try {
+                await page.goto(initialUrl, { timeout: 30000 }).catch(() => {})
+            } catch { /* ignore */ }
+        }
+
+        return page
+    }
+
+    private async applyThrottle(throttle: AdaptiveThrottler, min: number, max: number): Promise<void> {
+        const multiplier = throttle.getDelayMultiplier()
+        await this.bot.utils.waitRandom(Math.floor(min * multiplier), Math.floor(max * multiplier))
     }
 }
