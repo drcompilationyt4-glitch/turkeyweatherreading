@@ -1,4 +1,3 @@
-// src/functions/Workers.ts
 import fs from 'fs'
 import { Page } from 'rebrowser-playwright'
 import { DashboardData, MorePromotion, PromotionalItem, PunchCard } from '../interface/DashboardData'
@@ -80,27 +79,56 @@ export class Workers {
     private async buildSelectorsForActivity(page: Page, activity: BaseActivity, punchCard?: PunchCard): Promise<string[]> {
         const candidates: string[] = []
 
+        // If punch card helper available, prefer it first (keeps punch-card behavior)
+        if (punchCard) {
+            try {
+                const derived = await this.bot.browser.func.getPunchCardActivity(page, activity as any)
+                if (derived) candidates.push(derived)
+            } catch { /* ignore */ }
+        }
+
+        // Special-case prefix style selectors used in original working code.
+        // This helps catch items that the *= matching missed.
+        const name = (activity.name || '').trim()
+        if (name) {
+            const lname = name.toLowerCase()
+            // These names commonly use prefix matching on the site; add ^=
+            if (lname.includes('membercenter') || lname.includes('exploreonbing') || lname.includes('searchonbing')) {
+                candidates.push(`[data-bi-id^="${name}"] .pointLink:not(.contentContainer .pointLink)`)
+                candidates.push(`[data-bi-id^="${name}"]`)
+            }
+            // generic name-based contains matches
+            const nameSafe = name.replace(/"/g, '\\"')
+            candidates.push(`[data-bi-id*="${nameSafe}"] .pointLink:not(.contentContainer .pointLink)`)
+            candidates.push(`[data-bi-id*="${nameSafe}"]`)
+        }
+
+        // offerId candidates (also include prefix ^ for parity with the working code)
         if (activity.offerId) {
-            candidates.push(`[data-bi-id*="${activity.offerId}"] .pointLink:not(.contentContainer .pointLink)`)
-            candidates.push(`[data-bi-id*="${activity.offerId}"]`)
+            const offer = activity.offerId
+            candidates.push(`[data-bi-id^="${offer}"] .pointLink:not(.contentContainer .pointLink)`)
+            candidates.push(`[data-bi-id^="${offer}"]`)
+            candidates.push(`[data-bi-id*="${offer}"] .pointLink:not(.contentContainer .pointLink)`)
+            candidates.push(`[data-bi-id*="${offer}"]`)
             const esc = (activity.offerId || '').replace(/"/g, '\\"')
             candidates.push(`[data-bi-id*="${esc}"] .pointLink:not(.contentContainer .pointLink)`)
             candidates.push(`[data-bi-id*="${esc}"]`)
         }
 
-        if (activity.name) {
-            const nameSafe = (activity.name || '').replace(/"/g, '\\"')
-            candidates.push(`[data-bi-id*="${nameSafe}"] .pointLink:not(.contentContainer .pointLink)`)
-            candidates.push(`[data-bi-id*="${nameSafe}"]`)
-        }
-
+        // destination URL - sometimes the card contains an <a href> that is clickable
         if (activity.destinationUrl) {
             try {
                 const urlSafe = (activity.destinationUrl || '').replace(/"/g, '\\"')
                 candidates.push(`a[href*="${urlSafe}"]`)
+                try {
+                    const u = new URL(activity.destinationUrl)
+                    const hostFrag = u.hostname
+                    if (hostFrag) candidates.push(`a[href*="${hostFrag}"]`)
+                } catch { /* ignore */ }
             } catch { /* ignore */ }
         }
 
+        // try matching by visible title text by scanning DOM (expensive but effective)
         if (activity.title) {
             try {
                 const title = activity.title
@@ -140,7 +168,7 @@ export class Workers {
                     if (!candidates.includes(s)) candidates.push(s)
                 }
             } catch {
-                // ignore
+                // ignore DOM inspection failure
             }
         }
 
@@ -148,6 +176,8 @@ export class Workers {
         candidates.push('.pointLink:not(.contentContainer .pointLink)')
         candidates.push('.pointLink')
         candidates.push('a:not(.contentContainer a)')
+        candidates.push('[data-bi-id] .pointLink:not(.contentContainer .pointLink)')
+        candidates.push('[data-bi-id]')
 
         return Array.from(new Set(candidates)).filter(Boolean)
     }
@@ -355,7 +385,7 @@ export class Workers {
                     await this.bot.utils.waitRandom(200, 500)
                     return true
                 }
-                const pos = await page.evaluate(() => ({ y: window.scrollY, max: document.documentElement.scrollHeight - window.innerHeight }))
+                const pos = await page.evaluate(() => ({ y: window.scrollY, max: document.documentElement.scrollHeight - window.innerHeight } ))
                 if (pos && typeof pos.y === 'number' && typeof pos.max === 'number' && pos.y >= pos.max - 2) break
                 if (i % 3 === 2) {
                     await page.evaluate((s) => window.scrollBy(0, -Math.floor(s / 4)), step).catch(() => {})
@@ -859,7 +889,8 @@ export class Workers {
 
                             await retry.run(async () => {
                                 try {
-                                    await runWithTimeout(this.bot.activities.run(activityPage, activity as PromotionalItem | MorePromotion))
+                                    // Use dedicated handler that implements all promotion types (quiz variants, urlreward/search, etc.)
+                                    await runWithTimeout(this.runActivityByType(activityPage, activity as PromotionalItem | MorePromotion))
                                     throttle.record(true)
                                 } catch (e) {
                                     await this.bot.browser.utils.captureDiagnostics(activityPage, `activity_timeout_${(activity as any).title || (activity as any).offerId || 'unknown'}`)
@@ -928,5 +959,93 @@ export class Workers {
     private async applyThrottle(throttle: AdaptiveThrottler, min: number, max: number): Promise<void> {
         const multiplier = throttle.getDelayMultiplier()
         await this.bot.utils.waitRandom(Math.floor(min * multiplier), Math.floor(max * multiplier))
+    }
+
+    /**
+     * Run an activity by inspecting its promotionType/pointProgressMax/name/destinationUrl
+     * and calling the appropriate handler on this.bot.activities. This preserves the
+     * semantics of your reference implementation but keeps the robust interleaving/retry logic.
+     */
+    private async runActivityByType(page: Page, activity: PromotionalItem | MorePromotion | any): Promise<void> {
+        // Some defensive normalization
+        const promotionType = (activity.promotionType || '').toLowerCase()
+        const name = (activity.name || '').toLowerCase()
+        const dest = (activity.destinationUrl || '').toLowerCase()
+        const points = Number(activity.pointProgressMax || 0)
+
+        // IMPORTANT: At this point the click that opened the activity has already happened
+        // in solveActivities; activity `page` should already be the new tab or navigated tab.
+
+        switch (promotionType) {
+            case 'quiz':
+                // Distinguish quiz subtypes by points or destinationUrl
+                if (points === 10) {
+                    // Poll vs ABC
+                    if (dest.includes('pollscenarioid')) {
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "Poll" title: "${activity.title}"`)
+                        await this.bot.activities.doPoll(page)
+                    } else {
+                        this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "ABC" title: "${activity.title}"`)
+                        await this.bot.activities.doABC(page)
+                    }
+                } else if (points === 50) {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "ThisOrThat" title: "${activity.title}"`)
+                    await this.bot.activities.doThisOrThat(page)
+                } else {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "Quiz" title: "${activity.title}"`)
+                    await this.bot.activities.doQuiz(page)
+                }
+                break
+
+            case 'urlreward':
+            case 'url_reward':
+            case 'visit':
+                // SearchOnBing is often a subtype of urlreward
+                if (name.includes('exploreonbing') || name.includes('searchonbing') || dest.includes('searchonbing')) {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "SearchOnBing" title: "${activity.title}"`)
+                    await this.bot.activities.doSearchOnBing(page, activity)
+                } else {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "UrlReward" title: "${activity.title}"`)
+                    await this.bot.activities.doUrlReward(page)
+                }
+                break
+
+            // If your system uses other promotionType values, handle them here:
+            case 'poll':
+                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "Poll" (explicit) title: "${activity.title}"`)
+                await this.bot.activities.doPoll(page)
+                break
+
+            case 'abc':
+                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "ABC" (explicit) title: "${activity.title}"`)
+                await this.bot.activities.doABC(page)
+                break
+
+            case 'thisorthat':
+            case 'this-or-that':
+                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "ThisOrThat" (explicit) title: "${activity.title}"`)
+                await this.bot.activities.doThisOrThat(page)
+                break
+
+            case 'search':
+                this.bot.log(this.bot.isMobile, 'ACTIVITY', `Found activity type: "Search" title: "${activity.title}"`)
+                await this.bot.activities.doSearchOnBing(page, activity)
+                break
+
+            // Add any other explicit known types here...
+
+            default:
+                // Fallback: if activities.run exists, prefer that generic handler
+                if (typeof this.bot.activities.run === 'function') {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `Falling back to generic activity runner for title: "${activity.title}" (type: "${promotionType}")`)
+                    await this.bot.activities.run(page, activity)
+                } else {
+                    this.bot.log(this.bot.isMobile, 'ACTIVITY', `No handler for activity "${activity.title}" (type: "${promotionType}")`, 'warn')
+                }
+                break
+        }
+
+        // Small cooldown to allow navigation or points to register
+        await this.bot.utils.waitRandom(400, 900)
     }
 }

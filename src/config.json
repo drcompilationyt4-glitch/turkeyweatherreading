@@ -221,7 +221,7 @@
 
   // Additional optional fields (defaults from main)
   "diagnosticsSettings": {
-    "enabled": true
+    "enabled": false
   },
 
   // Keep the older flat keys if any legacy code references them

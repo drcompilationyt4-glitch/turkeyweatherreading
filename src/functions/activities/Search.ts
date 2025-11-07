@@ -1150,7 +1150,7 @@ export class Search extends Workers {
             throw new Error('OpenRouter API key not configured')
         }
 
-        const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
+        const preferredModel = this.bot.config?.openRouterPreferredModel || 'tngtech/deepseek-r1t2-chimera:free'
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
