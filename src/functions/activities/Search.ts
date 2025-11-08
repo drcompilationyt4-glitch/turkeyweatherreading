@@ -400,7 +400,7 @@ export class Search extends Workers {
         this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (70% Trends / 30% LLM; Trends fill missing)`)
 
         // Default to 30% LLM (i.e. 70% Trends). Respect config override but clamp 0..100.
-        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 30))
+        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 43))
         const llmCount = Math.max(0, Math.ceil(desiredCount * (llmPct / 100)))
         const trendsCount = Math.max(0, desiredCount - llmCount)
 
@@ -1152,12 +1152,24 @@ export class Search extends Workers {
         }
     }
 
-    /**
-     * Batch LLM request: ask OpenRouter (or compatible) for JSON array of queries.
-     * Returns normalized GoogleSearch[]
-     *
-     * FIXED: Better error handling for MiniMax "No content from LLM" issue
-     */
+    // Updated: replaced deepseek preferred model with z-ai/glm-4.5-air:free
+    // Kept most logic the same. Adjusted example searches to favor services (chatgpt, youtube, gmail, deepseek)
+    // and games/platforms (steam, roblox) while keeping UofT items present but less frequent. Kept axios usage
+    // and proxy:false. Added optional reasoning flag support in request body when using GLM-4.5-Air.
+
+    // Updated: replaced deepseek preferred model with z-ai/glm-4.5-air:free
+    // Kept most logic the same. Adjusted example searches to favor services (chatgpt, youtube, gmail, deepseek)
+    // and games/platforms (steam, roblox) while keeping UofT items present but less frequent. Kept axios usage
+    // and proxy:false. Added reasoning_enabled = true for GLM-4.5-Air (thinking mode). Increased timeout for longer reasoning.
+
+    // Updated: replaced deepseek preferred model with z-ai/glm-4.5-air:free
+    // Kept most logic the same. Adjusted example searches to favor services (chatgpt, youtube, gmail, deepseek)
+    // and games/platforms (steam, roblox) while keeping UofT items present but less frequent. Kept axios usage
+    // and proxy:false. Added reasoning_enabled = true for GLM-4.5-Air (thinking mode). Increased timeout for longer reasoning.
+
+// NOTE: remove any hard-coded API keys in your repo and rotate compromised keys immediately.
+
+// --- generateQueriesWithLLMBatch ---
     private async generateQueriesWithLLMBatch(
         geoLocale: string,
         desiredCount = 25,
@@ -1167,19 +1179,17 @@ export class Search extends Workers {
     ): Promise<GoogleSearch[]> {
         const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
-
         const keys = [envKey1, envKey2].filter(k => !!k)
         if (!keys.length) {
             this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key(s) missing. Set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2 or bot.config.openRouterApiKey', 'error')
             throw new Error('OpenRouter API key not configured')
         }
 
-        const preferredModel = this.bot.config?.openRouterPreferredModel || 'tngtech/deepseek-r1t2-chimera:free'
+        const preferredModel = this.bot.config?.openRouterPreferredModel || 'z-ai/glm-4.5-air:free'
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
 
-        // Style tips (keeps prompt varied)
         const realisticPatterns = [
             'Prefer very short queries (1-3 words), but allow up to 4 words for partial anime titles or short phrases (e.g., "reincarnated as slime").',
             'Mix one-word hot queries (YouTube, GitHub) with short 2-4 word specifics (e.g., "vegetarian fajitas", "attack on titan").',
@@ -1187,62 +1197,58 @@ export class Search extends Workers {
             'Avoid long prose; produce concise search-style phrases or titles. Keep JSON-only output.'
         ]
 
-        // Examples tuned to user's screenshot + desired anime/site style and regular student searches
         const exampleSearches = [
-            'deepsek',
-            'chatgpt',
-            'deepseek',
-            'openrouter',
-            'vegetarian fajitas',
-            'qwen',
-            'github',
-            'youtube music',
-            // anime/title/site examples
-            'attack on titan',
-            'reincarnated as slime',
-            're:zero',
-            'anime streaming sites',
-            'crunchyroll',
-            'myanimelist',
-            // student items
-            'csc108',
-            'mat137',
-            'prof smith office hours',
-            'wiki relativity',
-            'how to git',
-            'quick ramen recipe'
+            'deepseek', 'chatgpt', 'youtube', 'gmail', 'deepseek', 'chatgpt', 'youtube music', 'gmail login',
+            'attack on titan', 'reincarnated as slime', 're:zero', 'anime streaming sites', 'crunchyroll', 'myanimelist',
+            'steam', 'roblox', 'steam store', 'roblox login', 'uoft', 'uoft email', 'csc108', 'mat137',
+            'prof smith office hours', 'wiki relativity', 'quick ramen recipe', 'how to git'
         ]
 
-        const systemPrompt = `You are an assistant that outputs JSON only: a single JSON array of objects. Each object must contain:
-- "topic": a short realistic search query a University of Toronto undergraduate might type (prefer 1-3 words; allow up to 4 words for partial/full anime titles or short phrases).
-- "related": an array of 0..6 short related searches.
-
-Guidelines:
-- Use ${geoLocale.toUpperCase()} locale when relevant.
-- Keep queries concise and search-like: single words ("youtube", "github"), short phrases ("vegetarian fajitas", "attack on titan"), or short commands/questions ("how to git", "wiki relativity").
-- For anime-related queries, produce search-style titles or partial titles (examples: "attack on titan", "reincarnated as slime", "re:zero"), or site queries ("anime streaming sites", "crunchyroll", "myanimelist").
-- Favor student-relevant items: course codes (CSC108), prof names, campus locations, streaming creators, quick recipes, known tools (chatgpt, qwen, openrouter).
-- Avoid politically sensitive or adult content.
-- Avoid repeating the same phrase; be diverse.
-- Use the example search history to match tone and brevity: ${exampleSearches.slice(0,8).join(', ')} ... plus anime/site and student examples.
-- Output MUST be valid JSON only (no explanation). This request context: ${contextNotes}. Use style tip: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
+        const systemPrompt = `You are an assistant that outputs JSON only: a single JSON array of objects. Each object must contain: - "topic": a short realistic search query a University of Toronto undergraduate might type (prefer 1-3 words; allow up to 4 words for partial/full anime titles or short phrases). - "related": an array of 0..6 short related searches.  Guidelines: - Use ${geoLocale.toUpperCase()} locale when relevant. - Keep queries concise and search-like: single words ("youtube", "github"), short phrases ("vegetarian fajitas", "attack on titan"), or short commands/questions ("how to git", "wiki relativity"). - For anime-related queries, produce search-style titles or partial titles (examples: "attack on titan", "reincarnated as slime", "re:zero"), or site queries ("anime streaming sites", "crunchyroll", "myanimelist"). - Favor student-relevant items: course codes (CSC108), prof names, campus locations, streaming creators, quick recipes, known tools (chatgpt, qwen, openrouter). - Avoid politically sensitive or adult content. - Avoid repeating the same phrase; be diverse **but services (chatgpt, youtube, gmail, deepseek) and platforms (steam, roblox) may appear more often** to match real human search behaviour. - Use the example search history to match tone and brevity: ${exampleSearches.slice(0,8).join(', ')} ... plus anime/site and student examples. - Output MUST be valid JSON only (no explanation). This request context: ${contextNotes}. Use style tip: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
 
         const userPrompt = `Generate up to ${desiredCount} concise search queries a University of Toronto undergraduate might use. Prefer short queries (1-3 words), allow up to 4 words for partial anime titles or short site phrases. Output JSON array only.`
 
-        const baseMessages = [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-        ]
+        const baseMessages = [ { role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt } ]
 
         const maxTokens = Math.min(1600, 90 * desiredCount)
 
-        const sendOnce = async (apiKey: string, model: string) => {
-            const body = {
+        // Build request body using OpenRouter 'reasoning' object
+        const buildRequestBody = (model: string) => {
+            const body: any = {
                 model,
                 messages: baseMessages,
                 max_tokens: maxTokens,
                 temperature: 0.6
             }
+
+            if (/glm-4.5-air/i.test(model) || /glm-4.5/i.test(model)) {
+                // Default to enabling reasoning per your request; allow overrides in config
+                const cfgEnable = typeof this.bot.config?.openRouterReasoningEnabled === 'boolean'
+                    ? this.bot.config.openRouterReasoningEnabled
+                    : true
+
+                body.reasoning = { enabled: !!cfgEnable }
+
+                if (body.reasoning.enabled) {
+                    body.reasoning.effort = typeof this.bot.config?.openRouterReasoningEffort === 'string'
+                        ? this.bot.config.openRouterReasoningEffort
+                        : 'medium'
+                    if (typeof this.bot.config?.openRouterReasoningMaxTokens === 'number') {
+                        body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens
+                    }
+                    if (typeof this.bot.config?.openRouterReasoningExclude === 'boolean') {
+                        body.reasoning.exclude = !!this.bot.config.openRouterReasoningExclude
+                    }
+                }
+            }
+
+            return body
+        }
+
+        const sendOnce = async (apiKey: string, model: string): Promise<string> => {
+            const body = buildRequestBody(model)
+            const reasoningOn = body.reasoning && body.reasoning.enabled === true
+            const timeoutMs = reasoningOn ? (this.bot.config?.openRouterReasoningTimeoutMs || 240000) : 90000
 
             const requestConfig: AxiosRequestConfig = {
                 url: 'https://openrouter.ai/api/v1/chat/completions',
@@ -1254,42 +1260,78 @@ Guidelines:
                     'X-Title': 'TourDeFrance Search Bot'
                 },
                 data: body,
-                timeout: 30000,
+                timeout: timeoutMs,
                 proxy: false
             }
 
-            try {
-                const resp = await axios.request(requestConfig as any)
+            // Try + one retry on "empty" content
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const resp = await axios.request(requestConfig as any)
 
-                let content: string | undefined
-                const choices = resp?.data?.choices
+                    // representative choice/message
+                    const choice = Array.isArray(resp?.data?.choices) && resp.data.choices.length ? resp.data.choices[0] : null
+                    const msg = choice?.message || {}
 
-                if (Array.isArray(choices) && choices.length) {
-                    content = choices[0]?.message?.content || choices[0]?.text
-                } else if (typeof resp?.data === 'string') {
-                    content = resp.data
-                } else if (resp?.data?.result?.content) {
-                    content = resp.data.result.content
-                } else if (resp?.data?.content) {
-                    content = resp.data.content
-                }
+                    // extract content from the usual and reasoning fields
+                    let content: string | undefined
+                    if (typeof msg.content === 'string' && msg.content.trim().length) {
+                        content = msg.content
+                    } else if (typeof msg.reasoning === 'string' && msg.reasoning.trim().length) {
+                        content = msg.reasoning
+                    } else if (msg.reasoning && typeof msg.reasoning === 'object') {
+                        try { content = JSON.stringify(msg.reasoning) } catch { content = String(msg.reasoning || '') }
+                    } else if (choice && typeof choice.text === 'string' && choice.text.trim().length) {
+                        content = choice.text
+                    } else if (typeof resp?.data?.result?.content === 'string' && resp.data.result.content.trim().length) {
+                        content = resp.data.result.content
+                    } else if (typeof resp?.data?.content === 'string' && resp.data.content.trim().length) {
+                        content = resp.data.content
+                    } else if (typeof resp?.data === 'string' && resp.data.trim().length) {
+                        content = resp.data
+                    }
 
-                if (!content || content.trim().length === 0) {
-                    throw new Error('No content from LLM (empty response)')
+                    if (!content || !String(content).trim()) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM',
+                            `LLM returned empty content (attempt ${attempt+1}); status=${resp?.status} body-keys=${resp && typeof resp.data === 'object' ? Object.keys(resp.data) : typeof resp.data}`,
+                            'warn')
+                        if (attempt === 0) {
+                            await new Promise(res => setTimeout(res, reasoningOn ? 2000 : 500))
+                            continue
+                        }
+                        throw new Error('No content from LLM (empty response)')
+                    }
+
+                    return String(content)
+                } catch (error: any) {
+                    if (error.response) {
+                        const status = error.response.status
+                        const data = error.response.data
+                        throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
+                    } else if (error.code === 'ECONNABORTED') {
+                        throw new Error('Request timeout')
+                    } else if (error.message && error.message.includes('No content')) {
+                        throw error
+                    } else {
+                        if (attemptRetryable(error)) {
+                            if (attempt === 0) {
+                                await new Promise(res => setTimeout(res, 500))
+                                continue
+                            }
+                        }
+                        throw new Error(`Request failed: ${error.message || String(error)}`)
+                    }
                 }
-                return content
-            } catch (error: any) {
-                if (error.response) {
-                    const status = error.response.status
-                    const data = error.response.data
-                    throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
-                } else if (error.code === 'ECONNABORTED') {
-                    throw new Error('Request timeout')
-                } else if (error.message && error.message.includes('No content')) {
-                    throw error
-                } else {
-                    throw new Error(`Request failed: ${error.message || String(error)}`)
-                }
+            }
+
+            // Guarantee we never fall through without throwing (TypeScript safety)
+            throw new Error('LLM request failed after retries (batch sendOnce)')
+
+            // small helper: retryable error heuristic
+            function attemptRetryable(err: any) {
+                if (!err) return false
+                const msg = String(err.message || '')
+                return msg.includes('ECONNRESET') || msg.includes('ENOTFOUND') || msg.includes('ECONNABORTED')
             }
         }
 
@@ -1301,15 +1343,12 @@ Guidelines:
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} with an API key`)
                 const content = await sendOnce(key, preferredModel)
 
-                // parsing with robust fallbacks
+                // parse robustly (strip code fences if present)
                 let parsed: any = null
-                try {
-                    parsed = JSON.parse(String(content))
-                } catch {
+                try { parsed = JSON.parse(String(content)) } catch {
                     const s = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
-                    try {
-                        parsed = JSON.parse(s)
-                    } catch {
+                    try { parsed = JSON.parse(s) }
+                    catch {
                         const jsonMatch = String(content).match(/\[[\s\S]*\]/)
                         if (jsonMatch) parsed = JSON.parse(jsonMatch[0])
                         else throw new Error('No JSON array found in LLM response')
@@ -1318,7 +1357,6 @@ Guidelines:
 
                 if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
 
-                // normalize and enforce short query shape with anime/site allowance
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
                     let topic = ''
                     if (typeof item.topic === 'string') topic = item.topic
@@ -1326,20 +1364,14 @@ Guidelines:
                     else if (item && item[0] && typeof item[0] === 'string') topic = item[0]
                     topic = topic.trim().replace(/(^"|"$)/g, '')
 
-                    // allow up to 4 words for anime/site phrases, otherwise cap at 3 words
                     const words = topic.split(/\s+/).filter(Boolean)
                     const maxWords = /anime|crunchyroll|myanimelist|attack|reincarnated|re:zero/i.test(topic) ? 4 : 3
                     const finalWords = words.slice(0, Math.max(1, Math.min(maxWords, words.length)))
                     let cleaned = finalWords.join(' ').replace(/[^\w\s:-]/g, '').trim()
-
-                    // If cleaned is still long ( > 40 chars ), truncate to 40 chars preserving words
-                    if (cleaned.length > 40) {
-                        cleaned = cleaned.split(/\s+/).slice(0, 4).join(' ').slice(0, 40).trim()
-                    }
+                    if (cleaned.length > 40) cleaned = cleaned.split(/\s+/).slice(0, 4).join(' ').slice(0, 40).trim()
 
                     const related = Array.isArray(item.related) ? item.related.map((r: any) => {
                         if (typeof r !== 'string') return ''
-                        // keep related brief (<=4 words)
                         const rw = r.trim().split(/\s+/).slice(0, 4).join(' ').replace(/[^\w\s-]/g, '').trim()
                         return rw
                     }).filter((r: string) => r.length > 0) : []
@@ -1363,15 +1395,12 @@ Guidelines:
                 const content = await sendOnce(key, fallbackModel)
 
                 let parsed: any = null
-                try {
-                    parsed = JSON.parse(String(content))
-                } catch {
+                try { parsed = JSON.parse(String(content)) } catch {
                     const trimmed = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
                     const jsonMatch = trimmed.match(/\[[\s\S]*\]/)
                     if (jsonMatch) parsed = JSON.parse(jsonMatch[0])
                     else parsed = JSON.parse(trimmed)
                 }
-
                 if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
 
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
@@ -1406,36 +1435,49 @@ Guidelines:
         throw lastErr || new Error('LLM failed')
     }
 
-
-    /**
-     * Single-query LLM generation (used in per-search mode or per-search fallback).
-     * Returns single string or null.
-     *
-     * FIXED: Better error handling for MiniMax "No content from LLM" issue
-     */
+// --- generateSingleQueryFromLLM ---
     private async generateSingleQueryFromLLM(geoLocale: string = 'US', mode: Mode = 'balanced'): Promise<string | null> {
         const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
         const keys = [envKey1, envKey2].filter(k => !!k)
         if (!keys.length) throw new Error('OpenRouter API key not configured')
 
-        const preferredModel = this.bot.config?.openRouterPreferredModel || 'minimax/minimax-m2:free'
+        const preferredModel = this.bot.config?.openRouterPreferredModel || 'z-ai/glm-4.5-air:free'
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
         const systemPrompt = `You are an assistant that outputs only one short search query (plain text) a typical undergraduate student might use. Keep it short (3-8 words). Use ${geoLocale.toUpperCase()} locale if relevant. Avoid politics & adult content. Output MUST be only the query string. Mode hint: ${mode}.`
         const userPrompt = `Provide a single concise search query a university undergrad might use.`
 
-        const makeBody = (model: string) => ({
-            model,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ],
-            max_tokens: 60,
-            temperature: 0.8
-        })
+        const makeBody = (model: string) => {
+            const body: any = {
+                model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                ],
+                max_tokens: 60,
+                temperature: 0.8
+            }
 
-        const sendOnce = async (apiKey: string, model: string) => {
+            if (/glm-4.5-air/i.test(model) || /glm-4.5/i.test(model)) {
+                const cfg = typeof this.bot.config?.openRouterReasoningEnabled === 'boolean' ? this.bot.config.openRouterReasoningEnabled : true
+                body.reasoning = { enabled: !!cfg }
+                if (body.reasoning.enabled) {
+                    body.reasoning.effort = typeof this.bot.config?.openRouterReasoningEffort === 'string' ? this.bot.config.openRouterReasoningEffort : 'medium'
+                    if (typeof this.bot.config?.openRouterReasoningMaxTokens === 'number') {
+                        body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens
+                    }
+                }
+            }
+
+            return body
+        }
+
+        const sendOnce = async (apiKey: string, model: string): Promise<string> => {
+            const body = makeBody(model)
+            const reasoningOn = body.reasoning && body.reasoning.enabled === true
+            const timeoutMs = reasoningOn ? (this.bot.config?.openRouterReasoningTimeoutMs || 180000) : 60000
+
             const requestConfig: AxiosRequestConfig = {
                 url: 'https://openrouter.ai/api/v1/chat/completions',
                 method: 'POST',
@@ -1445,58 +1487,94 @@ Guidelines:
                     'HTTP-Referer': 'https://github.com/tourdefrance',
                     'X-Title': 'TourDeFrance Search Bot'
                 },
-                data: makeBody(model),
-                timeout: 20000,
+                data: body,
+                timeout: timeoutMs,
                 proxy: false
             }
 
-            const resp = await axios.request(requestConfig as any)
-            const choices = resp?.data?.choices
-            let rawContent = choices?.[0]?.message?.content || choices?.[0]?.text || (typeof resp?.data === 'string' ? resp.data : undefined)
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const resp = await axios.request(requestConfig as any)
+                    const choice = Array.isArray(resp?.data?.choices) && resp.data.choices.length ? resp.data.choices[0] : null
+                    const msg = choice?.message || {}
 
-            if (!rawContent || String(rawContent).trim().length === 0) {
-                throw new Error('No content from LLM (empty response)')
+                    let rawContent: string | undefined
+                    if (typeof msg.content === 'string' && msg.content.trim().length) rawContent = msg.content
+                    else if (typeof msg.reasoning === 'string' && msg.reasoning.trim().length) rawContent = msg.reasoning
+                    else if (msg.reasoning && typeof msg.reasoning === 'object') {
+                        try { rawContent = JSON.stringify(msg.reasoning) } catch { rawContent = String(msg.reasoning || '') }
+                    } else if (choice && typeof choice.text === 'string' && choice.text.trim().length) rawContent = choice.text
+                    else if (typeof resp?.data?.result?.content === 'string' && resp.data.result.content.trim().length) rawContent = resp.data.result.content
+                    else if (typeof resp?.data === 'string' && resp.data.trim().length) rawContent = resp.data
+
+                    if (!rawContent || !String(rawContent).trim()) {
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Single-query LLM returned empty content (attempt ${attempt+1}); status=${resp?.status} body-keys=${resp && typeof resp.data === 'object' ? Object.keys(resp.data) : typeof resp.data}`, 'warn')
+                        if (attempt === 0) {
+                            await new Promise(res => setTimeout(res, reasoningOn ? 1500 : 300))
+                            continue
+                        }
+                        throw new Error('No content from LLM (empty response)')
+                    }
+                    return String(rawContent)
+                } catch (error: any) {
+                    if (error.response) {
+                        const status = error.response.status
+                        const data = error.response.data
+                        throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
+                    } else if (error.code === 'ECONNABORTED') {
+                        throw new Error('Request timeout')
+                    } else {
+                        if (attempt === 0) {
+                            await new Promise(res => setTimeout(res, 500))
+                            continue
+                        }
+                        throw new Error(`Request failed: ${error.message || String(error)}`)
+                    }
+                }
             }
-            return String(rawContent)
+
+            // Guarantee a throw if nothing returned
+            throw new Error('LLM request failed after retries (single sendOnce)')
         }
 
-        // Try preferred model with key1 then key2
         let lastErr: any = null
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} for single-query with a key`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel}`)
                 const raw = await sendOnce(key, preferredModel)
                 const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
-                const cleanedLines = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
-                const candidate = cleanedLines.length ? cleanedLines[0] : String(raw).trim()
-                const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+                const cleaned = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)[0] || raw.trim()
+                const final = cleaned.replace(/(^"|"$)/g, '').trim()
                 if (!final || final.length < 2) throw new Error('Parsed query too short')
                 return final.length > 200 ? final.slice(0, 200) : final
             } catch (err) {
                 lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred single-query attempt failed with a key: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred single-query failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
             }
         }
 
-        // Try fallback model with key1 then key2
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} for single-query with a key`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel}`)
                 const raw = await sendOnce(key, fallbackModel)
                 const stripFences = (txt: string) => String(txt).replace(/```(?:json)?/g, '').trim()
-                const cleanedLines = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)
-                const candidate = cleanedLines.length ? cleanedLines[0] : String(raw).trim()
-                const final = String(candidate).replace(/(^"|"$)/g, '').trim()
+                const cleaned = stripFences(raw).split(/\r?\n/).map(l => l.trim()).filter(l => l.length)[0] || raw.trim()
+                const final = cleaned.replace(/(^"|"$)/g, '').trim()
                 if (!final || final.length < 2) throw new Error('Parsed query too short')
                 return final.length > 200 ? final.slice(0, 200) : final
             } catch (err) {
                 lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback single-query attempt failed with a key: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback single-query failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
             }
         }
 
         throw lastErr || new Error('LLM single-query failed')
     }
+
+
+
+
+
 }
 
 // Types used in this file
