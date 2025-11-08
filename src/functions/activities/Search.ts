@@ -397,25 +397,27 @@ export class Search extends Workers {
         runSeed?: number,
         modesPool?: Mode[]
     ): Promise<GoogleSearch[]> {
-        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (50/50 LLM/Trends; local fills missing)`)
+        this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Generating ${desiredCount} queries (70% Trends / 30% LLM; Trends fill missing)`)
 
-        // 50% LLM, 50% Trends (changed from 75/25)
-        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 50))
+        // Default to 30% LLM (i.e. 70% Trends). Respect config override but clamp 0..100.
+        const llmPct = Math.max(0, Math.min(100, this.bot.config.searchSettings?.queryMix?.llmPct ?? 30))
         const llmCount = Math.max(0, Math.ceil(desiredCount * (llmPct / 100)))
         const trendsCount = Math.max(0, desiredCount - llmCount)
 
-        // 1) Attempt LLM batch first
+        // 1) Attempt LLM batch first (target llmCount)
         let llmQueries: GoogleSearch[] = []
+        let llmShortfall = 0
         try {
             if (llmCount > 0) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Attempting LLM batch for ${llmCount} queries`)
                 llmQueries = await this.getEnhancedLLMQueries(geoLocale, llmCount, mode, runSeed)
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM returned ${llmQueries.length} items`)
+                if (llmQueries.length < llmCount) llmShortfall = llmCount - llmQueries.length
             }
         } catch (err) {
             this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM batch failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
             // per-search fallback if enabled
-            if (this.bot.config.searchSettings?.enablePerSearchFallback) {
+            if (this.bot.config.searchSettings?.enablePerSearchFallback && llmCount > 0) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Attempting per-search LLM fallback')
                 const per: GoogleSearch[] = []
                 for (let i = 0; i < llmCount; i++) {
@@ -428,23 +430,28 @@ export class Search extends Workers {
                 }
                 llmQueries = per
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Per-search LLM returned ${llmQueries.length} items`)
+                if (llmQueries.length < llmCount) llmShortfall = llmCount - llmQueries.length
+            } else {
+                llmShortfall = llmCount
             }
         }
 
-        // 2) Attempt Trends with caching (only for the number of remaining slots)
+        // 2) Attempt Trends with caching.
+        // If LLM had shortfall, attempt to fetch extra trends to cover that shortfall.
         let trendsQueries: GoogleSearch[] = []
-        if (trendsCount > 0) {
+        const trendsNeeded = Math.max(0, trendsCount + llmShortfall) // request extra to cover shortfall
+        if (trendsNeeded > 0) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsCount})`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Fetching Google Trends (up to ${trendsNeeded})`)
                 const gt = await this.getCachedGoogleTrends(geoLocale)
                 if (gt.length) {
-                    trendsQueries = this.bot.utils.shuffleArray(gt).slice(0, trendsCount)
+                    trendsQueries = this.bot.utils.shuffleArray(gt).slice(0, trendsNeeded)
                     this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google trends cache returned ${gt.length} items, sampled ${trendsQueries.length}`)
 
-                    // Remove used queries from cache to avoid reuse
-                    if (Search.googleTrendsCache && Search.googleTrendsCache.geoLocale === geoLocale) {
+                    // Remove used queries from cache (if stored and matches locale)
+                    if ((Search as any).googleTrendsCache && (Search as any).googleTrendsCache.geoLocale === geoLocale) {
                         const remainingQueries = gt.filter(item => !trendsQueries.includes(item))
-                        Search.googleTrendsCache.queries = remainingQueries
+                        ;(Search as any).googleTrendsCache.queries = remainingQueries
                     }
                 } else {
                     throw new Error('No usable Google trends')
@@ -453,10 +460,10 @@ export class Search extends Workers {
                 this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Google Trends fetch failed (non-fatal): ${tErr instanceof Error ? tErr.message : String(tErr)}`, 'warn')
                 // Fallback to Reddit if Google Trends fails
                 try {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Falling back to Reddit Trends (up to ${trendsCount})`)
+                    this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Falling back to Reddit Trends (up to ${trendsNeeded})`)
                     const rawTrends = await this.getRedditTrends(geoLocale)
                     if (Array.isArray(rawTrends) && rawTrends.length) {
-                        trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsCount)
+                        trendsQueries = this.bot.utils.shuffleArray(rawTrends).slice(0, trendsNeeded)
                         this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Reddit trends returned ${rawTrends.length} items, sampled ${trendsQueries.length}`)
                     } else {
                         this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'Reddit trends returned no usable items', 'warn')
@@ -467,62 +474,73 @@ export class Search extends Workers {
             }
         }
 
-        // 3) Combine according to rules:
+        // 3) Combine according to rules: prioritize Trends (since 70% trends), then LLM, then local fallback.
         const combined: GoogleSearch[] = []
         const seen = new Set<string>()
 
+        const normalizeKey = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '')
+
         const pushIfUnique = (q: GoogleSearch) => {
             if (!q?.topic) return false
-            const key = q.topic.toLowerCase().replace(/[^a-z0-9]/g, '')
+            const key = normalizeKey(q.topic)
             if (!key || seen.has(key)) return false
             seen.add(key)
             combined.push(q)
             return true
         }
 
+        // 3a) Start with Trends (sample up to trendsCount from trendsQueries)
+        if (trendsQueries && trendsQueries.length > 0) {
+            for (const t of trendsQueries) {
+                if (combined.length >= desiredCount) break
+                pushIfUnique(t)
+            }
+        }
+
+        // 3b) Append LLM (up to llmCount), if LLM provided items
         if (llmQueries && llmQueries.length > 0) {
-            // Keep LLM items first (up to desiredCount)
             for (const q of llmQueries) {
                 if (combined.length >= desiredCount) break
                 pushIfUnique(q)
             }
+        }
 
-            // Now append trends up to remaining slots
-            for (const t of trendsQueries) {
-                if (combined.length >= desiredCount) break
-                pushIfUnique(t)
-            }
-
-            // If still short, fill missing with local queries (do NOT discard LLM)
-            if (combined.length < desiredCount) {
-                const missing = desiredCount - combined.length
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Trends insufficient — topping up ${missing} from local fallback`)
-                const localCandidates = await this.getLocalQueriesFallback(Math.max(missing, 5))
-                for (const l of localCandidates) {
-                    if (combined.length >= desiredCount) break
-                    pushIfUnique(l)
+        // 3c) If still short, try to pull more trends from cache (if any left)
+        if (combined.length < desiredCount) {
+            const missing = desiredCount - combined.length
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Top-up: need ${missing} more queries after Trends/LLM. Attempting to fill from trends cache.`)
+            try {
+                const gtExtra = await this.getCachedGoogleTrends(geoLocale)
+                if (gtExtra && gtExtra.length) {
+                    const sample = this.bot.utils.shuffleArray(gtExtra).slice(0, missing)
+                    for (const s of sample) {
+                        if (combined.length >= desiredCount) break
+                        if (pushIfUnique(s)) {
+                            if ((Search as any).googleTrendsCache && (Search as any).googleTrendsCache.geoLocale === geoLocale) {
+                                (Search as any).googleTrendsCache.queries = (Search as any).googleTrendsCache.queries.filter((x: any) => x !== s)
+                            }
+                        }
+                    }
                 }
-            }
-        } else {
-            // LLM returned nothing — use trends first, then local
-            for (const t of trendsQueries) {
-                if (combined.length >= desiredCount) break
-                pushIfUnique(t)
-            }
-            if (combined.length < desiredCount) {
-                const missing = desiredCount - combined.length
-                this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `LLM empty — filling ${missing} from local fallback`)
-                const localCandidates = await this.getLocalQueriesFallback(Math.max(missing, 5))
-                for (const l of localCandidates) {
-                    if (combined.length >= desiredCount) break
-                    pushIfUnique(l)
-                }
+            } catch {
+                // ignore and continue to local fallback
             }
         }
 
-        // 4) If still somehow empty (extremely unlikely), return local fallback unconditionally
+        // 3d) If still short, use local fallback (guaranteed)
+        if (combined.length < desiredCount) {
+            const missing = desiredCount - combined.length
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', `Filling ${missing} queries from local fallback`)
+            const localCandidates = await this.getLocalQueriesFallback(Math.max(missing, 5))
+            for (const l of localCandidates) {
+                if (combined.length >= desiredCount) break
+                pushIfUnique(l)
+            }
+        }
+
+        // 4) If somehow empty, return unconditional local fallback
         if (combined.length === 0) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'No queries from LLM/Trends/local attempt — using local fallback (final)', 'warn')
+            this.bot.log(this.bot.isMobile, 'SEARCH-QUERIES', 'No queries from Trends/LLM/local attempt — using local fallback (final)', 'warn')
             return this.getLocalQueriesFallback(desiredCount)
         }
 
@@ -537,6 +555,12 @@ export class Search extends Workers {
 
         return normalized.slice(0, desiredCount)
     }
+
+
+
+
+
+
 
     /**
      * Get Google Trends with caching - pop from cache if available, otherwise fetch new
@@ -1154,20 +1178,56 @@ export class Search extends Workers {
         const fallbackModel = this.bot.config?.openRouterFallbackModel || 'meta-llama/llama-3.3-70b-instruct:free'
 
         const rng = this.seededRng(runSeed ?? this.getRunSeed())
+
+        // Style tips (keeps prompt varied)
         const realisticPatterns = [
-            'Instead of generic "cheap food near me", use specific examples like "McDonald\'s delivery promo" or "best sushi near campus"',
-            'Avoid repetitive phrasing - vary between questions ("How to..."), commands ("Find..."), and direct requests ("Best pizza in [city]")',
-            'Incorporate day-specific context: weekday = academic/work, weekend = entertainment/leisure',
-            'Add location context naturally: "near campus", "downtown", "in [city]"'
+            'Prefer very short queries (1-3 words), but allow up to 4 words for partial anime titles or short phrases (e.g., "reincarnated as slime").',
+            'Mix one-word hot queries (YouTube, GitHub) with short 2-4 word specifics (e.g., "vegetarian fajitas", "attack on titan").',
+            'Favor student-relevant items: course codes, prof names, campus places, streaming/youtube creators, game titles, quick recipes, wiki pages, anime site queries.',
+            'Avoid long prose; produce concise search-style phrases or titles. Keep JSON-only output.'
         ]
 
-        const systemPrompt = `You are an assistant that outputs a JSON array only. Each item must be an object with:
-- "topic": a short search query a typical university student might type.
-- "related": an array of 0..6 related searches (short strings).
+        // Examples tuned to user's screenshot + desired anime/site style and regular student searches
+        const exampleSearches = [
+            'deepsek',
+            'chatgpt',
+            'deepseek',
+            'openrouter',
+            'vegetarian fajitas',
+            'qwen',
+            'github',
+            'youtube music',
+            // anime/title/site examples
+            'attack on titan',
+            'reincarnated as slime',
+            're:zero',
+            'anime streaming sites',
+            'crunchyroll',
+            'myanimelist',
+            // student items
+            'csc108',
+            'mat137',
+            'prof smith office hours',
+            'wiki relativity',
+            'how to git',
+            'quick ramen recipe'
+        ]
 
-Return up to ${desiredCount} diverse items if possible. Avoid politically sensitive & adult topics. Output must be valid JSON only (no explanatory text). Use ${geoLocale.toUpperCase()} locale where relevant. Be varied and avoid repeating the same simple phrases (e.g., don't output "cheap food near me" repeatedly). This request context: ${contextNotes}. Use the style guidance: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
+        const systemPrompt = `You are an assistant that outputs JSON only: a single JSON array of objects. Each object must contain:
+- "topic": a short realistic search query a University of Toronto undergraduate might type (prefer 1-3 words; allow up to 4 words for partial/full anime titles or short phrases).
+- "related": an array of 0..6 short related searches.
 
-        const userPrompt = `Generate up to ${desiredCount} concise search queries a university undergrad might use.`
+Guidelines:
+- Use ${geoLocale.toUpperCase()} locale when relevant.
+- Keep queries concise and search-like: single words ("youtube", "github"), short phrases ("vegetarian fajitas", "attack on titan"), or short commands/questions ("how to git", "wiki relativity").
+- For anime-related queries, produce search-style titles or partial titles (examples: "attack on titan", "reincarnated as slime", "re:zero"), or site queries ("anime streaming sites", "crunchyroll", "myanimelist").
+- Favor student-relevant items: course codes (CSC108), prof names, campus locations, streaming creators, quick recipes, known tools (chatgpt, qwen, openrouter).
+- Avoid politically sensitive or adult content.
+- Avoid repeating the same phrase; be diverse.
+- Use the example search history to match tone and brevity: ${exampleSearches.slice(0,8).join(', ')} ... plus anime/site and student examples.
+- Output MUST be valid JSON only (no explanation). This request context: ${contextNotes}. Use style tip: ${realisticPatterns[Math.floor(rng() * realisticPatterns.length)]}. For mode: ${mode}.`
+
+        const userPrompt = `Generate up to ${desiredCount} concise search queries a University of Toronto undergraduate might use. Prefer short queries (1-3 words), allow up to 4 words for partial anime titles or short site phrases. Output JSON array only.`
 
         const baseMessages = [
             { role: 'system', content: systemPrompt },
@@ -1176,13 +1236,12 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
 
         const maxTokens = Math.min(1600, 90 * desiredCount)
 
-        // Improved request function with better error handling
         const sendOnce = async (apiKey: string, model: string) => {
             const body = {
                 model,
                 messages: baseMessages,
                 max_tokens: maxTokens,
-                temperature: 0.8
+                temperature: 0.6
             }
 
             const requestConfig: AxiosRequestConfig = {
@@ -1195,14 +1254,13 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
                     'X-Title': 'TourDeFrance Search Bot'
                 },
                 data: body,
-                timeout: 30000, // Increased timeout
+                timeout: 30000,
                 proxy: false
             }
 
             try {
                 const resp = await axios.request(requestConfig as any)
 
-                // Better response parsing with more fallbacks
                 let content: string | undefined
                 const choices = resp?.data?.choices
 
@@ -1221,123 +1279,133 @@ Return up to ${desiredCount} diverse items if possible. Avoid politically sensit
                 }
                 return content
             } catch (error: any) {
-                // More specific error handling
                 if (error.response) {
                     const status = error.response.status
                     const data = error.response.data
                     throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
                 } else if (error.code === 'ECONNABORTED') {
                     throw new Error('Request timeout')
-                } else if (error.message.includes('No content')) {
-                    throw error // Re-throw our specific error
+                } else if (error.message && error.message.includes('No content')) {
+                    throw error
                 } else {
-                    throw new Error(`Request failed: ${error.message}`)
+                    throw new Error(`Request failed: ${error.message || String(error)}`)
                 }
             }
         }
 
-        // Try preferred model with both keys
         let lastErr: any = null
+
+        // try preferred model/key combos
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} with one of the API keys`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying preferred model ${preferredModel} with an API key`)
                 const content = await sendOnce(key, preferredModel)
 
-                // Improved parsing with better error recovery
-                let parsed: any
-
+                // parsing with robust fallbacks
+                let parsed: any = null
                 try {
-                    // First try direct JSON parse
                     parsed = JSON.parse(String(content))
-                } catch (e) {
-                    // If that fails, try to extract JSON from markdown code blocks
-                    const trimmed = String(content)
-                        .replace(/```json\s*/g, '')
-                        .replace(/```\s*/g, '')
-                        .replace(/^\[/, '[') // Ensure it starts properly
-                        .trim()
-
+                } catch {
+                    const s = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
                     try {
-                        parsed = JSON.parse(trimmed)
-                    } catch (e2) {
-                        // If still failing, try to find JSON array in the text
+                        parsed = JSON.parse(s)
+                    } catch {
                         const jsonMatch = String(content).match(/\[[\s\S]*\]/)
-                        if (jsonMatch) {
-                            try {
-                                parsed = JSON.parse(jsonMatch[0])
-                            } catch (e3) {
-                                throw new Error('Failed to parse LLM response as JSON after multiple attempts')
-                            }
-                        } else {
-                            throw new Error('No JSON array found in LLM response')
-                        }
+                        if (jsonMatch) parsed = JSON.parse(jsonMatch[0])
+                        else throw new Error('No JSON array found in LLM response')
                     }
                 }
 
-                if (!Array.isArray(parsed)) {
-                    throw new Error('LLM returned non-array JSON')
-                }
+                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
 
+                // normalize and enforce short query shape with anime/site allowance
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
-                    const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
-                    const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-                    return { topic: topic.trim(), related }
-                }).filter(x => x.topic && x.topic.length > 1)
+                    let topic = ''
+                    if (typeof item.topic === 'string') topic = item.topic
+                    else if (typeof item === 'string') topic = item
+                    else if (item && item[0] && typeof item[0] === 'string') topic = item[0]
+                    topic = topic.trim().replace(/(^"|"$)/g, '')
 
-                if (normalized.length === 0) {
-                    throw new Error('LLM returned empty or invalid queries after normalization')
-                }
+                    // allow up to 4 words for anime/site phrases, otherwise cap at 3 words
+                    const words = topic.split(/\s+/).filter(Boolean)
+                    const maxWords = /anime|crunchyroll|myanimelist|attack|reincarnated|re:zero/i.test(topic) ? 4 : 3
+                    const finalWords = words.slice(0, Math.max(1, Math.min(maxWords, words.length)))
+                    let cleaned = finalWords.join(' ').replace(/[^\w\s:-]/g, '').trim()
+
+                    // If cleaned is still long ( > 40 chars ), truncate to 40 chars preserving words
+                    if (cleaned.length > 40) {
+                        cleaned = cleaned.split(/\s+/).slice(0, 4).join(' ').slice(0, 40).trim()
+                    }
+
+                    const related = Array.isArray(item.related) ? item.related.map((r: any) => {
+                        if (typeof r !== 'string') return ''
+                        // keep related brief (<=4 words)
+                        const rw = r.trim().split(/\s+/).slice(0, 4).join(' ').replace(/[^\w\s-]/g, '').trim()
+                        return rw
+                    }).filter((r: string) => r.length > 0) : []
+
+                    return { topic: cleaned, related }
+                }).filter(x => x.topic && x.topic.length > 0)
+
+                if (normalized.length === 0) throw new Error('LLM returned empty or invalid queries after normalization')
 
                 return normalized
             } catch (err) {
                 lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred model attempt with a key failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
-                // try next key
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Preferred model attempt failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
             }
         }
 
-        // If preferred model failed for both keys, try fallback model
+        // fallback model attempts
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} with one of the API keys`)
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel} with an API key`)
                 const content = await sendOnce(key, fallbackModel)
 
-                // Same improved parsing logic
-                let parsed: any
+                let parsed: any = null
                 try {
                     parsed = JSON.parse(String(content))
-                } catch (e) {
-                    const trimmed = String(content)
-                        .replace(/```json\s*/g, '')
-                        .replace(/```\s*/g, '')
-                        .trim()
-                    parsed = JSON.parse(trimmed)
+                } catch {
+                    const trimmed = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
+                    const jsonMatch = trimmed.match(/\[[\s\S]*\]/)
+                    if (jsonMatch) parsed = JSON.parse(jsonMatch[0])
+                    else parsed = JSON.parse(trimmed)
                 }
 
-                if (!Array.isArray(parsed)) {
-                    throw new Error('LLM returned non-array JSON')
-                }
+                if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON')
 
                 const normalized: GoogleSearch[] = parsed.map((item: any) => {
-                    const topic = typeof item.topic === 'string' ? item.topic : (typeof item === 'string' ? item : '')
-                    const related = Array.isArray(item.related) ? item.related.filter((r: any) => typeof r === 'string') : []
-                    return { topic: topic.trim(), related }
-                }).filter(x => x.topic && x.topic.length > 1)
+                    let topic = ''
+                    if (typeof item.topic === 'string') topic = item.topic
+                    else if (typeof item === 'string') topic = item
+                    else if (item && item[0] && typeof item[0] === 'string') topic = item[0]
+                    topic = topic.trim().replace(/(^"|"$)/g, '')
+                    const words = topic.split(/\s+/).filter(Boolean)
+                    const maxWords = /anime|crunchyroll|myanimelist|attack|reincarnated|re:zero/i.test(topic) ? 4 : 3
+                    const finalWords = words.slice(0, Math.max(1, Math.min(maxWords, words.length)))
+                    let cleaned = finalWords.join(' ').replace(/[^\w\s:-]/g, '').trim()
+                    if (cleaned.length > 40) cleaned = cleaned.split(/\s+/).slice(0, 4).join(' ').slice(0, 40).trim()
+                    const related = Array.isArray(item.related) ? item.related.map((r: any) => {
+                        if (typeof r !== 'string') return ''
+                        const rw = r.trim().split(/\s+/).slice(0, 4).join(' ').replace(/[^\w\s-]/g, '').trim()
+                        return rw
+                    }).filter((r: string) => r.length > 0) : []
+                    return { topic: cleaned, related }
+                }).filter(x => x.topic && x.topic.length > 0)
 
-                if (normalized.length === 0) {
-                    throw new Error('LLM returned empty or invalid queries after normalization')
-                }
+                if (normalized.length === 0) throw new Error('LLM returned empty or invalid queries after normalization')
 
                 return normalized
             } catch (err) {
                 lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model attempt with a key failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model attempt failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
             }
         }
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All OpenRouter attempts failed, throwing to allow fallback', 'error')
+        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All LLM attempts failed; will allow Trends/local fallback upstream', 'error')
         throw lastErr || new Error('LLM failed')
     }
+
 
     /**
      * Single-query LLM generation (used in per-search mode or per-search fallback).
