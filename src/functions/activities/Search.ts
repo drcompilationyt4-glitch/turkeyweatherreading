@@ -34,7 +34,7 @@ export class Search extends Workers {
     private static RECENT_CACHE_LIMIT = 500
     // Google Trends cache with timestamp
     private static googleTrendsCache: { queries: GoogleSearch[], timestamp: number, geoLocale: string } | null = null
-    private static TRENDS_CACHE_TTL = 3600000 // 1 hour in milliseconds
+    private static TRENDS_CACHE_TTL = 1000 * 60 * 300 // 1 hour in milliseconds
 
     // Updated model configuration with weights
     private readonly modelConfig = [
@@ -532,28 +532,207 @@ export class Search extends Workers {
     /**
      * Get Google Trends with caching - pop from cache if available, otherwise fetch new
      */
+        // Put these inside your Search class (adjust visibility as needed)
+
+
+
+// In-memory dedupe across runs
+    private recentGeneratedQueries: Set<string> = new Set<string>()
+
+// --- Helper: sanitize a raw topic string coming from LLMs / trends / logs ---
+    private normalizeTopicString(raw: string): string {
+        if (!raw || typeof raw !== 'string') return ''
+        let s = raw.trim()
+
+        // Remove common log/provenance prefixes like "33 Points Remaining | Query:"
+        s = s.replace(/^\s*\d+\s+Points\s+Remaining\s*\|\s*/i, '')
+        const qIdx = s.indexOf('Query:')
+        if (qIdx >= 0) s = s.slice(qIdx + 'Query:'.length).trim()
+
+        // Remove code fences and backticks
+        s = s.replace(/```(?:json)?/gi, '').replace(/```/g, '').replace(/`/g, '').trim()
+
+        // Remove serialized small JSON/snippets that accidentally appear (defensive)
+        s = s.replace(/\{(?:[^{}]|\{[^{}]*\})*\}/g, '') // remove {...} blocks
+        s = s.replace(/\[[^\]]*\]/g, '') // remove [...] fragments
+
+        // Remove repeated "type":"reasoning.text" artifacts
+        s = s.replace(/"type"\s*:\s*"reasoning\.text"[^,}]*/gi, '')
+
+        // Collapse whitespace, strip leading/trailing punctuation (but keep internal -/:)
+        s = s.replace(/\s+/g, ' ')
+        s = s.replace(/^[^\w]+|[^\w]+$/g, '')
+
+        // If numeric or empty return empty
+        if (!s || /^\d+$/.test(s)) return ''
+
+        return s.trim()
+    }
+
+// --- Helper: create simple variants for a given topic (for diversification) ---
+    private makeVariantsForTopic(topic: string, geoLocale: string, maxVariants = 6): string[] {
+        const out: string[] = []
+        if (!topic || typeof topic !== 'string') return out
+        const base = topic.trim()
+        if (!base) return out
+
+        const year = new Date().getFullYear().toString()
+        const modifiers = [
+            `${base} ${year}`,
+            `${base} tutorial`,
+            `${base} example`,
+            `${base} definition`,
+            `${base} news`,
+            `${base} how to`,
+        ]
+
+        // geo-specific modifier
+        if (geoLocale && geoLocale !== 'US') modifiers.push(`${base} ${geoLocale}`)
+        else modifiers.push(`${base} usa`)
+
+        // ensure normalized + deduped
+        const seen = new Set<string>()
+        for (const m of modifiers) {
+            const nm = this.normalizeTopicString(m)
+            if (!nm) continue
+            const lk = nm.toLowerCase()
+            if (seen.has(lk) || lk === base.toLowerCase()) continue
+            seen.add(lk)
+            out.push(nm)
+            if (out.length >= maxVariants) break
+        }
+
+        return out
+    }
+
+// --- Helper: pick diversified unique queries from a pool while avoiding usedSet (dedupe across runs) ---
+    private pickDiversified(pool: string[], usedSet: Set<string>, desiredCount: number, geoLocale: string): string[] {
+        const out: string[] = []
+        const chosenLower = new Set<string>()
+
+        const pushIfUnique = (q: string) => {
+            if (!q) return false
+            const cleaned = this.normalizeTopicString(q)
+            if (!cleaned) return false
+            const lk = cleaned.toLowerCase()
+            if (chosenLower.has(lk)) return false
+            if (usedSet && usedSet.has(lk)) return false
+            chosenLower.add(lk)
+            out.push(cleaned)
+            return true
+        }
+
+        // 1) prefer pool top-down
+        for (const p of pool) {
+            if (out.length >= desiredCount) break
+            pushIfUnique(p)
+        }
+
+        // 2) generate variants from pool items
+        for (const p of pool) {
+            if (out.length >= desiredCount) break
+            const variants = this.makeVariantsForTopic(p, geoLocale, 6)
+            for (const v of variants) {
+                if (out.length >= desiredCount) break
+                pushIfUnique(v)
+            }
+        }
+
+        // 3) fallback generic modifiers if still short
+        const genericAddons = ['tutorial', 'example', 'news', String(new Date().getFullYear())]
+        for (const mod of genericAddons) {
+            if (out.length >= desiredCount) break
+            for (const p of pool) {
+                if (out.length >= desiredCount) break
+                pushIfUnique(`${p} ${mod}`)
+            }
+        }
+
+        // 4) last-resort small tweaks
+        if (out.length < desiredCount) {
+            const lastMods = ['how to', 'guide', 'info', 'tips']
+            for (const lm of lastMods) {
+                if (out.length >= desiredCount) break
+                for (const p of pool) {
+                    if (out.length >= desiredCount) break
+                    pushIfUnique(`${p} ${lm}`)
+                }
+            }
+        }
+
+        return out.slice(0, desiredCount)
+    }
+
+// --- Updated getCachedGoogleTrends with actual use of pickDiversified ---
     private async getCachedGoogleTrends(geoLocale: string = 'US'): Promise<GoogleSearch[]> {
         const now = Date.now()
-        // Check if we have valid cached data
+
+        // If cache present & valid, return a diversified deep copy using pickDiversified
         if (Search.googleTrendsCache &&
             Search.googleTrendsCache.geoLocale === geoLocale &&
             (now - Search.googleTrendsCache.timestamp) < Search.TRENDS_CACHE_TTL &&
+            Array.isArray(Search.googleTrendsCache.queries) &&
             Search.googleTrendsCache.queries.length > 0) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Using cached Google Trends with ${Search.googleTrendsCache.queries.length} queries remaining`)
-            return [...Search.googleTrendsCache.queries] // Return copy to prevent mutation issues
+
+            const cached = Search.googleTrendsCache.queries
+                .map(q => ({
+                    topic: this.normalizeTopicString(q.topic ?? (typeof q === 'string' ? String(q) : '')),
+                    related: Array.isArray(q.related) ? q.related.map(r => this.normalizeTopicString(String(r))).filter(Boolean) : []
+                }))
+                .filter(q => !!q.topic)
+
+            this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', `Using cached Google Trends with ${cached.length} queries (diversifying)`)
+
+            // Build a pool of topics (strings) from cached topics (preserve order)
+            const pool = cached.map(q => q.topic)
+
+            // Use recentGeneratedQueries as usedSet to avoid repeats across runs (if present)
+            const usedSet = (this.recentGeneratedQueries && this.recentGeneratedQueries instanceof Set) ? this.recentGeneratedQueries : new Set<string>()
+
+            // Try to diversify to the same number as cached (so callers expecting size get similar length)
+            const desiredCount = Math.max(1, cached.length)
+
+            // pickDiversified will return unique normalized strings
+            const diversifiedTopics = this.pickDiversified(pool, usedSet, desiredCount, geoLocale)
+
+            // If diversification succeeded, assemble GoogleSearch[] preserving any related items if original topic matched
+            const result: GoogleSearch[] = diversifiedTopics.map(dt => {
+                // try to find original related for the exact topic; fallback to empty
+                const orig = cached.find(c => c.topic.toLowerCase() === dt.toLowerCase())
+                return { topic: dt, related: orig ? [...orig.related] : [] }
+            })
+
+            // If for some reason diversification returned empty, fall back to normalized cached entries
+            if (!result.length) {
+                return cached.map(q => ({ topic: q.topic, related: [...q.related] }))
+            }
+
+            return result
         }
 
-        // Cache is empty/expired, fetch new data
+        // Cache is empty/expired: fetch fresh trends
         this.bot.log(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'Cache empty/expired, fetching fresh Google Trends data')
-        const freshQueries = await this.getGoogleTrends(geoLocale)
-        // Update cache
+        // getGoogleTrends is expected to exist and return GoogleSearch[]
+        const freshQueriesRaw = await this.getGoogleTrends(geoLocale)
+
+        // Defensive normalization and cleaning
+        const freshQueries: GoogleSearch[] = (Array.isArray(freshQueriesRaw) ? freshQueriesRaw : []).map(q => {
+            const topic = this.normalizeTopicString(q.topic ?? (typeof q === 'string' ? String(q) : ''))
+            const related = Array.isArray(q.related) ? q.related.map(r => this.normalizeTopicString(String(r))).filter(Boolean) : []
+            return { topic, related }
+        }).filter(q => q.topic && q.topic.length > 0)
+
+        // Update cache (store normalized copy)
         Search.googleTrendsCache = {
-            queries: freshQueries,
+            queries: freshQueries.map(q => ({ topic: q.topic, related: Array.isArray(q.related) ? [...q.related] : [] })),
             timestamp: now,
             geoLocale
         }
-        return freshQueries
+
+        // Return deep copy
+        return Search.googleTrendsCache.queries.map(q => ({ topic: q.topic, related: Array.isArray(q.related) ? [...q.related] : [] }))
     }
+
 
     private async getEnhancedLLMQueries(geoLocale: string, count: number, mode: Mode, runSeed?: number): Promise<GoogleSearch[]> {
         const { mode: ctxMode, contextNotes } = this.determineRunSettings(runSeed)
@@ -1275,29 +1454,52 @@ export class Search extends Workers {
                 'X-Title': this.bot.config?.openRouter?.title ?? '<YOUR_SITE_NAME>',
                 'Authorization': `Bearer ${apiKey}`
             },
-            timeout: 30_000,
             proxy: false
         })
 
         const extractContentFromChoice = (choice: any, rawData: any): string | null => {
             try {
+                // handle OpenRouter / Chat-style: choice.message.content can be string or object
                 const msg = choice?.message ?? {}
+                // message.content might be string
                 if (typeof msg.content === 'string' && msg.content.trim().length) return msg.content.trim()
 
-                const reasoningObj = msg.reasoning_details ?? msg.reasoning
+                // some providers return content as { parts: [...] } or as an array
+                if (msg.content && typeof msg.content === 'object') {
+                    // try content.parts
+                    const parts = msg.content.parts || msg.content.text || msg.content
+                    if (Array.isArray(parts)) {
+                        const combined = parts.map((p: any) => (typeof p === 'string' ? p : (p?.text ?? ''))).join(' ').trim()
+                        if (combined) return combined
+                    } else if (typeof parts === 'string') {
+                        return parts.trim()
+                    }
+                }
+
+                // reasoning_details may contain final_answer or chain_of_thought
+                const reasoningObj = msg.reasoning_details ?? msg.reasoning ?? choice?.reasoning_details ?? rawData?.reasoning_details
                 if (reasoningObj) {
                     if (typeof reasoningObj.final_answer === 'string' && reasoningObj.final_answer.trim()) return reasoningObj.final_answer.trim()
                     if (typeof reasoningObj.chain_of_thought === 'string' && reasoningObj.chain_of_thought.trim()) return reasoningObj.chain_of_thought.trim()
+                    // sometimes final answer lives in an array or nested shape
                     const asStr = JSON.stringify(reasoningObj)
                     if (asStr && asStr.length) return asStr
                 }
 
+                // fallback shapes
                 if (typeof choice?.text === 'string' && choice.text.trim().length) return choice.text.trim()
                 if (typeof rawData?.result?.content === 'string' && rawData.result.content.trim().length) return rawData.result.content.trim()
                 if (typeof rawData?.content === 'string' && rawData.content.trim().length) return rawData.content.trim()
                 if (typeof rawData === 'string' && rawData.trim().length) return rawData.trim()
+
+                // special case: some providers put array of message-like objects in result
+                if (Array.isArray(rawData?.choices) && rawData.choices.length) {
+                    const first = rawData.choices[0]
+                    const candidate = first?.message?.content ?? first?.text ?? first?.content
+                    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+                }
             } catch {
-                // ignore
+                // ignore and fallback
             }
             return null
         }
@@ -1314,6 +1516,7 @@ export class Search extends Workers {
 
         const sendOnce = async (apiKey: string, model: string, supportsReasoning: boolean): Promise<string> => {
             const client = createOpenRouterClient(apiKey)
+            // Use longer timeout for reasoning-enabled models
             const defaultTimeout = supportsReasoning ? (this.bot.config?.openRouterReasoningTimeoutMs || 240000) : 90000
 
             const doPost = async (payload: any, timeoutMs?: number) => {
@@ -1329,9 +1532,12 @@ export class Search extends Workers {
 
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
+                    // Reasoning-capable flow: 2-step call that preserves assistant message with reasoning_details
                     if (supportsReasoning) {
-                        // First call with reasoning enabled
-                        const payload1: any = buildRequestBody(model, true)
+                        // Step 1: ask initial prompt with reasoning enabled
+                        const payload1: any = buildRequestBody(model, true, [])
+                        // ensure reasoning enabled explicitly
+                        if (!payload1.reasoning) payload1.reasoning = { enabled: true }
                         const resp1 = await doPost(payload1)
                         const choice1 = Array.isArray(resp1?.data?.choices) && resp1.data.choices.length ? resp1.data.choices[0] : null
                         const assistantMsg = choice1?.message ?? null
@@ -1343,10 +1549,18 @@ export class Search extends Workers {
                             throw new Error('Empty result from first reasoning call')
                         }
 
-                        const preservedAssistant: any = { role: 'assistant', content: assistantMsg.content ?? assistantContent }
+                        // preserve assistant message and any reasoning_details that came with it
+                        const preservedAssistant: any = {
+                            role: 'assistant',
+                            content: typeof assistantMsg.content === 'string' ? assistantMsg.content : (assistantContent || assistantMsg.content || '')
+                        }
+                        // preserve reasoning_details/reasoning verbatim if present
                         if (assistantMsg.reasoning_details) preservedAssistant.reasoning_details = assistantMsg.reasoning_details
                         if (assistantMsg.reasoning) preservedAssistant.reasoning = assistantMsg.reasoning
+                        // some providers include top-level reasoning in choice
+                        if (choice1?.reasoning_details) preservedAssistant.reasoning_details = preservedAssistant.reasoning_details ?? choice1.reasoning_details
 
+                        // followup user prompt asking for final concise queries
                         const followupUser = {
                             role: 'user',
                             content: `Are you sure? Think carefully and provide the concise final queries (exactly ${desiredCount} items). ${contextNotes || ''}`
@@ -1362,6 +1576,7 @@ export class Search extends Workers {
                             max_tokens: Math.min(1024, maxTokens),
                             temperature: 0.45
                         }
+                        // preserve provider/config fields if necessary
                         if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload2.provider = this.bot.config.openRouterProvider
                         if (this.bot.config?.openRouterRequireResponseFormat) payload2.response_format = { type: 'json_object' }
                         if (this.bot.config?.openRouterReasoningEnabled) payload2.reasoning = { enabled: true }
@@ -1423,9 +1638,25 @@ export class Search extends Workers {
         }
 
         const tryNormalizeWithFallbacks = (rawContent: string): GoogleSearch[] => {
+            // First: defensive trimming
+            let content = String(rawContent ?? '').trim()
+
+            // Remove obvious score/prefix patterns like "33 Points Remaining | Query: <json>"
+            // If there's a 'Query:' token followed by JSON, extract from there
+            try {
+                const qIdx = content.indexOf('Query:')
+                if (qIdx >= 0) {
+                    const after = content.slice(qIdx + 'Query:'.length).trim()
+                    // if after starts with '[' or '{', attempt to parse
+                    if (/^[\[{]/.test(after)) content = after
+                }
+                // also remove leading "<number> Points Remaining |" junk
+                content = content.replace(/^\s*\d+\s+Points\s+Remaining\s*\|/i, '').trim()
+            } catch { /* ignore */ }
+
             // Primary attempt: use your existing JSON parser
             try {
-                const normalized = this.parseAndNormalizeLLMResponse(rawContent)
+                const normalized = this.parseAndNormalizeLLMResponse(content)
                 if (Array.isArray(normalized) && normalized.length > 0) return normalized
             } catch (e) {
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `parseAndNormalizeLLMResponse failed: ${String(e)}`, 'warn')
@@ -1433,7 +1664,7 @@ export class Search extends Workers {
 
             // Attempt 1: strip fences and reparse
             try {
-                const s = String(rawContent).replace(/```(?:json)?/gi, '').replace(/```/g, '').trim()
+                const s = String(content).replace(/```(?:json)?/gi, '').replace(/```/g, '').trim()
                 const normalized = this.parseAndNormalizeLLMResponse(s)
                 if (Array.isArray(normalized) && normalized.length > 0) {
                     this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: parsed after stripping fences', 'warn')
@@ -1443,7 +1674,7 @@ export class Search extends Workers {
 
             // Attempt 2: find the first JSON array fragment in text
             try {
-                const m = String(rawContent).match(/\[[\s\S]*\]/)
+                const m = String(content).match(/\[[\s\S]*\]/)
                 if (m && m[0]) {
                     try {
                         const parsed = JSON.parse(m[0])
@@ -1457,7 +1688,7 @@ export class Search extends Workers {
             } catch { /* ignore */ }
 
             // Attempt 3: simple newline-splitting fallback
-            const lines = String(rawContent).split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+            const lines = String(content).split(/\r?\n/).map(l => l.trim()).filter(Boolean)
             if (lines.length > 0) {
                 const candidates = lines.slice(0, desiredCount).map(l => {
                     // remove bullets and numbering
@@ -1473,7 +1704,7 @@ export class Search extends Workers {
 
             // Attempt 4: last-resort short text fallback (for desiredCount === 1)
             if (desiredCount === 1) {
-                const plain = String(rawContent).trim().replace(/["`]/g, '')
+                const plain = String(content).trim().replace(/["`]/g, '')
                 const firstLine = plain.split(/\r?\n/).find(Boolean) ?? plain
                 if (firstLine && firstLine.length > 0) {
                     const words = firstLine.trim().split(/\s+/).slice(0, 4).join(' ')
@@ -1536,18 +1767,11 @@ export class Search extends Workers {
         throw lastErr || new Error('LLM failed - all models exhausted')
     }
 
-
-
     /**
      * Helper method to parse and normalize LLM responses
      */
     private parseAndNormalizeLLMResponse(content: string): GoogleSearch[] {
         // Defensive normalization of many possible LLM output shapes into GoogleSearch[]
-        // Supported inputs:
-        // - JSON array of strings or objects [{ topic: "...", related: [...]}, "...", ["topic", ...]]
-        // - JSON object with fields like { queries: [... ] } or { default: [...] }
-        // - Plain text lists (one-per-line, numbered, bullet points, code fences)
-        // - Single short string (when desiredCount === 1 upstream)
         const safeParseJson = (s: string): any | null => {
             try { return JSON.parse(s) } catch { return null }
         }
@@ -1559,8 +1783,8 @@ export class Search extends Workers {
             return safeParseJson(m[0])
         }
 
+        const raw = String(content ?? '').trim()
         let parsed: any = null
-        const raw = String(content || '').trim()
 
         // 1) Try direct JSON parse
         parsed = safeParseJson(raw)
@@ -1571,13 +1795,30 @@ export class Search extends Workers {
         // 3) Try extracting a JSON array from anywhere in the text
         if (parsed === null) parsed = firstJsonArrayInText(raw)
 
-        // 4) If it's an object that contains common array fields, extract them
+        // 4) Some LLMs return arrays/objects embedded in text: try to parse JSON object fragments
+        if (parsed === null) {
+            try {
+                const maybe = raw.match(/\{(?:[^{}]|\{[^{}]*\})*\}/g)
+                if (maybe && maybe.length) {
+                    for (const chunk of maybe) {
+                        const obj = safeParseJson(chunk)
+                        if (obj && (Array.isArray(obj) || typeof obj === 'object')) {
+                            parsed = obj
+                            break
+                        }
+                    }
+                }
+            } catch { /* ignore */ }
+        }
+
+        // 5) If it's an object that contains common array fields, extract them
         if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') {
             if (Array.isArray(parsed.queries)) parsed = parsed.queries
             else if (Array.isArray(parsed.default)) parsed = parsed.default
             else if (Array.isArray(parsed.items)) parsed = parsed.items
             else if (Array.isArray(parsed.results)) parsed = parsed.results
             else if (Array.isArray(parsed.topics)) parsed = parsed.topics
+            else if (Array.isArray(parsed.Query)) parsed = parsed.Query
             else {
                 // Maybe object where keys are topics: { "topic1": {}, "topic2": {} } -> make array of keys
                 const keys = Object.keys(parsed).filter(k => typeof parsed[k] === 'object' || typeof parsed[k] === 'string')
@@ -1590,7 +1831,7 @@ export class Search extends Workers {
             }
         }
 
-        // 5) If still null, attempt newline / bullet parsing (plain text lists)
+        // 6) If still null, attempt newline / bullet parsing (plain text lists)
         if (parsed === null) {
             const lines = stripFences(raw)
                 .split(/\r?\n/)
@@ -1598,11 +1839,10 @@ export class Search extends Workers {
                 .filter(l => l.length > 0)
             // Remove lines that look like metadata (e.g. "title:" or "subtitle:")
             const filtered = lines.filter(l => !/^[a-z0-9_-]+:\s*/i.test(l) && !/^#+\s*/.test(l))
-            // If there are multiple candidate lines, use them as topics
             if (filtered.length > 0) parsed = filtered
         }
 
-        // 6) Last fallback: treat entire raw string as single topic
+        // 7) Last fallback: treat entire raw string as single topic
         if (parsed === null) parsed = [raw]
 
         // Ensure we have an array now
@@ -1613,24 +1853,55 @@ export class Search extends Workers {
             let topicRaw = ''
             let relatedRaw: any[] = []
 
+            // If item looks like an array of reasoning tokens: [{ type: 'reasoning.text', text: '...' }, ...]
+            if (Array.isArray(item) && item.length && typeof item[0] === 'object' && ('type' in item[0])) {
+                // Safely extract text-like fields from each token
+                const texts: string[] = item.map((it: any) => {
+                    if (!it) return ''
+                    if (typeof it.text === 'string' && it.text.trim()) return it.text.trim()
+                    if (typeof it.content === 'string' && it.content.trim()) return it.content.trim()
+                    if (typeof it.message === 'string' && it.message.trim()) return it.message.trim()
+                    if (typeof it === 'string' && it.trim()) return it.trim()
+                    // try nested fields
+                    if (it?.message?.content && typeof it.message.content === 'string') return it.message.content.trim()
+                    return ''
+                }).filter(Boolean)
+                const combined: string = texts.join(' ').trim()
+                if (combined.length > 0) {
+                    const firstLine = combined.split(/\r?\n/)[0] ?? combined
+                    return { topic: firstLine.slice(0, 80), related: [] }
+                }
+            }
+
             if (typeof item === 'string') {
+                // some strings might include JSON-like fragments; keep whole string for later cleaning
                 topicRaw = item
             } else if (Array.isArray(item)) {
                 // array like ["topic", "related1", ...] — take first as topic, rest as related
                 if (item.length === 0) return null
-                topicRaw = item[0]
-                relatedRaw = item.slice(1)
+                const first = item[0]
+                topicRaw = typeof first === 'string' ? first : (first?.text ?? first?.content ?? '')
+                relatedRaw = item.slice(1).map((r: any) => typeof r === 'string' ? r : (r?.text ?? r?.content ?? ''))
             } else if (item && typeof item === 'object') {
                 // object shapes: { topic: "...", related: [...] } or { query: "...", queries: [...] }
                 if (typeof item.topic === 'string') topicRaw = item.topic
                 else if (typeof item.query === 'string') topicRaw = item.query
                 else if (typeof item.title === 'string') topicRaw = item.title
+                else if (typeof item.text === 'string') topicRaw = item.text
+                else if (typeof item.content === 'string') topicRaw = item.content
                 else if (typeof item[0] === 'string') topicRaw = item[0]
+
                 // collect related fields
                 if (Array.isArray(item.related)) relatedRaw = item.related
                 else if (Array.isArray(item.queries)) relatedRaw = item.queries
                 else if (Array.isArray(item.suggestions)) relatedRaw = item.suggestions
+                else if (typeof item.suggestions === 'string') relatedRaw = [item.suggestions]
                 else relatedRaw = []
+
+                // special-case: some objects are reasoning fragments with shape { type: 'reasoning.text', text: '...' }
+                if (!topicRaw && (item.type === 'reasoning.text' || item.type === 'text')) {
+                    topicRaw = item.text ?? item.content ?? ''
+                }
             } else {
                 return null
             }
@@ -1668,6 +1939,7 @@ export class Search extends Workers {
             return { topic: cleaned, related }
         }
 
+        // Map and filter
         const normalized: GoogleSearch[] = parsed.map((p: any) => normalizeItem(p)).filter(Boolean) as GoogleSearch[]
 
         if (!Array.isArray(normalized) || normalized.length === 0) {
@@ -1676,6 +1948,7 @@ export class Search extends Workers {
 
         return normalized
     }
+
 
 
     /**
