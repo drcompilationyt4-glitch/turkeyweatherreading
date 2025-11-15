@@ -38,8 +38,8 @@ export class Search extends Workers {
 
     // Updated model configuration with weights
     private readonly modelConfig = [
-        { name: 'tngtech/deepseek-r1t2-chimera:free', weight: 0.6, supportsReasoning: true },
-        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 0.4, supportsReasoning: false }
+        { name: 'google/gemini-2.0-flash-exp:free', weight: 0.5, supportsReasoning: false },
+        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 0.5, supportsReasoning: false }
     ]
 
     constructor(bot: any) {
@@ -1381,7 +1381,7 @@ export class Search extends Workers {
         runSeed?: number
     ): Promise<GoogleSearch[]> {
         // --- Keys & config ---
-        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();
+        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();;
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim();
         const openaiKey = (process.env.OPENAI_API_KEY || this.bot.config?.openaiApiKey || '').toString().trim();
 
