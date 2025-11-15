@@ -1380,19 +1380,24 @@ export class Search extends Workers {
         contextNotes: string = '',
         runSeed?: number
     ): Promise<GoogleSearch[]> {
-        // Load keys from env or config only. DO NOT hardcode secrets in repo.
-        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
+        // --- Keys & config ---
+        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim();
-        const keys = [envKey1, envKey2].filter(k => !!k);
+        const openaiKey = (process.env.OPENAI_API_KEY || this.bot.config?.openaiApiKey || '').toString().trim();
+
+        // Prefer explicit OpenAI key if present; otherwise use OpenRouter keys (these are tried in order).
+        const keys: string[] = [];
+        if (openaiKey) keys.push(openaiKey); // first try official OpenAI key (or set by user)
+        [envKey1, envKey2].forEach(k => { if (k) keys.push(k); });
 
         if (!keys.length) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key(s) missing. Set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2 or bot.config.openRouterApiKey', 'error');
-            throw new Error('OpenRouter API key not configured');
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter/OpenAI API key(s) missing. Set OPENAI_API_KEY or OPENROUTER_API_KEY(s) or bot.config', 'error');
+            throw new Error('OpenRouter/OpenAI API key not configured');
         }
 
+        // Model selection
         const selectedModel = this.selectRandomModel();
         const fallbackModel = 'meta-llama/llama-3.3-70b-instruct:free';
-
         const categoryWeights = this.getTimeBasedCategoryWeights();
         const { systemPrompt, userPrompt } = this.generateCategoryPrompt(categoryWeights, geoLocale);
 
@@ -1403,64 +1408,79 @@ export class Search extends Workers {
 
         const maxTokens = Math.min(1600, 90 * desiredCount);
 
-        const buildRequestBody = (model: string, supportsReasoning: boolean, extraMessages: any[] = []): any => {
+        // Build request bodies (both axios and SDK-compatible shapes)
+        const buildRequestBody = (model: string, supportsReasoning: boolean, extraMessages: any[] = []) => {
             const body: any = {
                 model,
                 messages: [...baseMessages, ...extraMessages],
                 max_tokens: maxTokens,
                 temperature: 0.6,
-                stream: false, // EXPLICIT: do not request streaming
+                stream: false
             };
 
-            if (supportsReasoning) {
-                const cfgEnable = typeof this.bot.config?.openRouterReasoningEnabled === 'boolean'
-                    ? this.bot.config.openRouterReasoningEnabled
-                    : true;
-
-                if (cfgEnable) {
-                    body.reasoning = { enabled: true };
-                    if (typeof this.bot.config?.openRouterReasoningEffort === 'string') {
-                        body.reasoning.effort = this.bot.config.openRouterReasoningEffort;
-                    }
-                    if (typeof this.bot.config?.openRouterReasoningMaxTokens === 'number') {
-                        body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens;
-                    }
-                    if (typeof this.bot.config?.openRouterReasoningExclude === 'boolean') {
-                        body.reasoning.exclude = !!this.bot.config.openRouterReasoningExclude;
-                    }
-                }
+            // reasoning options if supported and configured
+            const cfgEnable = typeof this.bot.config?.openRouterReasoningEnabled === 'boolean'
+                ? this.bot.config.openRouterReasoningEnabled
+                : true;
+            if (supportsReasoning && cfgEnable) {
+                body.reasoning = { enabled: true };
+                if (typeof this.bot.config?.openRouterReasoningEffort === 'string') body.reasoning.effort = this.bot.config.openRouterReasoningEffort;
+                if (typeof this.bot.config?.openRouterReasoningMaxTokens === 'number') body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens;
+                if (typeof this.bot.config?.openRouterReasoningExclude === 'boolean') body.reasoning.exclude = !!this.bot.config.openRouterReasoningExclude;
             }
 
-            if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') {
-                body.provider = this.bot.config.openRouterProvider as any;
-            }
-
-            if (this.bot.config?.openRouterRequireResponseFormat) {
-                body.response_format = { type: 'json_object' };
-            }
-
+            if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') body.provider = this.bot.config.openRouterProvider;
+            if (this.bot.config?.openRouterRequireResponseFormat) body.response_format = { type: 'json_object' };
             if (typeof this.bot.config?.openRouterUserId === 'string') body.user = this.bot.config.openRouterUserId;
 
             return body;
         };
 
-        const createOpenRouterClient = (apiKey: string) => axios.create({
-            baseURL: 'https://openrouter.ai/api/v1',
+        // axios client factory for OpenRouter / compatible endpoints
+        const createAxiosClient = (apiKey: string, baseURL = 'https://openrouter.ai/api/v1') => axios.create({
+            baseURL,
             headers: {
                 'Content-Type': 'application/json',
-                // OpenRouter docs show HTTP-Referer is used for app attribution
                 'HTTP-Referer': this.bot.config?.openRouter?.referer ?? '<YOUR_SITE_URL>',
                 'X-Title': this.bot.config?.openRouter?.title ?? '<YOUR_SITE_NAME>',
                 'Authorization': `Bearer ${apiKey}`
             },
-            proxy: false
+            proxy: false,
         });
 
+        // Try to dynamically import official OpenAI SDK (optional) to avoid using axios for SDK users
+        let OpenAIDefault: any = null;
+        try {
+            // dynamic import so code works even if SDK not installed
+            // For CommonJS and ESM compatibility:
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            OpenAIDefault = await import('openai').then(m => (m && (m as any).default) ? (m as any).default : m);
+        } catch {
+            OpenAIDefault = null;
+        }
+
+        const createOpenAIClient = (apiKey: string, baseURL?: string) => {
+            if (!OpenAIDefault) return null;
+            // official SDK expects { apiKey, baseURL } in newer versions
+            try {
+                const options: any = { apiKey };
+                if (baseURL) options.baseURL = baseURL;
+                if (this.bot.config?.openRouter?.referer) options.defaultHeaders = {
+                    'HTTP-Referer': this.bot.config.openRouter.referer,
+                    'X-Title': this.bot.config.openRouter.title ?? '<YOUR_SITE_NAME>'
+                };
+                // instantiate SDK client
+                return new OpenAIDefault(options);
+            } catch {
+                return null;
+            }
+        };
+
+        // Helper: extract content from a choice / rawData similar to your previous helper
         const extractContentFromChoice = (choice: any, rawData: any): string | null => {
             try {
                 const msg = choice?.message ?? {};
                 if (typeof msg.content === 'string' && msg.content.trim().length) return msg.content.trim();
-
                 if (msg.content && typeof msg.content === 'object') {
                     const parts = msg.content.parts || msg.content.text || msg.content;
                     if (Array.isArray(parts)) {
@@ -1470,7 +1490,6 @@ export class Search extends Workers {
                         return parts.trim();
                     }
                 }
-
                 const reasoningObj = msg.reasoning_details ?? msg.reasoning ?? choice?.reasoning_details ?? rawData?.reasoning_details ?? rawData?.reasoning;
                 if (reasoningObj) {
                     if (typeof reasoningObj.final_answer === 'string' && reasoningObj.final_answer.trim()) return reasoningObj.final_answer.trim();
@@ -1478,20 +1497,16 @@ export class Search extends Workers {
                     const asStr = JSON.stringify(reasoningObj);
                     if (asStr && asStr.length) return asStr;
                 }
-
                 if (typeof choice?.text === 'string' && choice.text.trim().length) return choice.text.trim();
                 if (typeof rawData?.result?.content === 'string' && rawData.result.content.trim().length) return rawData.result.content.trim();
                 if (typeof rawData?.content === 'string' && rawData.content.trim().length) return rawData.content.trim();
                 if (typeof rawData === 'string' && rawData.trim().length) return rawData.trim();
-
                 if (Array.isArray(rawData?.choices) && rawData.choices.length) {
                     const first = rawData.choices[0];
                     const candidate = first?.message?.content ?? first?.text ?? first?.content;
                     if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
                 }
-            } catch {
-                // ignore and fallback
-            }
+            } catch { /* ignore and fallback */ }
             return null;
         };
 
@@ -1500,17 +1515,20 @@ export class Search extends Workers {
                 const status = err?.response?.status;
                 const data = err?.response?.data;
                 return { ok: status === 429, data };
-            } catch {
-                return { ok: false, data: null };
-            }
+            } catch { return { ok: false, data: null }; }
         };
 
+        // sendOnce supports either SDK client or axios client. Returns raw string content from model.
         const sendOnce = async (apiKey: string, model: string, supportsReasoning: boolean): Promise<string> => {
-            const client = createOpenRouterClient(apiKey);
+            // prefer official SDK if available and apiKey looks like OPENAI key
+            const baseURL = this.bot.config?.openRouterBaseURL ?? 'https://openrouter.ai/api/v1';
+            const useSDK = !!OpenAIDefault && !!openaiKey && apiKey === openaiKey;
+            const openaiClient = useSDK ? createOpenAIClient(apiKey, this.bot.config?.openRouterBaseURL) : null;
+            const axiosClient = createAxiosClient(apiKey, baseURL);
+
             const defaultTimeout = supportsReasoning ? (this.bot.config?.openRouterReasoningTimeoutMs || 240000) : 90000;
 
-            const doPost = async (payload: any, timeoutMs?: number) => {
-                // Ensure we never accidentally request streaming from the server
+            const doAxiosPost = async (payload: any, timeoutMs?: number) => {
                 payload.stream = false;
                 const cfg: AxiosRequestConfig = {
                     url: '/chat/completions',
@@ -1519,28 +1537,47 @@ export class Search extends Workers {
                     timeout: timeoutMs ?? defaultTimeout,
                     proxy: false
                 };
-                return client.request(cfg as any);
+                return axiosClient.request(cfg as any);
+            };
+
+            // Helper to extract SDK/axios response consistently
+            const extractFromResp = (resp: any) => {
+                // axios response: resp.data
+                const data = resp?.data ?? resp;
+                const choice = Array.isArray(data?.choices) && data.choices.length ? data.choices[0] : null;
+                return extractContentFromChoice(choice, data);
             };
 
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
                     if (supportsReasoning) {
-                        // Step 1: initial prompt with reasoning, non-streaming
+                        // Step 1: initial reasoning call
                         const payload1: any = buildRequestBody(model, true, []);
                         if (!payload1.reasoning) payload1.reasoning = { enabled: true };
 
-                        const resp1 = await doPost(payload1);
-                        const choice1 = Array.isArray(resp1?.data?.choices) && resp1.data.choices.length ? resp1.data.choices[0] : null;
-                        const assistantMsg = choice1?.message ?? null;
-                        const assistantContent = extractContentFromChoice(choice1, resp1.data);
+                        let resp1: any;
+                        if (openaiClient) {
+                            // SDK path
+                            resp1 = await (openaiClient.chat?.completions?.create
+                                ? openaiClient.chat.completions.create(payload1)
+                                : openaiClient.createChatCompletion?.(payload1)); // try different SDK shapes
+                        } else {
+                            resp1 = await doAxiosPost(payload1);
+                        }
 
+                        const choice1 = (resp1?.data ?? resp1)?.choices?.[0] ?? null;
+                        const assistantMsg = choice1?.message ?? null;
+                        const assistantContent = extractFromResp(resp1);
                         if (!assistantMsg || !assistantContent) {
                             this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `First reasoning call returned empty (attempt ${attempt + 1})`, 'warn');
-                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+                            if (attempt === 0) {
+                                await new Promise(r => setTimeout(r, 800));
+                                continue;
+                            }
                             throw new Error('Empty result from first reasoning call');
                         }
 
-                        // Preserve assistant message and any reasoning_details that came with it
+                        // preserve assistant message for follow-up
                         const preservedAssistant: any = {
                             role: 'assistant',
                             content: typeof assistantMsg.content === 'string' ? assistantMsg.content : (assistantContent || assistantMsg.content || '')
@@ -1549,7 +1586,6 @@ export class Search extends Workers {
                         if (assistantMsg.reasoning) preservedAssistant.reasoning = assistantMsg.reasoning;
                         if (choice1?.reasoning_details) preservedAssistant.reasoning_details = preservedAssistant.reasoning_details ?? choice1.reasoning_details;
 
-                        // Followup user prompt asking for final concise queries
                         const followupUser = {
                             role: 'user',
                             content: `Are you sure? Think carefully and provide the concise final queries (exactly ${desiredCount} items). ${contextNotes || ''}`
@@ -1557,45 +1593,59 @@ export class Search extends Workers {
 
                         const payload2: any = {
                             model,
-                            messages: [
-                                ...baseMessages,
-                                preservedAssistant,
-                                followupUser
-                            ],
+                            messages: [...baseMessages, preservedAssistant, followupUser],
                             max_tokens: Math.min(1024, maxTokens),
                             temperature: 0.45,
-                            stream: false,
+                            stream: false
                         };
-
                         if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload2.provider = this.bot.config.openRouterProvider;
                         if (this.bot.config?.openRouterRequireResponseFormat) payload2.response_format = { type: 'json_object' };
                         if (this.bot.config?.openRouterReasoningEnabled) payload2.reasoning = { enabled: true };
 
-                        const resp2 = await doPost(payload2);
-                        const choice2 = Array.isArray(resp2?.data?.choices) && resp2.data.choices.length ? resp2.data.choices[0] : null;
-                        const finalContent = extractContentFromChoice(choice2, resp2.data);
+                        let resp2: any;
+                        if (openaiClient) {
+                            resp2 = await (openaiClient.chat?.completions?.create
+                                ? openaiClient.chat.completions.create(payload2)
+                                : openaiClient.createChatCompletion?.(payload2));
+                        } else {
+                            resp2 = await doAxiosPost(payload2);
+                        }
 
+                        const finalContent = extractFromResp(resp2);
                         if (finalContent && String(finalContent).trim().length) {
                             return String(finalContent);
                         } else {
                             this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Second reasoning continuation returned empty (attempt ${attempt + 1})`, 'warn');
-                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+                            if (attempt === 0) {
+                                await new Promise(r => setTimeout(r, 800));
+                                continue;
+                            }
                             throw new Error('Empty result from reasoning continuation call');
                         }
                     } else {
-                        // Single-call flow for non-reasoning models
-                        const payload: any = buildRequestBody(model, false);
+                        // non-reasoning single-call flow
+                        const payload = buildRequestBody(model, false);
                         if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload.provider = this.bot.config.openRouterProvider;
                         if (this.bot.config?.openRouterRequireResponseFormat) payload.response_format = { type: 'json_object' };
                         payload.stream = false;
 
-                        const resp = await doPost(payload);
-                        const choice = Array.isArray(resp?.data?.choices) && resp.data.choices.length ? resp.data.choices[0] : null;
-                        const content = extractContentFromChoice(choice, resp.data);
+                        let resp: any;
+                        if (openaiClient) {
+                            resp = await (openaiClient.chat?.completions?.create
+                                ? openaiClient.chat.completions.create(payload)
+                                : openaiClient.createChatCompletion?.(payload));
+                        } else {
+                            resp = await doAxiosPost(payload);
+                        }
 
+                        const content = extractFromResp(resp);
                         if (content && String(content).trim().length) return String(content);
+
                         this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Non-reasoning model returned empty content (attempt ${attempt + 1})`, 'warn');
-                        if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
+                        if (attempt === 0) {
+                            await new Promise(r => setTimeout(r, 500));
+                            continue;
+                        }
                         throw new Error('No content from non-reasoning model');
                     }
                 } catch (err: any) {
@@ -1605,10 +1655,17 @@ export class Search extends Workers {
                         await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 400)));
                         throw new Error(`HTTP 429: ${JSON.stringify(rl.data)}`);
                     }
-
                     if (err?.response) {
                         const status = err.response.status;
                         const data = err.response.data;
+                        // special-case OpenRouter privacy 404 message
+                        try {
+                            const message = typeof data?.error?.message === 'string' ? data.error.message : JSON.stringify(data);
+                            if (message && message.toLowerCase().includes('zero data retention')) {
+                                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `OpenRouter privacy settings blocking endpoints: ${message}`, 'error');
+                            }
+                        } catch { /* ignore */ }
+
                         this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `HTTP ${status} error: ${JSON.stringify(data)}`, 'error');
                         throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`);
                     } else if (err.code === 'ECONNABORTED') {
@@ -1620,17 +1677,17 @@ export class Search extends Workers {
                             continue;
                         }
                         this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Request failed: ${String(err?.message ?? err)}`, 'warn');
-                        throw new Error(`Request failed: ${err.message || String(err)}`);
+                        throw new Error(`Request failed: ${err?.message || String(err)}`);
                     }
-                }
-            }
+                } // end try/catch
+            } // end attempts
 
             throw new Error('LLM request failed after retries (sendOnce)');
-        };
+        }; // end sendOnce
 
+        // --- Normalization & fallback parsing (same logic as you had) ---
         const tryNormalizeWithFallbacks = (rawContent: string): GoogleSearch[] => {
             let content = String(rawContent ?? '').trim();
-
             try {
                 const qIdx = content.indexOf('Query:');
                 if (qIdx >= 0) {
@@ -1694,9 +1751,10 @@ export class Search extends Workers {
             throw new Error('LLM returned empty or invalid queries after normalization');
         };
 
+        // --- Attempt phases: selected model, alternative models, fallback model ---
         let lastErr: any = null;
 
-        // Phase 1: selected model
+        // Phase 1: try selected model with available keys (keys ordered: openaiKey first if present)
         for (const key of keys) {
             try {
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying selected model ${selectedModel.name} with reasoning=${selectedModel.supportsReasoning}`);
@@ -1710,8 +1768,8 @@ export class Search extends Workers {
             }
         }
 
-        // Phase 2: other models from modelConfig
-        const otherModels = this.modelConfig.filter(m => m.name !== selectedModel.name);
+        // Phase 2: try other models from modelConfig
+        const otherModels = this.modelConfig.filter((m: any) => m.name !== selectedModel.name);
         for (const model of otherModels) {
             for (const key of keys) {
                 try {
@@ -1727,7 +1785,7 @@ export class Search extends Workers {
             }
         }
 
-        // Phase 3: fallback llama model
+        // Phase 3: fallback llama model attempts
         for (const key of keys) {
             try {
                 this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel}`);
@@ -1744,7 +1802,6 @@ export class Search extends Workers {
         this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All LLM attempts failed; will allow Trends/local fallback upstream', 'error');
         throw lastErr || new Error('LLM failed - all models exhausted');
     }
-
 
     /**
      * Helper method to parse and normalize LLM responses
