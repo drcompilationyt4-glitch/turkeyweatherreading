@@ -38,8 +38,8 @@ export class Search extends Workers {
 
     // Updated model configuration with weights
     private readonly modelConfig = [
-        { name: 'openai/gpt-oss-120b', weight: 0.7, supportsReasoning: true },
-        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 0.3, supportsReasoning: false }
+        { name: 'tngtech/deepseek-r1t2-chimera:free', weight: 0.6, supportsReasoning: true },
+        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 0.4, supportsReasoning: false }
     ]
 
     constructor(bot: any) {
@@ -1382,26 +1382,26 @@ export class Search extends Workers {
     ): Promise<GoogleSearch[]> {
         // Load keys from env or config only. DO NOT hardcode secrets in repo.
         const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim()
-        const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim()
-        const keys = [envKey1, envKey2].filter(k => !!k)
+        const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim();
+        const keys = [envKey1, envKey2].filter(k => !!k);
 
         if (!keys.length) {
-            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key(s) missing. Set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2 or bot.config.openRouterApiKey', 'error')
-            throw new Error('OpenRouter API key not configured')
+            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'OpenRouter API key(s) missing. Set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2 or bot.config.openRouterApiKey', 'error');
+            throw new Error('OpenRouter API key not configured');
         }
 
-        const selectedModel = this.selectRandomModel()
-        const fallbackModel = 'meta-llama/llama-3.3-70b-instruct:free'
+        const selectedModel = this.selectRandomModel();
+        const fallbackModel = 'meta-llama/llama-3.3-70b-instruct:free';
 
-        const categoryWeights = this.getTimeBasedCategoryWeights()
-        const { systemPrompt, userPrompt } = this.generateCategoryPrompt(categoryWeights, geoLocale)
+        const categoryWeights = this.getTimeBasedCategoryWeights();
+        const { systemPrompt, userPrompt } = this.generateCategoryPrompt(categoryWeights, geoLocale);
 
         const baseMessages = [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt.replace('${desiredCount}', desiredCount.toString()) }
-        ]
+        ];
 
-        const maxTokens = Math.min(1600, 90 * desiredCount)
+        const maxTokens = Math.min(1600, 90 * desiredCount);
 
         const buildRequestBody = (model: string, supportsReasoning: boolean, extraMessages: any[] = []): any => {
             const body: any = {
@@ -1409,41 +1409,40 @@ export class Search extends Workers {
                 messages: [...baseMessages, ...extraMessages],
                 max_tokens: maxTokens,
                 temperature: 0.6,
-            }
+                stream: false, // EXPLICIT: do not request streaming
+            };
 
             if (supportsReasoning) {
                 const cfgEnable = typeof this.bot.config?.openRouterReasoningEnabled === 'boolean'
                     ? this.bot.config.openRouterReasoningEnabled
-                    : true
+                    : true;
 
                 if (cfgEnable) {
-                    body.reasoning = { enabled: true }
+                    body.reasoning = { enabled: true };
                     if (typeof this.bot.config?.openRouterReasoningEffort === 'string') {
-                        body.reasoning.effort = this.bot.config.openRouterReasoningEffort
+                        body.reasoning.effort = this.bot.config.openRouterReasoningEffort;
                     }
                     if (typeof this.bot.config?.openRouterReasoningMaxTokens === 'number') {
-                        body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens
+                        body.reasoning.max_tokens = this.bot.config.openRouterReasoningMaxTokens;
                     }
                     if (typeof this.bot.config?.openRouterReasoningExclude === 'boolean') {
-                        body.reasoning.exclude = !!this.bot.config.openRouterReasoningExclude
+                        body.reasoning.exclude = !!this.bot.config.openRouterReasoningExclude;
                     }
                 }
             }
 
-            // Optional provider routing (string or object) per OpenRouter docs
             if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') {
-                body.provider = this.bot.config.openRouterProvider as any
+                body.provider = this.bot.config.openRouterProvider as any;
             }
 
-            // Optionally request structured JSON when configured
             if (this.bot.config?.openRouterRequireResponseFormat) {
-                body.response_format = { type: 'json_object' }
+                body.response_format = { type: 'json_object' };
             }
 
-            if (typeof this.bot.config?.openRouterUserId === 'string') body.user = this.bot.config.openRouterUserId
+            if (typeof this.bot.config?.openRouterUserId === 'string') body.user = this.bot.config.openRouterUserId;
 
-            return body
-        }
+            return body;
+        };
 
         const createOpenRouterClient = (apiKey: string) => axios.create({
             baseURL: 'https://openrouter.ai/api/v1',
@@ -1455,116 +1454,106 @@ export class Search extends Workers {
                 'Authorization': `Bearer ${apiKey}`
             },
             proxy: false
-        })
+        });
 
         const extractContentFromChoice = (choice: any, rawData: any): string | null => {
             try {
-                // handle OpenRouter / Chat-style: choice.message.content can be string or object
-                const msg = choice?.message ?? {}
-                // message.content might be string
-                if (typeof msg.content === 'string' && msg.content.trim().length) return msg.content.trim()
+                const msg = choice?.message ?? {};
+                if (typeof msg.content === 'string' && msg.content.trim().length) return msg.content.trim();
 
-                // some providers return content as { parts: [...] } or as an array
                 if (msg.content && typeof msg.content === 'object') {
-                    // try content.parts
-                    const parts = msg.content.parts || msg.content.text || msg.content
+                    const parts = msg.content.parts || msg.content.text || msg.content;
                     if (Array.isArray(parts)) {
-                        const combined = parts.map((p: any) => (typeof p === 'string' ? p : (p?.text ?? ''))).join(' ').trim()
-                        if (combined) return combined
+                        const combined = parts.map((p: any) => (typeof p === 'string' ? p : (p?.text ?? ''))).join(' ').trim();
+                        if (combined) return combined;
                     } else if (typeof parts === 'string') {
-                        return parts.trim()
+                        return parts.trim();
                     }
                 }
 
-                // reasoning_details may contain final_answer or chain_of_thought
-                const reasoningObj = msg.reasoning_details ?? msg.reasoning ?? choice?.reasoning_details ?? rawData?.reasoning_details
+                const reasoningObj = msg.reasoning_details ?? msg.reasoning ?? choice?.reasoning_details ?? rawData?.reasoning_details ?? rawData?.reasoning;
                 if (reasoningObj) {
-                    if (typeof reasoningObj.final_answer === 'string' && reasoningObj.final_answer.trim()) return reasoningObj.final_answer.trim()
-                    if (typeof reasoningObj.chain_of_thought === 'string' && reasoningObj.chain_of_thought.trim()) return reasoningObj.chain_of_thought.trim()
-                    // sometimes final answer lives in an array or nested shape
-                    const asStr = JSON.stringify(reasoningObj)
-                    if (asStr && asStr.length) return asStr
+                    if (typeof reasoningObj.final_answer === 'string' && reasoningObj.final_answer.trim()) return reasoningObj.final_answer.trim();
+                    if (typeof reasoningObj.chain_of_thought === 'string' && reasoningObj.chain_of_thought.trim()) return reasoningObj.chain_of_thought.trim();
+                    const asStr = JSON.stringify(reasoningObj);
+                    if (asStr && asStr.length) return asStr;
                 }
 
-                // fallback shapes
-                if (typeof choice?.text === 'string' && choice.text.trim().length) return choice.text.trim()
-                if (typeof rawData?.result?.content === 'string' && rawData.result.content.trim().length) return rawData.result.content.trim()
-                if (typeof rawData?.content === 'string' && rawData.content.trim().length) return rawData.content.trim()
-                if (typeof rawData === 'string' && rawData.trim().length) return rawData.trim()
+                if (typeof choice?.text === 'string' && choice.text.trim().length) return choice.text.trim();
+                if (typeof rawData?.result?.content === 'string' && rawData.result.content.trim().length) return rawData.result.content.trim();
+                if (typeof rawData?.content === 'string' && rawData.content.trim().length) return rawData.content.trim();
+                if (typeof rawData === 'string' && rawData.trim().length) return rawData.trim();
 
-                // special case: some providers put array of message-like objects in result
                 if (Array.isArray(rawData?.choices) && rawData.choices.length) {
-                    const first = rawData.choices[0]
-                    const candidate = first?.message?.content ?? first?.text ?? first?.content
-                    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+                    const first = rawData.choices[0];
+                    const candidate = first?.message?.content ?? first?.text ?? first?.content;
+                    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
                 }
             } catch {
                 // ignore and fallback
             }
-            return null
-        }
+            return null;
+        };
 
         const isRateLimit429 = (err: any) => {
             try {
-                const status = err?.response?.status
-                const data = err?.response?.data
-                return { ok: status === 429, data }
+                const status = err?.response?.status;
+                const data = err?.response?.data;
+                return { ok: status === 429, data };
             } catch {
-                return { ok: false, data: null }
+                return { ok: false, data: null };
             }
-        }
+        };
 
         const sendOnce = async (apiKey: string, model: string, supportsReasoning: boolean): Promise<string> => {
-            const client = createOpenRouterClient(apiKey)
-            // Use longer timeout for reasoning-enabled models
-            const defaultTimeout = supportsReasoning ? (this.bot.config?.openRouterReasoningTimeoutMs || 240000) : 90000
+            const client = createOpenRouterClient(apiKey);
+            const defaultTimeout = supportsReasoning ? (this.bot.config?.openRouterReasoningTimeoutMs || 240000) : 90000;
 
             const doPost = async (payload: any, timeoutMs?: number) => {
+                // Ensure we never accidentally request streaming from the server
+                payload.stream = false;
                 const cfg: AxiosRequestConfig = {
                     url: '/chat/completions',
                     method: 'POST',
                     data: payload,
                     timeout: timeoutMs ?? defaultTimeout,
                     proxy: false
-                }
-                return client.request(cfg as any)
-            }
+                };
+                return client.request(cfg as any);
+            };
 
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
-                    // Reasoning-capable flow: 2-step call that preserves assistant message with reasoning_details
                     if (supportsReasoning) {
-                        // Step 1: ask initial prompt with reasoning enabled
-                        const payload1: any = buildRequestBody(model, true, [])
-                        // ensure reasoning enabled explicitly
-                        if (!payload1.reasoning) payload1.reasoning = { enabled: true }
-                        const resp1 = await doPost(payload1)
-                        const choice1 = Array.isArray(resp1?.data?.choices) && resp1.data.choices.length ? resp1.data.choices[0] : null
-                        const assistantMsg = choice1?.message ?? null
-                        const assistantContent = extractContentFromChoice(choice1, resp1.data)
+                        // Step 1: initial prompt with reasoning, non-streaming
+                        const payload1: any = buildRequestBody(model, true, []);
+                        if (!payload1.reasoning) payload1.reasoning = { enabled: true };
+
+                        const resp1 = await doPost(payload1);
+                        const choice1 = Array.isArray(resp1?.data?.choices) && resp1.data.choices.length ? resp1.data.choices[0] : null;
+                        const assistantMsg = choice1?.message ?? null;
+                        const assistantContent = extractContentFromChoice(choice1, resp1.data);
 
                         if (!assistantMsg || !assistantContent) {
-                            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `First reasoning call returned empty (attempt ${attempt + 1})`, 'warn')
-                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue }
-                            throw new Error('Empty result from first reasoning call')
+                            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `First reasoning call returned empty (attempt ${attempt + 1})`, 'warn');
+                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+                            throw new Error('Empty result from first reasoning call');
                         }
 
-                        // preserve assistant message and any reasoning_details that came with it
+                        // Preserve assistant message and any reasoning_details that came with it
                         const preservedAssistant: any = {
                             role: 'assistant',
                             content: typeof assistantMsg.content === 'string' ? assistantMsg.content : (assistantContent || assistantMsg.content || '')
-                        }
-                        // preserve reasoning_details/reasoning verbatim if present
-                        if (assistantMsg.reasoning_details) preservedAssistant.reasoning_details = assistantMsg.reasoning_details
-                        if (assistantMsg.reasoning) preservedAssistant.reasoning = assistantMsg.reasoning
-                        // some providers include top-level reasoning in choice
-                        if (choice1?.reasoning_details) preservedAssistant.reasoning_details = preservedAssistant.reasoning_details ?? choice1.reasoning_details
+                        };
+                        if (assistantMsg.reasoning_details) preservedAssistant.reasoning_details = assistantMsg.reasoning_details;
+                        if (assistantMsg.reasoning) preservedAssistant.reasoning = assistantMsg.reasoning;
+                        if (choice1?.reasoning_details) preservedAssistant.reasoning_details = preservedAssistant.reasoning_details ?? choice1.reasoning_details;
 
-                        // followup user prompt asking for final concise queries
+                        // Followup user prompt asking for final concise queries
                         const followupUser = {
                             role: 'user',
                             content: `Are you sure? Think carefully and provide the concise final queries (exactly ${desiredCount} items). ${contextNotes || ''}`
-                        }
+                        };
 
                         const payload2: any = {
                             model,
@@ -1574,177 +1563,166 @@ export class Search extends Workers {
                                 followupUser
                             ],
                             max_tokens: Math.min(1024, maxTokens),
-                            temperature: 0.45
-                        }
-                        // preserve provider/config fields if necessary
-                        if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload2.provider = this.bot.config.openRouterProvider
-                        if (this.bot.config?.openRouterRequireResponseFormat) payload2.response_format = { type: 'json_object' }
-                        if (this.bot.config?.openRouterReasoningEnabled) payload2.reasoning = { enabled: true }
+                            temperature: 0.45,
+                            stream: false,
+                        };
 
-                        const resp2 = await doPost(payload2)
-                        const choice2 = Array.isArray(resp2?.data?.choices) && resp2.data.choices.length ? resp2.data.choices[0] : null
-                        const finalContent = extractContentFromChoice(choice2, resp2.data)
+                        if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload2.provider = this.bot.config.openRouterProvider;
+                        if (this.bot.config?.openRouterRequireResponseFormat) payload2.response_format = { type: 'json_object' };
+                        if (this.bot.config?.openRouterReasoningEnabled) payload2.reasoning = { enabled: true };
+
+                        const resp2 = await doPost(payload2);
+                        const choice2 = Array.isArray(resp2?.data?.choices) && resp2.data.choices.length ? resp2.data.choices[0] : null;
+                        const finalContent = extractContentFromChoice(choice2, resp2.data);
 
                         if (finalContent && String(finalContent).trim().length) {
-                            return String(finalContent)
+                            return String(finalContent);
                         } else {
-                            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Second reasoning continuation returned empty (attempt ${attempt + 1})`, 'warn')
-                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue }
-                            throw new Error('Empty result from reasoning continuation call')
+                            this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Second reasoning continuation returned empty (attempt ${attempt + 1})`, 'warn');
+                            if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+                            throw new Error('Empty result from reasoning continuation call');
                         }
                     } else {
                         // Single-call flow for non-reasoning models
-                        const payload: any = buildRequestBody(model, false)
-                        if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload.provider = this.bot.config.openRouterProvider
-                        if (this.bot.config?.openRouterRequireResponseFormat) payload.response_format = { type: 'json_object' }
+                        const payload: any = buildRequestBody(model, false);
+                        if (this.bot.config && typeof this.bot.config.openRouterProvider !== 'undefined') payload.provider = this.bot.config.openRouterProvider;
+                        if (this.bot.config?.openRouterRequireResponseFormat) payload.response_format = { type: 'json_object' };
+                        payload.stream = false;
 
-                        const resp = await doPost(payload)
-                        const choice = Array.isArray(resp?.data?.choices) && resp.data.choices.length ? resp.data.choices[0] : null
-                        const content = extractContentFromChoice(choice, resp.data)
+                        const resp = await doPost(payload);
+                        const choice = Array.isArray(resp?.data?.choices) && resp.data.choices.length ? resp.data.choices[0] : null;
+                        const content = extractContentFromChoice(choice, resp.data);
 
-                        if (content && String(content).trim().length) return String(content)
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Non-reasoning model returned empty content (attempt ${attempt + 1})`, 'warn')
-                        if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue }
-                        throw new Error('No content from non-reasoning model')
+                        if (content && String(content).trim().length) return String(content);
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Non-reasoning model returned empty content (attempt ${attempt + 1})`, 'warn');
+                        if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
+                        throw new Error('No content from non-reasoning model');
                     }
                 } catch (err: any) {
-                    const rl = isRateLimit429(err)
+                    const rl = isRateLimit429(err);
                     if (rl.ok) {
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `HTTP 429 (upstream rate limit): ${JSON.stringify(rl.data)}`, 'warn')
-                        await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 400)))
-                        throw new Error(`HTTP 429: ${JSON.stringify(rl.data)}`)
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `HTTP 429 (upstream rate limit): ${JSON.stringify(rl.data)}`, 'warn');
+                        await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 400)));
+                        throw new Error(`HTTP 429: ${JSON.stringify(rl.data)}`);
                     }
 
                     if (err?.response) {
-                        const status = err.response.status
-                        const data = err.response.data
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `HTTP ${status} error: ${JSON.stringify(data)}`, 'error')
-                        throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
+                        const status = err.response.status;
+                        const data = err.response.data;
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `HTTP ${status} error: ${JSON.stringify(data)}`, 'error');
+                        throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`);
                     } else if (err.code === 'ECONNABORTED') {
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Request timeout', 'warn')
-                        throw new Error('Request timeout')
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Request timeout', 'warn');
+                        throw new Error('Request timeout');
                     } else {
                         if (this.isRetryableError && this.isRetryableError(err) && attempt === 0) {
-                            await new Promise(r => setTimeout(r, 500))
-                            continue
+                            await new Promise(r => setTimeout(r, 500));
+                            continue;
                         }
-                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Request failed: ${String(err?.message ?? err)}`, 'warn')
-                        throw new Error(`Request failed: ${err.message || String(err)}`)
+                        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Request failed: ${String(err?.message ?? err)}`, 'warn');
+                        throw new Error(`Request failed: ${err.message || String(err)}`);
                     }
                 }
             }
 
-            throw new Error('LLM request failed after retries (sendOnce)')
-        }
+            throw new Error('LLM request failed after retries (sendOnce)');
+        };
 
         const tryNormalizeWithFallbacks = (rawContent: string): GoogleSearch[] => {
-            // First: defensive trimming
-            let content = String(rawContent ?? '').trim()
+            let content = String(rawContent ?? '').trim();
 
-            // Remove obvious score/prefix patterns like "33 Points Remaining | Query: <json>"
-            // If there's a 'Query:' token followed by JSON, extract from there
             try {
-                const qIdx = content.indexOf('Query:')
+                const qIdx = content.indexOf('Query:');
                 if (qIdx >= 0) {
-                    const after = content.slice(qIdx + 'Query:'.length).trim()
-                    // if after starts with '[' or '{', attempt to parse
-                    if (/^[\[{]/.test(after)) content = after
+                    const after = content.slice(qIdx + 'Query:'.length).trim();
+                    if (/^[\[{]/.test(after)) content = after;
                 }
-                // also remove leading "<number> Points Remaining |" junk
-                content = content.replace(/^\s*\d+\s+Points\s+Remaining\s*\|/i, '').trim()
+                content = content.replace(/^\s*\d+\s+Points\s+Remaining\s*\|/i, '').trim();
             } catch { /* ignore */ }
 
-            // Primary attempt: use your existing JSON parser
             try {
-                const normalized = this.parseAndNormalizeLLMResponse(content)
-                if (Array.isArray(normalized) && normalized.length > 0) return normalized
+                const normalized = this.parseAndNormalizeLLMResponse(content);
+                if (Array.isArray(normalized) && normalized.length > 0) return normalized;
             } catch (e) {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `parseAndNormalizeLLMResponse failed: ${String(e)}`, 'warn')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `parseAndNormalizeLLMResponse failed: ${String(e)}`, 'warn');
             }
 
-            // Attempt 1: strip fences and reparse
             try {
-                const s = String(content).replace(/```(?:json)?/gi, '').replace(/```/g, '').trim()
-                const normalized = this.parseAndNormalizeLLMResponse(s)
+                const s = String(content).replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+                const normalized = this.parseAndNormalizeLLMResponse(s);
                 if (Array.isArray(normalized) && normalized.length > 0) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: parsed after stripping fences', 'warn')
-                    return normalized
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: parsed after stripping fences', 'warn');
+                    return normalized;
                 }
             } catch { /* fallthrough */ }
 
-            // Attempt 2: find the first JSON array fragment in text
             try {
-                const m = String(content).match(/\[[\s\S]*\]/)
+                const m = String(content).match(/\[[\s\S]*\]/);
                 if (m && m[0]) {
                     try {
-                        const parsed = JSON.parse(m[0])
+                        const parsed = JSON.parse(m[0]);
                         if (Array.isArray(parsed) && parsed.length > 0) {
-                            // reuse normalization logic by stringifying back to expected format and calling parseAndNormalizeLLMResponse
-                            const normalized = this.parseAndNormalizeLLMResponse(JSON.stringify(parsed))
-                            if (Array.isArray(normalized) && normalized.length > 0) return normalized
+                            const normalized = this.parseAndNormalizeLLMResponse(JSON.stringify(parsed));
+                            if (Array.isArray(normalized) && normalized.length > 0) return normalized;
                         }
                     } catch { /* ignore */ }
                 }
             } catch { /* ignore */ }
 
-            // Attempt 3: simple newline-splitting fallback
-            const lines = String(content).split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+            const lines = String(content).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
             if (lines.length > 0) {
                 const candidates = lines.slice(0, desiredCount).map(l => {
-                    // remove bullets and numbering
-                    const cleaned = l.replace(/^[\-\*\d\.\)\s]+/, '').replace(/^"|"$/g, '').trim()
-                    // create simple shape expected by parse function
-                    return { topic: cleaned, related: [] as string[] }
-                })
+                    const cleaned = l.replace(/^[\-\*\d\.\)\s]+/, '').replace(/^"|"$/g, '').trim();
+                    return { topic: cleaned, related: [] as string[] };
+                });
                 if (candidates.length > 0) {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: used newline-split to derive queries', 'warn')
-                    return candidates as GoogleSearch[]
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: used newline-split to derive queries', 'warn');
+                    return candidates as GoogleSearch[];
                 }
             }
 
-            // Attempt 4: last-resort short text fallback (for desiredCount === 1)
             if (desiredCount === 1) {
-                const plain = String(content).trim().replace(/["`]/g, '')
-                const firstLine = plain.split(/\r?\n/).find(Boolean) ?? plain
+                const plain = String(content).trim().replace(/["`]/g, '');
+                const firstLine = plain.split(/\r?\n/).find(Boolean) ?? plain;
                 if (firstLine && firstLine.length > 0) {
-                    const words = firstLine.trim().split(/\s+/).slice(0, 4).join(' ')
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: single-item plain text accepted', 'warn')
-                    return [{ topic: words, related: [] }]
+                    const words = firstLine.trim().split(/\s+/).slice(0, 4).join(' ');
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'Fallback: single-item plain text accepted', 'warn');
+                    return [{ topic: words, related: [] }];
                 }
             }
 
-            throw new Error('LLM returned empty or invalid queries after normalization')
-        }
+            throw new Error('LLM returned empty or invalid queries after normalization');
+        };
 
-        let lastErr: any = null
+        let lastErr: any = null;
 
         // Phase 1: selected model
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying selected model ${selectedModel.name} with reasoning=${selectedModel.supportsReasoning}`)
-                const content = await sendOnce(key, selectedModel.name, selectedModel.supportsReasoning)
-                const normalized = tryNormalizeWithFallbacks(content)
-                if (normalized.length > 0) return normalized
-                throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying selected model ${selectedModel.name} with reasoning=${selectedModel.supportsReasoning}`);
+                const content = await sendOnce(key, selectedModel.name, selectedModel.supportsReasoning);
+                const normalized = tryNormalizeWithFallbacks(content);
+                if (normalized.length > 0) return normalized;
+                throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)');
             } catch (err) {
-                lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Selected model attempt failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                lastErr = err;
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Selected model attempt failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
             }
         }
 
         // Phase 2: other models from modelConfig
-        const otherModels = this.modelConfig.filter(m => m.name !== selectedModel.name)
+        const otherModels = this.modelConfig.filter(m => m.name !== selectedModel.name);
         for (const model of otherModels) {
             for (const key of keys) {
                 try {
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying alternative model ${model.name}`)
-                    const content = await sendOnce(key, model.name, model.supportsReasoning)
-                    const normalized = tryNormalizeWithFallbacks(content)
-                    if (normalized.length > 0) return normalized
-                    throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)')
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying alternative model ${model.name}`);
+                    const content = await sendOnce(key, model.name, model.supportsReasoning);
+                    const normalized = tryNormalizeWithFallbacks(content);
+                    if (normalized.length > 0) return normalized;
+                    throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)');
                 } catch (err) {
-                    lastErr = err
-                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Alternative model ${model.name} failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                    lastErr = err;
+                    this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Alternative model ${model.name} failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
                 }
             }
         }
@@ -1752,20 +1730,21 @@ export class Search extends Workers {
         // Phase 3: fallback llama model
         for (const key of keys) {
             try {
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel}`)
-                const content = await sendOnce(key, fallbackModel, false)
-                const normalized = tryNormalizeWithFallbacks(content)
-                if (normalized.length > 0) return normalized
-                throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)')
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel}`);
+                const content = await sendOnce(key, fallbackModel, false);
+                const normalized = tryNormalizeWithFallbacks(content);
+                if (normalized.length > 0) return normalized;
+                throw new Error('LLM returned empty or invalid queries after normalization (post-fallbacks)');
             } catch (err) {
-                lastErr = err
-                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model failed: ${err instanceof Error ? err.message : String(err)}`, 'warn')
+                lastErr = err;
+                this.bot.log(this.bot.isMobile, 'SEARCH-LLM', `Fallback model failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
             }
         }
 
-        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All LLM attempts failed; will allow Trends/local fallback upstream', 'error')
-        throw lastErr || new Error('LLM failed - all models exhausted')
+        this.bot.log(this.bot.isMobile, 'SEARCH-LLM', 'All LLM attempts failed; will allow Trends/local fallback upstream', 'error');
+        throw lastErr || new Error('LLM failed - all models exhausted');
     }
+
 
     /**
      * Helper method to parse and normalize LLM responses
