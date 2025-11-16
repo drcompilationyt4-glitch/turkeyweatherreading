@@ -1,8 +1,8 @@
-// src/functions/activities/SearchOnBing.ts  (updated to include description in LLM context)
+// src/functions/activities/SearchOnBing.ts  (updated to include description in LLM context and disable proxy)
 import { Page } from 'rebrowser-playwright'
 import * as fs from 'fs'
 import path from 'path'
-import axios from 'axios';
+import axios, { AxiosRequestConfig } from 'axios';
 
 // If you want to load .env automatically when running locally, either
 // call require('dotenv').config() in your app entry or uncomment the line below:
@@ -11,7 +11,23 @@ import axios from 'axios';
 import { Workers } from '../Workers'
 
 import { MorePromotion, PromotionalItem } from '../../interface/DashboardData'
-import { AxiosRequestConfig } from 'axios'
+
+// --- Hard disable proxying for axios in this module to avoid upstream 502 via corporate proxies ---
+// This helps when environment variables like HTTP_PROXY/HTTPS_PROXY are present.
+try {
+    // global axios default
+    (axios as any).defaults = (axios as any).defaults || {}
+    ;(axios as any).defaults.proxy = false
+} catch (e) {
+    // ignore if we can't set it
+}
+try {
+    // remove common env proxy vars in-process so node/http(s) libs won't pick them up
+    delete process.env.HTTP_PROXY
+    delete process.env.HTTPS_PROXY
+    delete process.env.http_proxy
+    delete process.env.https_proxy
+} catch { /* ignore */ }
 
 export class SearchOnBing extends Workers {
     /**
@@ -140,10 +156,11 @@ export class SearchOnBing extends Workers {
                     url: 'https://raw.githubusercontent.com/TheNetsky/Microsoft-Rewards-Script/refs/heads/main/src/functions/queries.json',
                     timeout: 8000,
                     responseType: 'text',
-                    proxy: false // Added proxy false as per instructions
+                    proxy: false // ensure axios does not use proxy for this request
                 }
 
-                const response = await this.bot.axios.request(axiosReq).catch(() => ({ data: null }))
+                // Use module-local axios (not this.bot.axios which may be configured with proxies)
+                const response = await axios.request(axiosReq).catch(() => ({ data: null }))
                 let remoteData: any = response && response.data ? response.data : null
 
                 if (typeof remoteData === 'string') {
@@ -232,7 +249,7 @@ export class SearchOnBing extends Workers {
             const promptSubtext = `Description/context: "${String(description || '').trim()}".
 Instructions: Provide a concise search query (2-8 words) that a human would enter into Bing to find pages relevant to the promotion. Keep it natural-language, focused on the user's intent, and avoid including site names or tracking tokens. Output only the query on the first line.`;
 
-            // Use axios to bypass proxy for this request only
+            // Use axios to bypass proxy for this request only (and explicit timeout)
             const openRouterClient = axios.create({
                 baseURL: 'https://openrouter.ai/api/v1',
                 headers: defaultHeaders,
