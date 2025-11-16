@@ -32,8 +32,8 @@
     "doDailySet": true,
     "doMorePromotions": true,
     "doPunchCards": true,
-    "doDesktopSearch": true,
-    "doMobileSearch": true,
+    "doDesktopSearch": false,
+    "doMobileSearch": false,
     "doDailyCheckIn": true,
     "doReadToEarn": true,
     "bundleDailySetWithSearch": false
@@ -227,3 +227,4 @@
   // Keep the older flat keys if any legacy code references them
   "baseTimeout": "100s"
 }
+
