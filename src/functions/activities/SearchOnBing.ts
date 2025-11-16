@@ -222,7 +222,7 @@ export class SearchOnBing extends Workers {
             else defaultHeaders['X-Title'] = '<YOUR_SITE_NAME>';
 
             // Choose model and temperature from config if present
-            const model = (this.bot.config && this.bot.config.openRouterModel) || 'deepseek/deepseek-chat-v3-0324:free';
+            const model = (this.bot.config && this.bot.config.openRouterModel) || 'meta-llama/llama-3.3-70b-instruct:free';
             const temperature = (this.bot.config && typeof this.bot.config.openRouterTemperature === 'number')
                 ? this.bot.config.openRouterTemperature : 0.2;
 

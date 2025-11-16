@@ -38,9 +38,10 @@ export class Search extends Workers {
 
     // Updated model configuration with weights
     private readonly modelConfig = [
-        { name: 'google/gemini-2.0-flash-exp:free', weight: 0.5, supportsReasoning: false },
-        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 0.5, supportsReasoning: false }
-    ]
+        { name: 'google/gemini-2.0-flash-exp:free', weight: 1/3, supportsReasoning: false },
+        { name: 'deepseek/deepseek-chat-v3-0324:free', weight: 1/3, supportsReasoning: false },
+        { name: 'qwen/qwen3-235b-a22b:free', weight: 1/3, supportsReasoning: false },
+]
 
     constructor(bot: any) {
         super(bot)
@@ -1381,7 +1382,7 @@ export class Search extends Workers {
         runSeed?: number
     ): Promise<GoogleSearch[]> {
         // --- Keys & config ---
-        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();;
+        const envKey1 = (process.env.OPENROUTER_API_KEY || this.bot.config?.openRouterApiKey || '').toString().trim();
         const envKey2 = (process.env.OPENROUTER_API_KEY_2 || this.bot.config?.openRouterApiKey2 || '').toString().trim();
         const openaiKey = (process.env.OPENAI_API_KEY || this.bot.config?.openaiApiKey || '').toString().trim();
 
@@ -1807,182 +1808,209 @@ export class Search extends Workers {
      * Helper method to parse and normalize LLM responses
      */
     private parseAndNormalizeLLMResponse(content: string): GoogleSearch[] {
-        // Defensive normalization of many possible LLM output shapes into GoogleSearch[]
         const safeParseJson = (s: string): any | null => {
-            try { return JSON.parse(s) } catch { return null }
+            try { return JSON.parse(s); } catch { return null; }
+        };
+
+        const normalizeString = (s: string) =>
+            String(s || '')
+                .replace(/[\u2018\u2019\u201C\u201D]/g, '"') // smart quotes -> "
+                .replace(/\t+/g, ' ')
+                .replace(/\r/g, '\n')
+                .trim();
+
+        const stripFences = (s: string) =>
+            normalizeString(s)
+                .replace(/```(?:json)?/gi, '')
+                .replace(/```/g, '')
+                .trim();
+
+        const raw = String(content ?? '').trim();
+        const stripped = stripFences(raw).replace(/\s+$/g, '');
+
+        // Try multiple JSON extraction strategies
+        const tryExtractJson = (text: string): any | null => {
+            const direct = safeParseJson(text);
+            if (direct !== null) return direct;
+
+            const jsonBlockRegex = /(\{[\s\S]*?\}|\[[\s\S]*?\])/g;
+            const matches = Array.from(text.matchAll(jsonBlockRegex)).map(m => m[0]);
+            matches.sort((a, b) => b.length - a.length);
+            for (const m of matches) {
+                const parsed = safeParseJson(m);
+                if (parsed !== null) return parsed;
+                const trimmed = m.replace(/,\s*([\]\}])/g, '$1');
+                const parsed2 = safeParseJson(trimmed);
+                if (parsed2 !== null) return parsed2;
+            }
+
+            const firstJsonStart = text.search(/[\{\[]/);
+            if (firstJsonStart >= 0) {
+                const candidate = text.slice(firstJsonStart);
+                const parsed = safeParseJson(candidate);
+                if (parsed !== null) return parsed;
+            }
+
+            return null;
+        };
+
+        // 1) JSON-first approach
+        const parsed = tryExtractJson(stripped);
+        if (parsed !== null) {
+            if (!Array.isArray(parsed) && typeof parsed === 'object' && parsed !== null) {
+                const arr =
+                    parsed.queries ||
+                    parsed.items ||
+                    parsed.results ||
+                    parsed.topics ||
+                    parsed.default ||
+                    parsed.Query ||
+                    parsed.data ||
+                    parsed.output;
+
+                if (Array.isArray(arr)) {
+                    const normalized = arr
+                        .map((it: any) => {
+                            if (typeof it === 'string') return { topic: it.trim(), related: [] };
+                            if (it && typeof it === 'object') {
+                                const topic = String(it.topic || it.query || it.title || it.text || (Object.keys(it)[0] ?? '')).trim();
+                                const related = Array.isArray(it.related) ? it.related.map(String) : [];
+                                return { topic, related };
+                            }
+                            return null;
+                        })
+                        .filter(Boolean) as GoogleSearch[];
+                    if (normalized.length) return normalized;
+                }
+
+                const keys = Object.keys(parsed).filter(k => typeof parsed[k] === 'string' || typeof parsed[k] === 'object');
+                if (keys.length) {
+                    return keys.map(k => ({ topic: k.trim(), related: [] }));
+                }
+            }
+
+            if (Array.isArray(parsed)) {
+                const normalized = parsed
+                    .map((it: any) => {
+                        if (typeof it === 'string') return { topic: it.trim(), related: [] };
+                        if (it && typeof it === 'object') {
+                            const topic = String(it.topic || it.query || it.title || it.text || (Object.keys(it)[0] ?? '')).trim();
+                            const related = Array.isArray(it.related) ? it.related.map(String) : [];
+                            return { topic, related };
+                        }
+                        return null;
+                    })
+                    .filter(Boolean) as GoogleSearch[];
+                if (normalized.length) return normalized;
+            }
         }
 
-        const stripFences = (s: string) => String(s).replace(/```(?:json)?/gi, '').replace(/```/g, '').trim()
-        const firstJsonArrayInText = (s: string): any | null => {
-            const m = String(s).match(/\[[\s\S]*\]/)
-            if (!m) return null
-            return safeParseJson(m[0])
-        }
+        // 2) Not JSON — split but avoid splitting on commas inside quotes.
+        const removeEmptyQuoteTokens = (s: string) =>
+            s.replace(/(^|[\s,])""(?=$|[\s,])/g, '').replace(/\b""\b/g, '');
 
-        const raw = String(content ?? '').trim()
-        let parsed: any = null
+        const cleaned = removeEmptyQuoteTokens(stripped);
 
-        // 1) Try direct JSON parse
-        parsed = safeParseJson(raw)
+        const splitRespectingQuotes = (s: string): string[] => {
+            const parts: string[] = [];
+            let cur = '';
+            let inQuote = false;
+            let quoteChar: string | null = null;
+            for (let i = 0; i < s.length; i++) {
+                const ch = s[i];
+                if (!inQuote && (ch === '"' || ch === "'")) {
+                    inQuote = true;
+                    quoteChar = ch;
+                    cur += ch;
+                    continue;
+                } else if (inQuote && ch === quoteChar) {
+                    let backslashes = 0;
+                    let j = i - 1;
+                    while (j >= 0 && s[j] === '\\') { backslashes++; j--; }
+                    if (backslashes % 2 === 0) {
+                        inQuote = false;
+                        quoteChar = null;
+                    }
+                    cur += ch;
+                    continue;
+                }
 
-        // 2) Try after stripping fences
-        if (parsed === null) parsed = safeParseJson(stripFences(raw))
+                if (!inQuote && (ch === '\n' || ch === '\r')) {
+                    if (cur.trim()) parts.push(cur);
+                    cur = '';
+                    while (i + 1 < s.length && (s[i + 1] === '\n' || s[i + 1] === '\r')) i++;
+                    continue;
+                }
 
-        // 3) Try extracting a JSON array from anywhere in the text
-        if (parsed === null) parsed = firstJsonArrayInText(raw)
-
-        // 4) Some LLMs return arrays/objects embedded in text: try to parse JSON object fragments
-        if (parsed === null) {
-            try {
-                const maybe = raw.match(/\{(?:[^{}]|\{[^{}]*\})*\}/g)
-                if (maybe && maybe.length) {
-                    for (const chunk of maybe) {
-                        const obj = safeParseJson(chunk)
-                        if (obj && (Array.isArray(obj) || typeof obj === 'object')) {
-                            parsed = obj
-                            break
+                if (!inQuote && (ch === ',' || ch === ';')) {
+                    const rest = s.slice(i + 1);
+                    const nextNonSpace = rest.match(/\S/);
+                    if (!nextNonSpace) {
+                        if (cur.trim()) parts.push(cur);
+                        cur = '';
+                        continue;
+                    } else {
+                        const idx = i + 1 + rest.search(/\S/);
+                        const nc = (s[idx] ?? '');
+                        if (nc === '"' || nc === "'" || /[A-Za-z0-9]/.test(nc)) {
+                            if (cur.trim()) parts.push(cur);
+                            cur = '';
+                            continue;
+                        } else {
+                            cur += ch;
+                            continue;
                         }
                     }
                 }
-            } catch { /* ignore */ }
+
+                cur += ch;
+            }
+            if (cur.trim()) parts.push(cur);
+            return parts;
+        };
+
+        let candidateParts = splitRespectingQuotes(cleaned);
+
+        if (candidateParts.length === 1 && (cleaned.match(/,/g) || []).length > 2) {
+            candidateParts = splitRespectingQuotes(cleaned.replace(/\r/g, '\n'));
         }
 
-        // 5) If it's an object that contains common array fields, extract them
-        if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') {
-            if (Array.isArray(parsed.queries)) parsed = parsed.queries
-            else if (Array.isArray(parsed.default)) parsed = parsed.default
-            else if (Array.isArray(parsed.items)) parsed = parsed.items
-            else if (Array.isArray(parsed.results)) parsed = parsed.results
-            else if (Array.isArray(parsed.topics)) parsed = parsed.topics
-            else if (Array.isArray(parsed.Query)) parsed = parsed.Query
-            else {
-                // Maybe object where keys are topics: { "topic1": {}, "topic2": {} } -> make array of keys
-                const keys = Object.keys(parsed).filter(k => typeof parsed[k] === 'object' || typeof parsed[k] === 'string')
-                if (keys.length) {
-                    parsed = keys
+        const parts = candidateParts
+            .map(p => String(p || '').trim())
+            .filter(Boolean)
+            .map(p => {
+                p = p.replace(/^[\-\*\•\u2022\s]*\d+[\.\)\-\:]\s*/, '');
+                p = p.replace(/^[\-\*\•\u2022\)\(\s]+/, '');
+
+                const colonMatch = p.match(/^\s*(?:topic|query|title|item|suggestion|suggest|question|prompt)\s*[:\-]\s*(.+)$/i);
+                if (colonMatch && colonMatch[1]) {
+                    p = colonMatch[1].trim();
                 } else {
-                    // leave as-is for fallback to plain-text parsing
-                    parsed = null
+                    const colonGeneric = p.match(/^\s*([^:]{1,40})\s*:\s*(.+)$/);
+                    if (colonGeneric && colonGeneric[1] !== undefined && colonGeneric[2] !== undefined) {
+                        const left = colonGeneric[1];
+                        if (!/\s{2,}/.test(left) && left.length < 30) {
+                            p = colonGeneric[2].trim();
+                        }
+                    }
                 }
-            }
-        }
 
-        // 6) If still null, attempt newline / bullet parsing (plain text lists)
-        if (parsed === null) {
-            const lines = stripFences(raw)
-                .split(/\r?\n/)
-                .map(l => l.trim())
-                .filter(l => l.length > 0)
-            // Remove lines that look like metadata (e.g. "title:" or "subtitle:")
-            const filtered = lines.filter(l => !/^[a-z0-9_-]+:\s*/i.test(l) && !/^#+\s*/.test(l))
-            if (filtered.length > 0) parsed = filtered
-        }
-
-        // 7) Last fallback: treat entire raw string as single topic
-        if (parsed === null) parsed = [raw]
-
-        // Ensure we have an array now
-        if (!Array.isArray(parsed)) throw new Error('LLM returned non-array JSON or unparsable content')
-
-        // Normalize each entry into GoogleSearch { topic: string, related: string[] }
-        const normalizeItem = (item: any): GoogleSearch | null => {
-            let topicRaw = ''
-            let relatedRaw: any[] = []
-
-            // If item looks like an array of reasoning tokens: [{ type: 'reasoning.text', text: '...' }, ...]
-            if (Array.isArray(item) && item.length && typeof item[0] === 'object' && ('type' in item[0])) {
-                // Safely extract text-like fields from each token
-                const texts: string[] = item.map((it: any) => {
-                    if (!it) return ''
-                    if (typeof it.text === 'string' && it.text.trim()) return it.text.trim()
-                    if (typeof it.content === 'string' && it.content.trim()) return it.content.trim()
-                    if (typeof it.message === 'string' && it.message.trim()) return it.message.trim()
-                    if (typeof it === 'string' && it.trim()) return it.trim()
-                    // try nested fields
-                    if (it?.message?.content && typeof it.message.content === 'string') return it.message.content.trim()
-                    return ''
-                }).filter(Boolean)
-                const combined: string = texts.join(' ').trim()
-                if (combined.length > 0) {
-                    const firstLine = combined.split(/\r?\n/)[0] ?? combined
-                    return { topic: firstLine.slice(0, 80), related: [] }
+                if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+                    p = p.slice(1, -1).trim();
                 }
-            }
 
-            if (typeof item === 'string') {
-                // some strings might include JSON-like fragments; keep whole string for later cleaning
-                topicRaw = item
-            } else if (Array.isArray(item)) {
-                // array like ["topic", "related1", ...] — take first as topic, rest as related
-                if (item.length === 0) return null
-                const first = item[0]
-                topicRaw = typeof first === 'string' ? first : (first?.text ?? first?.content ?? '')
-                relatedRaw = item.slice(1).map((r: any) => typeof r === 'string' ? r : (r?.text ?? r?.content ?? ''))
-            } else if (item && typeof item === 'object') {
-                // object shapes: { topic: "...", related: [...] } or { query: "...", queries: [...] }
-                if (typeof item.topic === 'string') topicRaw = item.topic
-                else if (typeof item.query === 'string') topicRaw = item.query
-                else if (typeof item.title === 'string') topicRaw = item.title
-                else if (typeof item.text === 'string') topicRaw = item.text
-                else if (typeof item.content === 'string') topicRaw = item.content
-                else if (typeof item[0] === 'string') topicRaw = item[0]
+                p = p.replace(/\b""\b/g, '').trim();
+                p = p.replace(/\s{2,}/g, ' ').trim();
+                return p;
+            })
+            .filter(Boolean);
 
-                // collect related fields
-                if (Array.isArray(item.related)) relatedRaw = item.related
-                else if (Array.isArray(item.queries)) relatedRaw = item.queries
-                else if (Array.isArray(item.suggestions)) relatedRaw = item.suggestions
-                else if (typeof item.suggestions === 'string') relatedRaw = [item.suggestions]
-                else relatedRaw = []
-
-                // special-case: some objects are reasoning fragments with shape { type: 'reasoning.text', text: '...' }
-                if (!topicRaw && (item.type === 'reasoning.text' || item.type === 'text')) {
-                    topicRaw = item.text ?? item.content ?? ''
-                }
-            } else {
-                return null
-            }
-
-            if (!topicRaw || typeof topicRaw !== 'string') return null
-
-            // Clean and trim the topic
-            let topic = topicRaw.trim()
-            // remove bullets/numbering prefixes
-            topic = topic.replace(/^[\-\*\•\d\.\)\s]+/, '').replace(/^"|"$/g, '').trim()
-            // remove surrounding punctuation but keep internal hyphens and colons
-            topic = topic.replace(/^[^\w]+|[^\w]+$/g, '')
-
-            // Word-limits: anime-related topics allow up to 4 words, otherwise 3 (configurable heuristics)
-            const animeRegex = /anime|crunchyroll|myanimelist|re:? ?zero|isekai|reincarnat/i
-            const maxWords = animeRegex.test(topic.toLowerCase()) ? 4 : 3
-            const words = topic.split(/\s+/).filter(Boolean).slice(0, maxWords)
-            let cleaned = words.join(' ').replace(/[^\w\s:-]/g, '').trim()
-
-            // enforce a reasonable length cap (40 chars) and max 4 words
-            if (cleaned.length > 40) {
-                cleaned = cleaned.split(/\s+/).slice(0, 4).join(' ').slice(0, 40).trim()
-            }
-
-            if (!cleaned) return null
-
-            // Normalize related items: take up to 4 words per related entry, remove weird chars
-            const related: string[] = Array.isArray(relatedRaw) ? relatedRaw.map((r: any) => {
-                if (typeof r !== 'string') return ''
-                let rr = r.trim().replace(/^[\-\*\d\.\)\s]+/, '').replace(/[^\w\s-]/g, '')
-                rr = rr.split(/\s+/).slice(0, 4).join(' ').trim()
-                return rr
-            }).filter(Boolean) : []
-
-            return { topic: cleaned, related }
+        if (parts.length === 0) {
+            throw new Error('LLM returned empty or unparsable content');
         }
 
-        // Map and filter
-        const normalized: GoogleSearch[] = parsed.map((p: any) => normalizeItem(p)).filter(Boolean) as GoogleSearch[]
-
-        if (!Array.isArray(normalized) || normalized.length === 0) {
-            throw new Error('LLM returned empty or invalid queries after normalization')
-        }
-
-        return normalized
+        const results: GoogleSearch[] = parts.map(p => ({ topic: p, related: [] }));
+        return results;
     }
 
 
