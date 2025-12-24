@@ -1714,6 +1714,7 @@ export class Login {
 
             this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Attempting robust popup dismissal (max 2 attempts).');
 
+            // --- selectors + containers (kept from original, plus a few more cancel/back variants) ---
             const closeSelectors = [
                 'button[aria-label="Close"]',
                 'button[aria-label="Close dialog"]',
@@ -1744,7 +1745,11 @@ export class Login {
                 'div[role="alertdialog"] button',
                 '.overlay .close',
                 '.modal-backdrop',
-                '.overlay'
+                '.overlay',
+                'button:has-text("Cancel")',
+                'button:has-text("Dismiss")',
+                'button:has-text("Close")',
+                'button:has-text("Back")'
             ];
 
             const dialogContainers = [
@@ -1760,12 +1765,209 @@ export class Login {
                 '.streakPause',
                 '.streak-pause',
                 '[data-testid="popup"]',
-                'mee-rewards-user-status-banner'
+                'mee-rewards-user-status-banner',
+                '.onboarding-modal',
+                '.security-window'
             ];
+
+            // --- new: keywords that indicate "passkey" / passkey setup dialogs (from screenshots) ---
+            const passkeyKeywords = [
+                'passkey',
+                'pass key',
+                'pass-key',
+                'setting up your passkey',
+                'choose where to save your passkey',
+                'passkeys',
+                'set up your passkey',
+                'setting up your pass key'
+            ].map(s => s.toLowerCase());
 
             let overallSucceeded = false;
 
-            // Run up to 2 attempts. If both fail, continue without blocking.
+            // Quick dedicated handler for passkey-like dialogs: prefer clicking "Cancel"
+            const tryHandlePasskeyDialog = async (): Promise<boolean> => {
+                try {
+                    // probe visible text quickly (DOM-safe)
+                    const bodyText = await page.evaluate(() => {
+                        const b = document.body;
+                        if (!b) return '';
+                        // prefer innerText when present; fallback to textContent
+                        // (this is pure runtime JS; TS warnings are avoided by using this code as-is)
+                        return (b as HTMLElement).innerText || b.textContent || '';
+                    });
+                    const lc = (bodyText || '').toLowerCase();
+
+                    const foundKeyword = passkeyKeywords.some(k => lc.includes(k));
+                    if (!foundKeyword) return false;
+
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Detected passkey/setup dialog by text probe — attempting to click Cancel.');
+
+                    // 1) Playwright direct locators (preferred)
+                    const cancelLocators = [
+                        'button:has-text("Cancel")',
+                        'button[aria-label="Cancel"]',
+                        'button:has-text("Dismiss")',
+                        'button[aria-label="Dismiss"]',
+                        'button:has-text("No")',
+                        'button:has-text("Close")',
+                        'a:has-text("Cancel")',
+                        'input[type="button"][value="Cancel"]',
+                        'input[type="submit"][value="Cancel"]'
+                    ];
+                    for (const sel of cancelLocators) {
+                        try {
+                            const loc = page.locator(sel).first();
+                            const cnt = await loc.count().catch(() => 0);
+                            if (cnt > 0) {
+                                const visible = await loc.isVisible().catch(() => false);
+                                if (visible) {
+                                    try {
+                                        await loc.click({ force: true }).catch(() => {});
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Clicked Cancel via locator: ${sel}`);
+                                        await this.bot.utils.wait(250);
+                                        // verify if dialog still present
+                                        const still = await page.evaluate((kws) => {
+                                            const b = document.body;
+                                            const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                                            const lower = text.toLowerCase();
+                                            for (const k of kws) if (lower.includes(k)) return true;
+                                            return false;
+                                        }, passkeyKeywords).catch(() => false);
+                                        if (!still) return true;
+                                    } catch (err) {
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error clicking ${sel}: ${err}`, 'warn');
+                                    }
+                                }
+                            }
+                        } catch { /* per-locator */ }
+                    }
+
+                    // 2) DOM-evaluate fallback: find elements whose trimmed text is "Cancel" (case-insensitive) and dispatch clicks
+                    const clicked = await page.evaluate(() => {
+                        const wanted = ['cancel', 'dismiss', 'no', 'close'];
+                        const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], div[role="button"]'));
+                        for (const el of candidates) {
+                            try {
+                                // runtime-safe checks: prefer HTMLElement.innerText, else HTMLInputElement.value, else element.textContent
+                                let txt = '';
+                                if (el instanceof HTMLElement) {
+                                    txt = el.innerText || (el.textContent || '');
+                                } else if (el instanceof HTMLInputElement || el instanceof HTMLButtonElement) {
+                                    txt = (el as HTMLInputElement).value || (el.textContent || '');
+                                } else {
+                                    txt = (el.textContent || '');
+                                }
+                                txt = txt.trim().toLowerCase();
+                                if (!txt) continue;
+                                if (wanted.includes(txt)) {
+                                    try {
+                                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                        return true;
+                                    } catch {}
+                                }
+                            } catch {}
+                        }
+                        return false;
+                    }).catch(() => false);
+
+                    if (clicked) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Clicked Cancel via DOM-evaluate fallback for passkey dialog');
+                        await this.bot.utils.wait(200);
+                        // confirm gone
+                        const still = await page.evaluate((kws) => {
+                            const b = document.body;
+                            const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                            const lower = text.toLowerCase();
+                            for (const k of kws) if (lower.includes(k)) return true;
+                            return false;
+                        }, passkeyKeywords).catch(() => false);
+                        if (!still) return true;
+                    }
+
+                    // 3) If still visible: hide ephemeral dialog containers with a targeted passkey-safe approach
+                    const hidden = await page.evaluate((containers: string[]) => {
+                        let changed = false;
+                        try {
+                            for (const sel of containers) {
+                                try {
+                                    const nodes = Array.from(document.querySelectorAll(sel));
+                                    for (const n of nodes) {
+                                        try {
+                                            const role = n.getAttribute ? n.getAttribute('role') : null;
+                                            const cls = (n as any).className || '';
+                                            const isEphemeral = (role === 'dialog' || role === 'alertdialog' || /popup|popUp|modal|overlay|security/i.test(cls));
+                                            if (!isEphemeral) continue;
+                                            if ((n as any).style) {
+                                                try { (n as any).style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                                                try { (n as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                                try { (n as any).style.setProperty('opacity', '0', 'important'); } catch {}
+                                            }
+                                            try { n.setAttribute && n.setAttribute('aria-hidden', 'true'); } catch {}
+                                            try { n.setAttribute && n.setAttribute('data-removed-by-bot', '1'); } catch {}
+                                            changed = true;
+                                        } catch {}
+                                    }
+                                } catch {}
+                            }
+
+                            // hide common backdrops
+                            try {
+                                const backdrops = Array.from(document.querySelectorAll('.modal-backdrop, .backdrop, .overlay, [data-modal-overlay]'));
+                                for (const b of backdrops) {
+                                    try { if ((b as any).style) (b as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                    try { if ((b as any).setAttribute) (b as any).setAttribute('data-removed-by-bot', '1'); } catch {}
+                                    changed = true;
+                                }
+                            } catch {}
+
+                            try { if (document.body && (document.body as any).style) (document.body as any).style.setProperty('pointer-events', 'auto', 'important'); } catch {}
+                        } catch {}
+                        return changed;
+                    }, dialogContainers).catch(() => false);
+
+                    if (hidden) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Safely hid passkey dialog containers as fallback (did not remove nodes).');
+                        await this.bot.utils.wait(150);
+                        return true;
+                    }
+
+                    // 4) final keyboard/body click fallback for passkey
+                    try {
+                        await page.keyboard.press('Escape').catch(() => {});
+                        await page.mouse.click(5, 5).catch(() => {});
+                        await page.mouse.click(20, 20).catch(() => {});
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Sent Escape and body-click fallbacks for passkey dialog');
+                        await this.bot.utils.wait(200);
+                    } catch {}
+
+                    // final probe: is the passkey text gone?
+                    const stillHas = await page.evaluate((kws) => {
+                        const b = document.body;
+                        const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                        const lower = text.toLowerCase();
+                        for (const k of kws) if (lower.includes(k)) return true;
+                        return false;
+                    }, passkeyKeywords).catch(() => false);
+
+                    return !stillHas;
+                } catch (err) {
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Passkey handler error: ${err}`, 'warn');
+                    return false;
+                }
+            };
+
+            // If we detect & handle a passkey/setup dialog, prefer that path first.
+            const passkeyHandled = await tryHandlePasskeyDialog();
+            if (passkeyHandled) {
+                this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Passkey dialog handled (Cancel clicked or hidden).');
+                overallSucceeded = true;
+                await this.bot.utils.wait(200);
+                return;
+            }
+
+            // If not passkey or not handled, continue with the original multi-attempt dismissal logic:
             for (let attempt = 0; attempt < 2; attempt++) {
                 this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Dismiss attempt ${attempt + 1}/2`);
 
@@ -1965,6 +2167,8 @@ export class Login {
             this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error while dismissing welcome modal: ${err}`, 'warn');
         }
     }
+
+
 
     private async checkBingLoginStatus(page: Page): Promise<boolean> {
         try {
