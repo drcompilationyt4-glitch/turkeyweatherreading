@@ -1782,7 +1782,213 @@ export class Login {
                 'setting up your pass key'
             ].map(s => s.toLowerCase());
 
+            // --- new: keywords for security / security-check style dialogs ---
+            const securityKeywords = [
+                'security',
+                'security check',
+                'security checkup',
+                'security sign in',
+                'security warning',
+                'security issue',
+                'security verification',
+                'check your security',
+                'review your security',
+                'security up',
+                'security update',
+                'account security',
+                'security check completed',
+                'security check completed'
+            ].map(s => s.toLowerCase());
+
             let overallSucceeded = false;
+
+            // Quick dedicated handler for security-like dialogs: prefer clicking "All good" / "Good" / "Looks good"
+            const tryHandleSecurityDialog = async (): Promise<boolean> => {
+                try {
+                    // probe visible text quickly (DOM-safe)
+                    const bodyText = await page.evaluate(() => {
+                        const b = document.body;
+                        if (!b) return '';
+                        return (b as HTMLElement).innerText || b.textContent || '';
+                    });
+                    const lc = (bodyText || '').toLowerCase();
+
+                    const foundKeyword = securityKeywords.some(k => lc.includes(k));
+                    if (!foundKeyword) return false;
+
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Detected security/check dialog by text probe — attempting to click "good" action.');
+
+                    // 1) Playwright direct locators (preferred) for 'good' variants first
+                    const goodLocators = [
+                        'button:has-text("All good")',
+                        'button:has-text("All Good")',
+                        'button:has-text("all good")',
+                        'button:has-text("Looks good")',
+                        'button:has-text("Looks Good")',
+                        'button:has-text("Looks good to me")',
+                        'button:has-text("I\'m good")',
+                        'button:has-text("I am good")',
+                        'button:has-text("Good")',
+                        'button:has-text("Good to go")',
+                        'button[aria-label*="good"]',
+                        'button[title*="good"]',
+                        'input[type="button"][value*="Good"]',
+                        'a:has-text("All good")',
+                        'a:has-text("Good")'
+                    ];
+                    for (const sel of goodLocators) {
+                        try {
+                            const loc = page.locator(sel).first();
+                            const cnt = await loc.count().catch(() => 0);
+                            if (cnt > 0) {
+                                const visible = await loc.isVisible().catch(() => false);
+                                if (visible) {
+                                    try {
+                                        await loc.click({ force: true }).catch(() => {});
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Clicked "good" action via locator: ${sel}`);
+                                        await this.bot.utils.wait(250);
+                                        // verify if dialog still present
+                                        const still = await page.evaluate((kws) => {
+                                            const b = document.body;
+                                            const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                                            const lower = text.toLowerCase();
+                                            for (const k of kws) if (lower.includes(k)) return true;
+                                            return false;
+                                        }, securityKeywords).catch(() => false);
+                                        if (!still) return true;
+                                    } catch (err) {
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error clicking ${sel}: ${err}`, 'warn');
+                                    }
+                                }
+                            }
+                        } catch { /* per-locator */ }
+                    }
+
+                    // 2) DOM-evaluate fallback: find elements whose trimmed text contains 'good' (case-insensitive) and dispatch clicks
+                    const clicked = await page.evaluate(() => {
+                        const wantedKeywords = ['good', 'all good', 'looks good', "i'm good", 'i am good', 'good to go'];
+                        const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], div[role="button"]'));
+                        for (const el of candidates) {
+                            try {
+                                let txt = '';
+                                if (el instanceof HTMLElement) {
+                                    txt = el.innerText || (el.textContent || '');
+                                } else if ((el as HTMLInputElement).value) {
+                                    txt = (el as HTMLInputElement).value;
+                                } else {
+                                    txt = (el.textContent || '');
+                                }
+                                txt = txt.trim().toLowerCase();
+                                if (!txt) continue;
+                                for (const kw of wantedKeywords) {
+                                    if (txt.includes(kw)) {
+                                        try {
+                                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                                            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                            return true;
+                                        } catch {}
+                                    }
+                                }
+                            } catch {}
+                        }
+                        return false;
+                    }).catch(() => false);
+
+                    if (clicked) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Clicked "good" action via DOM-evaluate fallback for security dialog');
+                        await this.bot.utils.wait(200);
+                        // confirm gone
+                        const still = await page.evaluate((kws) => {
+                            const b = document.body;
+                            const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                            const lower = text.toLowerCase();
+                            for (const k of kws) if (lower.includes(k)) return true;
+                            return false;
+                        }, securityKeywords).catch(() => false);
+                        if (!still) return true;
+                    }
+
+                    // 3) If still visible: hide ephemeral dialog containers (safe hide)
+                    const hidden = await page.evaluate((containers: string[]) => {
+                        let changed = false;
+                        try {
+                            for (const sel of containers) {
+                                try {
+                                    const nodes = Array.from(document.querySelectorAll(sel));
+                                    for (const n of nodes) {
+                                        try {
+                                            const role = n.getAttribute ? n.getAttribute('role') : null;
+                                            const cls = (n as any).className || '';
+                                            const isEphemeral = (role === 'dialog' || role === 'alertdialog' || /popup|popUp|modal|overlay|security/i.test(cls));
+                                            if (!isEphemeral) continue;
+                                            if ((n as any).style) {
+                                                try { (n as any).style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                                                try { (n as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                                try { (n as any).style.setProperty('opacity', '0', 'important'); } catch {}
+                                            }
+                                            try { n.setAttribute && n.setAttribute('aria-hidden', 'true'); } catch {}
+                                            try { n.setAttribute && n.setAttribute('data-removed-by-bot', '1'); } catch {}
+                                            changed = true;
+                                        } catch {}
+                                    }
+                                } catch {}
+                            }
+
+                            // hide common backdrops
+                            try {
+                                const backdrops = Array.from(document.querySelectorAll('.modal-backdrop, .backdrop, .overlay, [data-modal-overlay]'));
+                                for (const b of backdrops) {
+                                    try { if ((b as any).style) (b as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                    try { if ((b as any).setAttribute) (b as any).setAttribute('data-removed-by-bot', '1'); } catch {}
+                                    changed = true;
+                                }
+                            } catch {}
+
+                            try { if (document.body && (document.body as any).style) (document.body as any).style.setProperty('pointer-events', 'auto', 'important'); } catch {}
+                        } catch {}
+                        return changed;
+                    }, dialogContainers).catch(() => false);
+
+                    if (hidden) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Safely hid security dialog containers as fallback (did not remove nodes).');
+                        await this.bot.utils.wait(150);
+                        return true;
+                    }
+
+                    // 4) final keyboard/body click fallback for security
+                    try {
+                        await page.keyboard.press('Escape').catch(() => {});
+                        await page.mouse.click(5, 5).catch(() => {});
+                        await page.mouse.click(20, 20).catch(() => {});
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Sent Escape and body-click fallbacks for security dialog');
+                        await this.bot.utils.wait(200);
+                    } catch {}
+
+                    // final probe: is the security text gone?
+                    const stillHas = await page.evaluate((kws) => {
+                        const b = document.body;
+                        const text = b ? ((b as HTMLElement).innerText || b.textContent || '') : '';
+                        const lower = text.toLowerCase();
+                        for (const k of kws) if (lower.includes(k)) return true;
+                        return false;
+                    }, securityKeywords).catch(() => false);
+
+                    return !stillHas;
+                } catch (err) {
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Security handler error: ${err}`, 'warn');
+                    return false;
+                }
+            };
+
+            // If we detect & handle a security dialog, prefer that path first.
+            const securityHandled = await tryHandleSecurityDialog();
+            if (securityHandled) {
+                this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Security dialog handled (clicked "good" or hid).');
+                overallSucceeded = true;
+                await this.bot.utils.wait(200);
+                return;
+            }
 
             // Quick dedicated handler for passkey-like dialogs: prefer clicking "Cancel"
             const tryHandlePasskeyDialog = async (): Promise<boolean> => {
@@ -1958,7 +2164,7 @@ export class Login {
                 }
             };
 
-            // If we detect & handle a passkey/setup dialog, prefer that path first.
+            // If we detect & handle a passkey/setup dialog, prefer that path next.
             const passkeyHandled = await tryHandlePasskeyDialog();
             if (passkeyHandled) {
                 this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Passkey dialog handled (Cancel clicked or hidden).');
@@ -2167,6 +2373,7 @@ export class Login {
             this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error while dismissing welcome modal: ${err}`, 'warn');
         }
     }
+
 
 
 
