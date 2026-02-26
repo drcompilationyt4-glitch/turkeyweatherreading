@@ -1,6 +1,8 @@
 ###############################################################################
 # Stage 1: Builder (compile TypeScript)
-###############################################################################
+#########################################
+
+######################################
 FROM node:18-slim AS builder
 
 WORKDIR /usr/src/microsoft-rewards-script
@@ -66,3 +68,4 @@ ENV TZ=UTC
 # Entrypoint handles TZ, initial run toggle, cron templating & launch
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sh", "-c", "echo 'Container started; cron is running.'"]
+
