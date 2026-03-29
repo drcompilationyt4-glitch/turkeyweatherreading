@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      NODE_VERSION: '20'
+      NODE_VERSION: '24'
       SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
       JOB_INDEX: '0'
       GROUP_SIZES: '3,2,2'
@@ -310,7 +310,10 @@ jobs:
           dpkg -l | head -n 20
 
       - name: Build the project
-        run: npm run build
+        run: |
+            set -euo pipefail
+            npm run pre-build
+            npm run build
 
       - name: Ensure dist/accounts.json exists (copy after build)
         shell: bash
