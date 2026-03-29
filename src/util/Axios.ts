@@ -7,6 +7,7 @@ import { AccountProxy } from '../interface/Account'
 class AxiosClient {
     private instance: AxiosInstance
     private account: AccountProxy
+    private proxyUrl: string = ''
 
     constructor(account: AccountProxy) {
         this.account = account
@@ -21,6 +22,23 @@ class AxiosClient {
             const agent = this.getAgentForProxy(this.account)
             this.instance.defaults.httpAgent = agent
             this.instance.defaults.httpsAgent = agent
+            this.proxyUrl = this.maskProxyUrl(this.account.url)
+            console.log(`[AXIOS] Proxy enabled: ${this.proxyUrl}`)
+        } else {
+            console.log(`[AXIOS] No proxy configured (proxyAxios=${this.account.proxyAxios}, url=${this.account.url || 'empty'})`)
+        }
+    }
+
+    private maskProxyUrl(url: string): string {
+        try {
+            const parsed = new URL(url.startsWith('http') ? url : `http://${url}`)
+            const host = parsed.hostname
+            const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+            // Show first 3 chars of host, mask the rest
+            const maskedHost = host.length > 3 ? host.substring(0, 3) + '***' : host
+            return `${parsed.protocol}//${maskedHost}:${port}`
+        } catch {
+            return 'invalid-url'
         }
     }
 

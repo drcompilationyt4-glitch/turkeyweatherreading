@@ -57,6 +57,20 @@ class Browser {
                   }
                 : undefined
 
+            if (proxyConfig) {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'BROWSER-PROXY',
+                    `Using proxy: ${this.maskProxyUrl(account.proxy.url)}`
+                )
+            } else {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'BROWSER-PROXY',
+                    `No proxy configured`
+                )
+            }
+
             browser = await rebrowser.chromium.launch({
                 headless: this.bot.config.headless,
                 ...(proxyConfig && { proxy: proxyConfig }),
@@ -127,6 +141,19 @@ class Browser {
             return `${protocol}://${urlObj.hostname}:${proxy.port}`
         } catch {
             return `${proxy.url}:${proxy.port}`
+        }
+    }
+
+    private maskProxyUrl(url: string): string {
+        try {
+            const parsed = new URL(url.startsWith('http') ? url : `http://${url}`)
+            const host = parsed.hostname
+            const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+            // Show first 3 chars of host, mask the rest
+            const maskedHost = host.length > 3 ? host.substring(0, 3) + '***' : host
+            return `${parsed.protocol}//${maskedHost}:${port}`
+        } catch {
+            return 'invalid-url'
         }
     }
 
