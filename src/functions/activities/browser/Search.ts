@@ -34,10 +34,10 @@ export class Search extends Workers {
 
     // Model configuration with weights
     private readonly modelConfig = [
-        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'liquid/lfm-2.5-1.2b-instruct:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'meta-llama/llama-3.3-70b-instruct:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 2, supportsReasoning: false },
+        // { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
+        // { name: 'liquid/lfm-2.5-1.2b-instruct:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'meta-llama/llama-3.3-70b-instruct:free', weight: 1 / 2, supportsReasoning: false },
     ]
 
     public async doSearch(data: DashboardData, page: Page, isMobile: boolean): Promise<number> {
