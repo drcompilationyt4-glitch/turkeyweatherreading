@@ -2,6 +2,7 @@ import type { Cookie } from 'patchright'
 import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
 import fs from 'fs'
 import path from 'path'
+import { randomInt } from 'crypto'
 
 import type { Account, ConfigSaveFingerprint } from '../interface/Account'
 import type { Config } from '../interface/Config'
@@ -25,7 +26,7 @@ export function loadAccounts(): Account[] {
 
         // ✅ Shuffle accounts (Fisher-Yates)
         for (let i = accountsData.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1))
+            const j = randomInt(0, i + 1)
             ;[accountsData[i], accountsData[j]] = [accountsData[j], accountsData[i]]
         }
 

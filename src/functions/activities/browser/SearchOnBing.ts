@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { randomBytes } from 'crypto'
+import { randomBytes, randomInt } from 'crypto'
 import type { Page } from 'patchright'
 import * as fs from 'fs'
 import path from 'path'
@@ -152,7 +152,7 @@ export class SearchOnBing extends Workers {
             // -----------------------------
             // 60/40 DECISION
             // -----------------------------
-            const useLLM = llmQuery && Math.random() < 0.6
+            const useLLM = llmQuery && randomInt(0, 100) < 60
             const finalQuery = useLLM ? llmQuery! : originalQuery
 
             this.bot.logger.info(

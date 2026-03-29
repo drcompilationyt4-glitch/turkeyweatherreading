@@ -1,6 +1,16 @@
 import ms, { StringValue } from 'ms'
+import { randomInt } from 'crypto'
 
 export default class Util {
+    // Cryptographically secure random float between 0 and 1
+    private cryptoRandom(): number {
+        return randomInt(0, 1000000) / 1000000
+    }
+
+    // Cryptographically secure random integer between min and max (inclusive)
+    private cryptoRandomInt(min: number, max: number): number {
+        return randomInt(min, max + 1)
+    }
     async wait(time: number | string): Promise<void> {
         if (typeof time === 'string') {
             time = this.stringToNumber(time)
@@ -22,7 +32,7 @@ export default class Util {
 
     shuffleArray<T>(array: T[]): T[] {
         for (let i = array.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1))
+            const j = this.cryptoRandomInt(0, i)
 
             const a = array[i]
             const b = array[j]
@@ -37,7 +47,7 @@ export default class Util {
     }
 
     randomNumber(min: number, max: number): number {
-        return Math.floor(Math.random() * (max - min + 1)) + min
+        return this.cryptoRandomInt(min, max)
     }
 
     chunkArray<T>(arr: T[], numChunks: number): T[][] {
@@ -91,11 +101,11 @@ export default class Util {
     // Human-like typing delay (80-200ms per keystroke with occasional pauses)
     humanTypingDelay(): number {
         // 15% chance of a longer pause (simulating thinking)
-        if (Math.random() < 0.15) {
+        if (this.cryptoRandom() < 0.15) {
             return this.randomNumber(300, 600)
         }
         // 5% chance of very long pause (distraction)
-        if (Math.random() < 0.05) {
+        if (this.cryptoRandom() < 0.05) {
             return this.randomNumber(800, 1500)
         }
         return this.randomNumber(80, 200)
@@ -143,7 +153,7 @@ export default class Util {
 
     // Check if should take a distraction break (5% chance)
     shouldTakeDistractionBreak(): boolean {
-        return Math.random() < 0.05
+        return this.cryptoRandom() < 0.05
     }
 
     // Human-like reading time based on content length

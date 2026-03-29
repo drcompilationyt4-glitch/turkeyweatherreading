@@ -1,5 +1,6 @@
 import axios from 'axios'
 import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
+import { randomInt } from 'crypto'
 
 import type { ChromeVersion, EdgeVersion } from '../interface/UserAgentUtil'
 import type { MicrosoftRewardsBot } from '../index'
@@ -17,7 +18,7 @@ export class UserAgentManager {
             ? `Mozilla/5.0 (${system}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${app.chrome_reduced_version} Mobile Safari/537.36 EdgA/${app.edge_version}`
             : `Mozilla/5.0 (${system}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${app.chrome_reduced_version} Safari/537.36 Edg/${app.edge_version}`
 
-        const platformVersion = `${isMobile ? Math.floor(Math.random() * 5) + 9 : Math.floor(Math.random() * 15) + 1}.0.0`
+        const platformVersion = `${isMobile ? randomInt(9, 14) : randomInt(1, 16)}.0.0`
 
         const uaMetadata = {
             isMobile,
@@ -96,7 +97,7 @@ export class UserAgentManager {
 
     getSystemComponents(mobile: boolean): string {
         if (mobile) {
-            const androidVersion = 10 + Math.floor(Math.random() * 5)
+            const androidVersion = 10 + randomInt(0, 5)
             return `Linux; Android ${androidVersion}; K`
         }
 

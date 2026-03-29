@@ -1,5 +1,5 @@
 import type { Page } from 'patchright'
-import { randomBytes } from 'crypto'
+import { randomBytes, randomInt } from 'crypto'
 import { hostname } from 'os'
 import axios, { AxiosRequestConfig } from 'axios'
 import type { Counters, DashboardData } from '../../../interface/DashboardData'
@@ -489,7 +489,7 @@ export class Search extends Workers {
         try {
             const viewportHeight = await page.evaluate(() => window.innerHeight)
             const totalHeight = await page.evaluate(() => document.body.scrollHeight)
-            const randomScrollPosition = Math.floor(Math.random() * (totalHeight - viewportHeight))
+            const randomScrollPosition = randomInt(0, totalHeight - viewportHeight)
 
             this.bot.logger.debug(
                 isMobile,
@@ -1022,7 +1022,7 @@ export class Search extends Workers {
                     const status = err?.response?.status
                     if (status === 429) {
                         this.bot.logger.warn(mobile, 'SEARCH-LLM', `HTTP 429 (rate limit)`)
-                        await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 400)))
+                        await new Promise(r => setTimeout(r, 800 + randomInt(0, 400)))
                         throw new Error(`HTTP 429`)
                     }
                     if (err?.response) {
@@ -1599,7 +1599,7 @@ export class Search extends Workers {
     }
 
     private selectRandomModel(): { name: string, supportsReasoning: boolean } {
-        const random = Math.random()
+        const random = randomInt(0, 1000000) / 1000000
         let cumulativeWeight = 0
         for (const model of this.modelConfig) {
             cumulativeWeight += model.weight
@@ -1703,7 +1703,7 @@ export class Search extends Workers {
     }
 
     private selectWeightedCategory(categories: any[], weights: CategoryWeights): any {
-        const rng = Math.random()
+        const rng = randomInt(0, 1000000) / 1000000
         let cumulativeWeight = 0
         for (const category of categories) {
             cumulativeWeight += weights[category.name as keyof CategoryWeights]

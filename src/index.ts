@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import cluster, { Worker } from 'cluster'
 import type { BrowserContext, Cookie, Page } from 'patchright'
+import { randomInt } from 'crypto'
 import pkg from '../package.json'
 
 import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
@@ -131,7 +132,7 @@ export class MicrosoftRewardsBot {
     private async randomDelayBetween(minMinutes: number, maxMinutes: number): Promise<void> {
         const minMs = minMinutes * 60 * 1000
         const maxMs = maxMinutes * 60 * 1000
-        const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
+        const delay = randomInt(minMs, maxMs + 1)
 
         this.logger.info(
             'main',
@@ -219,7 +220,7 @@ export class MicrosoftRewardsBot {
             const chunk = accountChunks[i]
             if (!chunk) continue
 
-            const delayMinutes = 30 + Math.random() * 20 // Each worker gets its own random 30-50 min delay
+            const delayMinutes = 30 + (randomInt(0, 20000000) / 1000000) // Each worker gets its own random 30-50 min delay
             const delayMs = delayMinutes * 60 * 1000
             const workerIndex = i
 
@@ -499,7 +500,7 @@ export class MicrosoftRewardsBot {
                 )
 
                 // Randomly choose whether to do mobile or desktop activities first
-                const doMobileFirst = Math.random() < 0.5
+                const doMobileFirst = randomInt(0, 2) === 0
                 this.logger.info('main', 'FLOW', `Activity order: ${doMobileFirst ? 'Mobile first' : 'Desktop first'} | ${accountEmail}`)
 
                 // Define mobile activities function
