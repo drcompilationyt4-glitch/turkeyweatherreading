@@ -181,7 +181,8 @@ export class MicrosoftRewardsBot {
         const allAccountStats: AccountStats[] = []
         let hadWorkerFailure = false
 
-        for (const chunk of accountChunks) {
+        // Helper function to fork a worker with message handling
+        const forkWorker = (chunk: Account[]) => {
             const worker = cluster.fork()
             worker.send?.({ chunk, runStartTime })
 
@@ -204,12 +205,40 @@ export class MicrosoftRewardsBot {
                     }
                 }
             })
-
-            // Startup delay for clusters due to resource usage
-            if (accountChunks.indexOf(chunk) !== accountChunks.length - 1) {
-                await this.utils.wait(5000)
-            }
         }
+
+        // Start the first worker immediately
+        const firstChunk = accountChunks[0]
+        if (firstChunk) {
+            forkWorker(firstChunk)
+        }
+
+        // Start each remaining worker with its own independent random 30-50 minute delay
+        const workerPromises: Promise<void>[] = []
+        for (let i = 1; i < accountChunks.length; i++) {
+            const chunk = accountChunks[i]
+            if (!chunk) continue
+
+            const delayMinutes = 30 + Math.random() * 20 // Each worker gets its own random 30-50 min delay
+            const delayMs = delayMinutes * 60 * 1000
+            const workerIndex = i
+
+            const promise = (async () => {
+                this.logger.info(
+                    'main',
+                    'CLUSTER-DELAY',
+                    `Worker ${workerIndex + 1} will start in ${(delayMs / 60000).toFixed(2)} minutes...`
+                )
+                await new Promise(resolve => setTimeout(resolve, delayMs))
+                this.logger.info('main', 'CLUSTER-START', `Starting worker ${workerIndex + 1}...`)
+                forkWorker(chunk)
+            })()
+
+            workerPromises.push(promise)
+        }
+
+        // Wait for all worker delays to complete (workers will continue running)
+        await Promise.allSettled(workerPromises)
 
         const onWorkerExit = async (worker: Worker, code?: number, signal?: string): Promise<void> => {
             const { pid } = worker.process
