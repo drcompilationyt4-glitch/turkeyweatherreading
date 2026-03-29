@@ -26,11 +26,11 @@
         "searchResultVisitTime": "15sec",
         "searchDelay": {
             "min": "45sec",
-            "max": "1min30sec"
+            "max": "90sec"
         },
         "readDelay": {
             "min": "45sec",
-            "max": "1min30sec"
+            "max": "90sec"
         }
     },
     "debugLogs": false,
