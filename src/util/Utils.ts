@@ -88,48 +88,71 @@ export default class Util {
         return Math.floor(this.randomNumber(minMs, maxMs))
     }
 
-    // Human-like typing delay (50-150ms per keystroke with occasional pauses)
+    // Human-like typing delay (80-200ms per keystroke with occasional pauses)
     humanTypingDelay(): number {
-        // 10% chance of a longer pause (simulating thinking)
-        if (Math.random() < 0.1) {
-            return this.randomNumber(200, 400)
+        // 15% chance of a longer pause (simulating thinking)
+        if (Math.random() < 0.15) {
+            return this.randomNumber(300, 600)
         }
-        return this.randomNumber(50, 150)
+        // 5% chance of very long pause (distraction)
+        if (Math.random() < 0.05) {
+            return this.randomNumber(800, 1500)
+        }
+        return this.randomNumber(80, 200)
     }
 
-    // Human-like page load delay (1.5-3 seconds)
+    // Human-like page load delay (2-5 seconds)
     humanPageLoadDelay(): number {
+        return this.randomNumber(2000, 5000)
+    }
+
+    // Human-like form input delay (1-2.5 seconds before/after inputs)
+    humanFormInputDelay(): number {
+        return this.randomNumber(1000, 2500)
+    }
+
+    // Human-like scroll delay (700-1500ms between scrolls)
+    humanScrollDelay(): number {
+        return this.randomNumber(700, 1500)
+    }
+
+    // Human-like click delay (300-700ms before clicking)
+    humanClickDelay(): number {
+        return this.randomNumber(300, 700)
+    }
+
+    // Human-like hover delay (400-800ms before hovering)
+    humanHoverDelay(): number {
+        return this.randomNumber(400, 800)
+    }
+
+    // Human-like activity delay (3-6 seconds between activities)
+    humanActivityDelay(): number {
+        return this.randomNumber(3000, 6000)
+    }
+
+    // Human-like navigation delay (1.5-3 seconds after navigation)
+    humanNavigationDelay(): number {
         return this.randomNumber(1500, 3000)
     }
 
-    // Human-like form input delay (800-1500ms before/after inputs)
-    humanFormInputDelay(): number {
-        return this.randomNumber(800, 1500)
+    // Random distraction pause (5-15 seconds occasionally)
+    humanDistractionPause(): number {
+        return this.randomNumber(5000, 15000)
     }
 
-    // Human-like scroll delay (500-1000ms between scrolls)
-    humanScrollDelay(): number {
-        return this.randomNumber(500, 1000)
+    // Check if should take a distraction break (5% chance)
+    shouldTakeDistractionBreak(): boolean {
+        return Math.random() < 0.05
     }
 
-    // Human-like click delay (200-500ms before clicking)
-    humanClickDelay(): number {
-        return this.randomNumber(200, 500)
-    }
-
-    // Human-like hover delay (300-600ms before hovering)
-    humanHoverDelay(): number {
-        return this.randomNumber(300, 600)
-    }
-
-    // Human-like activity delay (2-4 seconds between activities)
-    humanActivityDelay(): number {
-        return this.randomNumber(2000, 4000)
-    }
-
-    // Human-like navigation delay (1-2 seconds after navigation)
-    humanNavigationDelay(): number {
-        return this.randomNumber(1000, 2000)
+    // Human-like reading time based on content length
+    humanReadingTime(contentLength: number): number {
+        // Average reading speed: 200-300 words per minute
+        // Assume ~5 characters per word
+        const words = contentLength / 5
+        const readingTimeMs = (words / 250) * 60 * 1000 // 250 wpm average
+        return this.randomNumber(Math.max(2000, readingTimeMs * 0.8), readingTimeMs * 1.2)
     }
 
     // Human-like search query delay (varies by query length)

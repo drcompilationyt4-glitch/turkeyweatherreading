@@ -504,14 +504,44 @@ export class MicrosoftRewardsBot {
 
                 // Define mobile activities function
                 const doMobileActivities = async () => {
-                    if (this.config.workers.doAppPromotions) await this.workers.doAppPromotions(appData)
-                    if (this.config.workers.doDailySet) await this.workers.doDailySet(data, this.mainMobilePage)
-                    if (this.config.workers.doSpecialPromotions) await this.workers.doSpecialPromotions(data)
-                    if (this.config.workers.doQuests) await this.activities.doQuests(this.mainMobilePage)
-                    if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(data, this.mainMobilePage)
-                    if (this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
-                    if (this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
-                    if (this.config.workers.doPunchCards) await this.workers.doPunchCards(data, this.mainMobilePage)
+                    // Create array of activities with their conditions and functions
+                    const mobileActivities = [
+                        { condition: this.config.workers.doAppPromotions, fn: () => this.workers.doAppPromotions(appData), name: 'AppPromotions' },
+                        { condition: this.config.workers.doDailySet, fn: () => this.workers.doDailySet(data, this.mainMobilePage), name: 'DailySet' },
+                        { condition: this.config.workers.doSpecialPromotions, fn: () => this.workers.doSpecialPromotions(data), name: 'SpecialPromotions' },
+                        { condition: this.config.workers.doQuests, fn: () => this.activities.doQuests(this.mainMobilePage), name: 'Quests' },
+                        { condition: this.config.workers.doMorePromotions, fn: () => this.workers.doMorePromotions(data, this.mainMobilePage), name: 'MorePromotions' },
+                        { condition: this.config.workers.doDailyCheckIn, fn: () => this.activities.doDailyCheckIn(), name: 'DailyCheckIn' },
+                        { condition: this.config.workers.doReadToEarn, fn: () => this.activities.doReadToEarn(), name: 'ReadToEarn' },
+                        { condition: this.config.workers.doPunchCards, fn: () => this.workers.doPunchCards(data, this.mainMobilePage), name: 'PunchCards' }
+                    ]
+
+                    // Filter activities based on conditions
+                    const enabledActivities = mobileActivities.filter(a => a.condition)
+
+                    // Shuffle the activities for random order
+                    const shuffledActivities = this.utils.shuffleArray([...enabledActivities])
+
+                    this.logger.info('main', 'ACTIVITY-ORDER', `Mobile activities order: ${shuffledActivities.map(a => a.name).join(' → ')}`)
+
+                    // Execute activities in shuffled order
+                    for (const activity of shuffledActivities) {
+                        try {
+                            // Random distraction break (5% chance)
+                            if (this.utils.shouldTakeDistractionBreak()) {
+                                const distractionTime = this.utils.humanDistractionPause()
+                                this.logger.info('main', 'DISTRACTION', `Taking a ${Math.round(distractionTime/1000)}s break...`)
+                                await this.utils.wait(distractionTime)
+                            }
+
+                            await activity.fn()
+
+                            // Add delay between activities
+                            await this.utils.wait(this.utils.humanActivityDelay())
+                        } catch (error) {
+                            this.logger.error('main', 'ACTIVITY-ERROR', `Error in ${activity.name}: ${error instanceof Error ? error.message : String(error)}`)
+                        }
+                    }
                 }
 
                 // Define desktop activities function
@@ -530,10 +560,38 @@ export class MicrosoftRewardsBot {
                                 this.mainMobilePage
                             )
 
-                            if (this.config.workers.doDailySet)
-                                await this.workers.doDailySet(desktopData, this.mainMobilePage)
-                            if (this.config.workers.doMorePromotions)
-                                await this.workers.doMorePromotions(desktopData, this.mainMobilePage)
+                            // Create array of desktop activities with their conditions and functions
+                            const desktopActivities = [
+                                { condition: this.config.workers.doDailySet, fn: () => this.workers.doDailySet(desktopData, this.mainMobilePage), name: 'DesktopDailySet' },
+                                { condition: this.config.workers.doMorePromotions, fn: () => this.workers.doMorePromotions(desktopData, this.mainMobilePage), name: 'DesktopMorePromotions' }
+                            ]
+
+                            // Filter activities based on conditions
+                            const enabledDesktopActivities = desktopActivities.filter(a => a.condition)
+
+                            // Shuffle the activities for random order
+                            const shuffledDesktopActivities = this.utils.shuffleArray([...enabledDesktopActivities])
+
+                            this.logger.info('main', 'ACTIVITY-ORDER', `Desktop activities order: ${shuffledDesktopActivities.map(a => a.name).join(' → ')}`)
+
+                            // Execute activities in shuffled order
+                            for (const activity of shuffledDesktopActivities) {
+                                try {
+                                    // Random distraction break (5% chance)
+                                    if (this.utils.shouldTakeDistractionBreak()) {
+                                        const distractionTime = this.utils.humanDistractionPause()
+                                        this.logger.info('main', 'DISTRACTION', `Taking a ${Math.round(distractionTime/1000)}s break...`)
+                                        await this.utils.wait(distractionTime)
+                                    }
+
+                                    await activity.fn()
+
+                                    // Add delay between activities
+                                    await this.utils.wait(this.utils.humanActivityDelay())
+                                } catch (error) {
+                                    this.logger.error('main', 'ACTIVITY-ERROR', `Error in ${activity.name}: ${error instanceof Error ? error.message : String(error)}`)
+                                }
+                            }
 
                             await (this.mainMobilePage.context() as any)._setExtraHTTPHeaders?.({
                                 'User-Agent': mobileSession!.fingerprint.headers['User-Agent']
