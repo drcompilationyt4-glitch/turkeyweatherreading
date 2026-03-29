@@ -498,41 +498,59 @@ export class MicrosoftRewardsBot {
                     } | App: ${appEarnable?.totalEarnablePoints ?? 0} | ${accountEmail} | locale: ${this.userData.geoLocale}`
                 )
 
-                if (this.config.workers.doAppPromotions) await this.workers.doAppPromotions(appData)
-                if (this.config.workers.doDailySet) await this.workers.doDailySet(data, this.mainMobilePage)
-                if (this.config.workers.doSpecialPromotions) await this.workers.doSpecialPromotions(data)
-                if (this.config.workers.doQuests) await this.activities.doQuests(this.mainMobilePage)
-                if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(data, this.mainMobilePage)
-                if (this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
-                if (this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
-                if (this.config.workers.doPunchCards) await this.workers.doPunchCards(data, this.mainMobilePage)
+                // Randomly choose whether to do mobile or desktop activities first
+                const doMobileFirst = Math.random() < 0.5
+                this.logger.info('main', 'FLOW', `Activity order: ${doMobileFirst ? 'Mobile first' : 'Desktop first'} | ${accountEmail}`)
 
-                // DESKTOP SESSION (V4 Adaptation - Session Reuse)
-                this.logger.info('main', 'FLOW', `Switching to Desktop mode for ${accountEmail} to solve activities...`)
-                try {
-                    await executionContext.run({ isMobile: false, account }, async () => {
-                        await this.mainMobilePage.setViewportSize({ width: 1920, height: 1080 })
-                        const desktopUA =
-                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.3856.62'
-                        await (this.mainMobilePage.context() as any)._setExtraHTTPHeaders?.({ 'User-Agent': desktopUA })
+                // Define mobile activities function
+                const doMobileActivities = async () => {
+                    if (this.config.workers.doAppPromotions) await this.workers.doAppPromotions(appData)
+                    if (this.config.workers.doDailySet) await this.workers.doDailySet(data, this.mainMobilePage)
+                    if (this.config.workers.doSpecialPromotions) await this.workers.doSpecialPromotions(data)
+                    if (this.config.workers.doQuests) await this.activities.doQuests(this.mainMobilePage)
+                    if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(data, this.mainMobilePage)
+                    if (this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
+                    if (this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
+                    if (this.config.workers.doPunchCards) await this.workers.doPunchCards(data, this.mainMobilePage)
+                }
 
-                        this.logger.info('main', 'BROWSER', `Emulating Desktop view & User-Agent | ${accountEmail}`)
+                // Define desktop activities function
+                const doDesktopActivities = async () => {
+                    this.logger.info('main', 'FLOW', `Switching to Desktop mode for ${accountEmail} to solve activities...`)
+                    try {
+                        await executionContext.run({ isMobile: false, account }, async () => {
+                            await this.mainMobilePage.setViewportSize({ width: 1920, height: 1080 })
+                            const desktopUA =
+                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.3856.62'
+                            await (this.mainMobilePage.context() as any)._setExtraHTTPHeaders?.({ 'User-Agent': desktopUA })
 
-                        const desktopData: DashboardData = await this.browser.func.getDashboardDataFromPage(
-                            this.mainMobilePage
-                        )
+                            this.logger.info('main', 'BROWSER', `Emulating Desktop view & User-Agent | ${accountEmail}`)
 
-                        if (this.config.workers.doDailySet)
-                            await this.workers.doDailySet(desktopData, this.mainMobilePage)
-                        if (this.config.workers.doMorePromotions)
-                            await this.workers.doMorePromotions(desktopData, this.mainMobilePage)
+                            const desktopData: DashboardData = await this.browser.func.getDashboardDataFromPage(
+                                this.mainMobilePage
+                            )
 
-                        await (this.mainMobilePage.context() as any)._setExtraHTTPHeaders?.({
-                            'User-Agent': mobileSession!.fingerprint.headers['User-Agent']
+                            if (this.config.workers.doDailySet)
+                                await this.workers.doDailySet(desktopData, this.mainMobilePage)
+                            if (this.config.workers.doMorePromotions)
+                                await this.workers.doMorePromotions(desktopData, this.mainMobilePage)
+
+                            await (this.mainMobilePage.context() as any)._setExtraHTTPHeaders?.({
+                                'User-Agent': mobileSession!.fingerprint.headers['User-Agent']
+                            })
                         })
-                    })
-                } catch (desktopError) {
-                    this.logger.error('main', 'DESKTOP-SESSION', `Error during desktop emulation: ${desktopError}`)
+                    } catch (desktopError) {
+                        this.logger.error('main', 'DESKTOP-SESSION', `Error during desktop emulation: ${desktopError}`)
+                    }
+                }
+
+                // Execute activities in random order
+                if (doMobileFirst) {
+                    await doMobileActivities()
+                    await doDesktopActivities()
+                } else {
+                    await doDesktopActivities()
+                    await doMobileActivities()
                 }
 
                 const searchPoints = await this.browser.func.getSearchPoints()
