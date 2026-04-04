@@ -16,7 +16,7 @@
         "doReadToEarn": true,
         "doQuests": true
     },
-    "searchOnBingLocalQueries": false,
+    "searchOnBingLocalQueries": true,
     "globalTimeout": "30sec",
     "searchSettings": {
         "scrollRandomResults": true,

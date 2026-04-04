@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { randomBytes, randomInt } from 'crypto'
+import { randomInt } from 'crypto'
 import type { Page } from 'patchright'
 import * as fs from 'fs'
 import path from 'path'
@@ -10,11 +10,18 @@ import { QueryCore } from '../../QueryEngine'
 import type { BasePromotion } from '../../../interface/DashboardData'
 
 export class SearchOnBing extends Workers {
-    private bingHome = 'https://bing.com'
 
     private gainedPoints: number = 0
     private success: boolean = false
     private oldBalance: number = this.bot.userData.currentPoints
+
+    // Model configuration with weights
+    private readonly modelConfig = [
+        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'liquid/lfm-2.5-1.2b-instruct:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'meta-llama/llama-3.3-70b-instruct:free', weight: 1 / 4, supportsReasoning: false },
+    ]
 
     public async doSearchOnBing(promotion: BasePromotion, page: Page) {
         this.oldBalance = Number(this.bot.userData.currentPoints ?? 0)
@@ -50,12 +57,46 @@ export class SearchOnBing extends Workers {
 
         for (const query of queries) {
             try {
-                const cvid = randomBytes(16).toString('hex')
-                const url = `${this.bingHome}/search?q=${encodeURIComponent(query)}&cvid=${cvid}`
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'SEARCH-ON-BING',
+                    `Searching for: "${query}"`
+                )
 
-                await page.goto(url)
+                // ✅ Go to Bing homepage first
+                await page.goto('https://bing.com', { waitUntil: 'domcontentloaded' }).catch(() => {})
+                await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
 
-                await page.waitForLoadState('networkidle').catch(() => {})
+                await this.bot.browser.utils.tryDismissAllMessages(page)
+
+                // ✅ USE ALT+D THAT ALWAYS WORKS!
+                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Pressing Alt + D')
+                await page.keyboard.press('Alt+D')
+                await this.bot.utils.wait(500)
+
+                // Fallback: try Ctrl+L if Alt+D didn't work
+                try {
+                    const isFocused = await page.evaluate(() => document.activeElement?.tagName === 'INPUT')
+                    if (!isFocused) {
+                        this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Fallback: Pressing Ctrl + L')
+                        await page.keyboard.press('Control+L')
+                        await this.bot.utils.wait(500)
+                    }
+                } catch {}
+
+                // ✅ Type query human like
+                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Typing query...')
+                await page.keyboard.type(query, {
+                    delay: this.bot.utils.randomDelay(60, 120)
+                })
+
+                await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+
+                // ✅ Press Enter
+                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Pressing Enter')
+                await page.keyboard.press('Enter')
+
+                await page.waitForLoadState('domcontentloaded').catch(() => {})
                 await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
 
                 await this.bot.browser.utils.tryDismissAllMessages(page)
@@ -117,12 +158,30 @@ export class SearchOnBing extends Workers {
             if (match && match.queries.length > 0) {
                 originalQuery = this.bot.utils.shuffleArray(match.queries)[0]!
             } else {
-                const queryCore = new QueryCore(this.bot)
-                const desc = promotion.description?.toLowerCase().replace('search on bing', '').trim() || ''
-                const suggestions = await queryCore.getBingSuggestions(desc)
-
-                if (suggestions.length) {
-                    originalQuery = this.bot.utils.shuffleArray(suggestions)[0]!
+                // ✅ WHEN QUERY NOT FOUND LOCALLY: USE LLM DIRECTLY
+                const apiKey = process.env.OPENROUTER_API_KEY 
+                if (apiKey) {
+                    this.bot.logger.info(this.bot.isMobile, 'SEARCH-ON-BING', `No local query found, requesting from LLM: ${promotion.title}`)
+                    const llmResult = await this.callLLM(promotion.title, promotion.description || '', promotion.title, apiKey)
+                    if (llmResult) {
+                        originalQuery = llmResult
+                    } else {
+                        // Fallback to suggestion system if LLM fails
+                        const queryCore = new QueryCore(this.bot)
+                        const desc = promotion.description?.toLowerCase().replace('search on bing', '').trim() || ''
+                        const suggestions = await queryCore.getBingSuggestions(desc)
+                        if (suggestions.length) {
+                            originalQuery = this.bot.utils.shuffleArray(suggestions)[0]!
+                        }
+                    }
+                } else {
+                    // No API key, use original suggestion system
+                    const queryCore = new QueryCore(this.bot)
+                    const desc = promotion.description?.toLowerCase().replace('search on bing', '').trim() || ''
+                    const suggestions = await queryCore.getBingSuggestions(desc)
+                    if (suggestions.length) {
+                        originalQuery = this.bot.utils.shuffleArray(suggestions)[0]!
+                    }
                 }
             }
 
@@ -173,6 +232,18 @@ export class SearchOnBing extends Workers {
         }
     }
 
+    private selectRandomModel(): { name: string, supportsReasoning: boolean } {
+        const random = randomInt(0, 1000000) / 1000000
+        let cumulativeWeight = 0
+        for (const model of this.modelConfig) {
+            cumulativeWeight += model.weight
+            if (random <= cumulativeWeight) {
+                return { name: model.name, supportsReasoning: model.supportsReasoning }
+            }
+        }
+        return this.modelConfig[0]!
+    }
+
     // 🔥 CLEAN LLM CALL
     private async callLLM(
         title: string,
@@ -191,6 +262,8 @@ export class SearchOnBing extends Workers {
                 timeout: 20000
             })
 
+            const selectedModel = this.selectRandomModel()
+
             const prompt = `
 Generate a natural Bing search query.
 
@@ -204,7 +277,7 @@ Return ONLY the query.
 `
 
             const res = await client.post('/chat/completions', {
-                model: 'meta-llama/llama-3.3-70b-instruct:free',
+                model: selectedModel.name,
                 messages: [{ role: 'user', content: prompt }],
                 temperature: 0.3,
                 max_tokens: 50

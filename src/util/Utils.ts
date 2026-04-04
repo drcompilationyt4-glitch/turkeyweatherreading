@@ -98,37 +98,37 @@ export default class Util {
         return Math.floor(this.randomNumber(minMs, maxMs))
     }
 
-    // Human-like typing delay (80-200ms per keystroke with occasional pauses)
+    // Human-like typing delay (200-500ms per keystroke - slow one-finger typist)
     humanTypingDelay(): number {
-        // 15% chance of a longer pause (simulating thinking)
-        if (this.cryptoRandom() < 0.15) {
-            return this.randomNumber(300, 600)
+        // 30% chance of a longer pause (simulating thinking/looking for key)
+        if (this.cryptoRandom() < 0.30) {
+            return this.randomNumber(1000, 2000)
         }
-        // 5% chance of very long pause (distraction)
-        if (this.cryptoRandom() < 0.05) {
-            return this.randomNumber(800, 1500)
+        // 10% chance of very long pause (looking for key on keyboard)
+        if (this.cryptoRandom() < 0.10) {
+            return this.randomNumber(2000, 4000)
         }
-        return this.randomNumber(80, 200)
+        return this.randomNumber(200, 500)
     }
 
-    // Human-like page load delay (2-5 seconds)
+    // Human-like page load delay (20-45 seconds - simulating slow internet)
     humanPageLoadDelay(): number {
-        return this.randomNumber(2000, 5000)
+        return this.randomNumber(20000, 45000)
     }
 
-    // Human-like form input delay (1-2.5 seconds before/after inputs)
+    // Human-like form input delay (3-6 seconds before/after inputs - slow form filling)
     humanFormInputDelay(): number {
-        return this.randomNumber(1000, 2500)
+        return this.randomNumber(3000, 6000)
     }
 
-    // Human-like scroll delay (700-1500ms between scrolls)
+    // Human-like scroll delay (2-4 seconds between scrolls - slow scrolling)
     humanScrollDelay(): number {
-        return this.randomNumber(700, 1500)
+        return this.randomNumber(2000, 4000)
     }
 
-    // Human-like click delay (300-700ms before clicking)
+    // Human-like click delay (1500-3000ms before clicking - slow deliberate clicking)
     humanClickDelay(): number {
-        return this.randomNumber(300, 700)
+        return this.randomNumber(1500, 3000)
     }
 
     // Human-like hover delay (400-800ms before hovering)
@@ -136,14 +136,14 @@ export default class Util {
         return this.randomNumber(400, 800)
     }
 
-    // Human-like activity delay (3-6 seconds between activities)
+    // Human-like activity delay (8-15 seconds between activities - slow transitions)
     humanActivityDelay(): number {
-        return this.randomNumber(3000, 6000)
+        return this.randomNumber(8000, 15000)
     }
 
-    // Human-like navigation delay (1.5-3 seconds after navigation)
+    // Human-like navigation delay (10-20 seconds after navigation - slow internet)
     humanNavigationDelay(): number {
-        return this.randomNumber(1500, 3000)
+        return this.randomNumber(10000, 20000)
     }
 
     // Random distraction pause (5-15 seconds occasionally)
@@ -151,9 +151,9 @@ export default class Util {
         return this.randomNumber(5000, 15000)
     }
 
-    // Check if should take a distraction break (5% chance)
+    // Check if should take a distraction break (15% chance)
     shouldTakeDistractionBreak(): boolean {
-        return this.cryptoRandom() < 0.05
+        return this.cryptoRandom() < 0.15
     }
 
     // Human-like reading time based on content length

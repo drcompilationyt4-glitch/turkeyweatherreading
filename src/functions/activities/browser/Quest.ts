@@ -403,15 +403,28 @@ export class Quest extends Workers {
             // NOTE: Only works for bing.com/search URLs (ms-search:// tasks never reach here)
             let linkElement: any = null
 
-            // Strategy 1: Find by exact href match
-            // Most reliable - exact URL from DOM
+            // Strategy 0: Find by TEXT CONTENT (case insensitive partial match) - MOST RELIABLE
+            // Click directly on the text element, no need to find button
             try {
-                linkElement = await page.locator(`a[href="${task.destination}"]`).first()
+                const escapedTitle = task.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                linkElement = await page.locator(`text=/.*${escapedTitle}.*/i`).first()
                 const count = await linkElement.count().catch(() => 0)
                 if (count > 0) {
-                    this.bot.logger.debug(this.bot.isMobile, 'QUEST-TASK', 'Found by exact href match')
+                    this.bot.logger.debug(this.bot.isMobile, 'QUEST-TASK', 'Found by TEXT CONTENT match (case insensitive partial)')
                 }
             } catch {}
+
+            // Strategy 1: Find by exact href match
+            // Most reliable - exact URL from DOM
+            if (!linkElement || (await linkElement.count().catch(() => 0)) === 0) {
+                try {
+                    linkElement = await page.locator(`a[href="${task.destination}"]`).first()
+                    const count = await linkElement.count().catch(() => 0)
+                    if (count > 0) {
+                        this.bot.logger.debug(this.bot.isMobile, 'QUEST-TASK', 'Found by exact href match')
+                    }
+                } catch {}
+            }
 
             // Strategy 2: If exact match fails, find by partial href (bing.com/search)
             if (!linkElement || (await linkElement.count().catch(() => 0)) === 0) {

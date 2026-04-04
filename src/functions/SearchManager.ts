@@ -396,7 +396,8 @@ export class SearchManager {
         missingSearchPoints: MissingSearchPoints,
         mobileSession: BrowserSession,
         accountEmail: string,
-        executionContext: any
+        executionContext: any,
+        maxSearches?: number
     ): Promise<number> {
         this.bot.logger.debug(
             'main',
@@ -423,7 +424,7 @@ export class SearchManager {
                 )
                 this.bot.logger.debug('main', 'SEARCH-MOBILE-SEARCH', 'activities.doSearch (mobile)')
 
-                const pointsEarned = await this.bot.activities.doSearch(data, this.bot.mainMobilePage, true)
+                const pointsEarned = await this.bot.activities.doSearch(data, this.bot.mainMobilePage, true, maxSearches)
 
                 this.bot.logger.info(
                     'main',
