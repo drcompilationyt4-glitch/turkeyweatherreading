@@ -74,155 +74,6 @@ export class Login {
         this.recoveryLogin = new RecoveryLogin(this.bot)
     }
 
-    // Dismiss login messages - from provided Login.ts
-    private async dismissLoginMessages(page: Page) {
-        try {
-            const currentUrl = page.url()
-            if (!currentUrl.includes('login.live.com') && !currentUrl.includes('account.microsoft.com')) {
-                return
-            }
-
-            // Handle Passkey prompt
-            const passkeyPromptDetected = await page.evaluate(() => {
-                const titleEl = document.querySelector('[data-testid="title"]')
-                const titleText = titleEl ? titleEl.textContent || '' : ''
-                const hasBiometricVideo = document.querySelector('[data-testid="biometricVideo"]') !== null
-                const hasPasskeyIndicators = /sign in faster|passkey|biometric|fingerprint|face id|windows hello/i.test(titleText)
-                return hasBiometricVideo || hasPasskeyIndicators
-            })
-
-            if (passkeyPromptDetected) {
-                const skipButton = await page.$('button[data-testid="secondaryButton"]:has-text("Skip for now")')
-                if (skipButton) {
-                    await skipButton.click({ delay: 50 })
-                    this.bot.logger.info(this.bot.isMobile, 'DISMISS-LOGIN-MESSAGES', 'Dismissed passkey prompt')
-                    await this.bot.utils.wait(1000)
-                    return
-                }
-            }
-
-            // Handle "Keep me signed in" prompt
-            const kmsiPromptDetected = await page.evaluate(() => {
-                const titleEl = document.querySelector('[data-testid="title"]')
-                const titleText = titleEl ? titleEl.textContent || '' : ''
-                return /keep me signed in|stay signed in/i.test(titleText)
-            })
-
-            if (kmsiPromptDetected) {
-                const yesButton = await page.$('button[data-testid="primaryButton"]:has-text("Yes")')
-                if (yesButton) {
-                    await yesButton.click({ delay: 50 })
-                    this.bot.logger.info(this.bot.isMobile, 'DISMISS-LOGIN-MESSAGES', 'Accepted KMSI prompt')
-                    await this.bot.utils.wait(1000)
-                }
-            }
-        } catch (error) {
-            this.bot.logger.warn(this.bot.isMobile, 'DISMISS-LOGIN-MESSAGES', `Error: ${error}`)
-        }
-    }
-
-    // Dismiss welcome modal - from provided Login.ts
-    private async dismissWelcomeModal(page: Page) {
-        try {
-            const url = new URL(page.url())
-            if (!url.hostname.includes('rewards.bing.com')) {
-                return
-            }
-
-            await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
-
-            const closeSelectors = [
-                'button[aria-label="Close"]',
-                'button[aria-label="Close dialog"]',
-                'button[title="Close"]',
-                'button[aria-label="Dismiss"]',
-                'button:has-text("Cancel")',
-                'button:has-text("Dismiss")',
-                'button:has-text("Close")',
-                'button:has-text("Back")'
-            ]
-
-            for (const sel of closeSelectors) {
-                try {
-                    const locator = page.locator(sel).first()
-                    if (await locator.isVisible().catch(() => false)) {
-                        await locator.click({ force: true }).catch(() => {})
-                        this.bot.logger.info(this.bot.isMobile, 'DISMISS-WELCOME', `Clicked: ${sel}`)
-                        await this.bot.utils.wait(500)
-                        break
-                    }
-                } catch { /* ignore */ }
-            }
-        } catch (error) {
-            this.bot.logger.warn(this.bot.isMobile, 'DISMISS-WELCOME', `Error: ${error}`)
-        }
-    }
-
-    // Handle optional prompts - from provided Login.ts
-    private async handleOptionalPrompts(page: Page) {
-        const tries = [
-            `button#idBtn_Back`,
-            `button#idSIButton9`,
-            `button:has-text("No")`,
-            `button:has-text("Don't show again")`,
-            `button:has-text("Skip")`,
-            `button:has-text("Not now")`,
-            `button:has-text("Use another account")`,
-            `button:has-text("Continue")`,
-            `input[type="button"][value="No"]`,
-            `button:has-text("Next")`,
-            `button:has-text("Yes")`,
-            `button:has-text("Accept")`,
-            `button:has-text("Agree")`,
-            `button:has-text("I accept")`,
-            `button[type="submit"]`,
-            `input[type="submit"]`,
-            `button:has-text("Get started")`,
-            `button:has-text("Let's go")`,
-            `button:has-text("OK")`
-        ]
-
-        let dismissedAny = false
-        const maxPromptLoops = 10
-        let loopCount = 0
-
-        while (loopCount < maxPromptLoops) {
-            let dismissedThisLoop = false
-            for (const sel of tries) {
-                try {
-                    const handle = await page.$(sel)
-                    if (handle) {
-                        try {
-                            await handle.click()
-                            dismissedThisLoop = true
-                            dismissedAny = true
-                        } catch (e) {
-                            try {
-                                await page.evaluate((s) => {
-                                    const el = document.querySelector(s) as HTMLElement | null
-                                    if (el) el.click()
-                                }, sel)
-                                dismissedThisLoop = true
-                                dismissedAny = true
-                            } catch { /* ignore */ }
-                        }
-                        await this.bot.utils.wait(800)
-                        break
-                    }
-                } catch { /* ignore */ }
-            }
-
-            if (!dismissedThisLoop) {
-                break
-            }
-            loopCount++
-        }
-
-        if (dismissedAny) {
-            this.bot.logger.info(this.bot.isMobile, 'DISMISS-OPTIONAL', 'Dismissed optional prompts')
-        }
-    }
-
     async login(page: Page, account: Account) {
         try {
             this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Starting login process')
@@ -308,14 +159,6 @@ export class Login {
 
     private async detectCurrentState(page: Page, account?: Account): Promise<LoginState> {
         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
-
-        const pageContent = await page.innerText('body').catch(() => '')
-        if (
-            pageContent.toLowerCase().includes('too many requests') ||
-            pageContent.toLowerCase().includes('banyak permintaan')
-        ) {
-            return 'ERROR_ALERT'
-        }
 
         const url = new URL(page.url())
         this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Current URL: ${url.hostname}${url.pathname}`)
@@ -449,23 +292,9 @@ export class Login {
             }
 
             case 'ERROR_ALERT': {
-                const alertEl = page.locator(this.selectors.errorAlert).first()
-                let errorMsg = await alertEl.innerText().catch(() => '')
-
-                if (!errorMsg) {
-                    const bodyText = await page.innerText('body').catch(() => '')
-                    if (
-                        bodyText.toLowerCase().includes('too many requests') ||
-                        bodyText.toLowerCase().includes('banyak permintaan')
-                    ) {
-                        errorMsg = 'Too many requests'
-                    } else {
-                        errorMsg = 'Unknown Error (Check screenshot)'
-                    }
-                }
-
-                this.bot.logger.error(this.bot.isMobile, 'LOGIN', `Account error detected: ${errorMsg}`)
-
+                const alertEl = page.locator(this.selectors.errorAlert)
+                const errorMsg = await alertEl.innerText().catch(() => 'Unknown Error')
+                this.bot.logger.error(this.bot.isMobile, 'LOGIN', `Account error: ${errorMsg}`)
                 throw new Error(`Microsoft login error: ${errorMsg}`)
             }
 
@@ -474,74 +303,67 @@ export class Login {
 
             case 'EMAIL_INPUT': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Entering email')
-                await this.bot.utils.wait(this.bot.utils.humanFormInputDelay())
                 await this.emailLogin.enterEmail(page, account.email)
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after email entry')
                 })
-                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Email entered successfully')
                 return true
             }
 
             case 'PASSWORD_INPUT': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Entering password')
-                await this.bot.utils.wait(this.bot.utils.humanFormInputDelay())
                 await this.emailLogin.enterPassword(page, account.password)
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after password entry')
                 })
-                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Password entered successfully')
                 return true
             }
 
             case 'GET_A_CODE': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Attempting to bypass "Get code" page - looking for "Other ways to sign in"')
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Attempting to bypass "Get code" page')
 
-                // Future-proof: Look for any button/link containing "other", "another", "different" text
-                const otherWaysSelectors = [
-                    this.selectors.otherWaysToSignIn,
-                    this.selectors.viewFooter,
-                    'button:has-text("Other ways to sign in")',
-                    'button:has-text("Sign in another way")',
-                    'button:has-text("Use another way")',
-                    'button:has-text("Try another way")',
-                    'button:has-text("Different way")',
-                    'span[role="button"]:has-text("Other")',
-                    'span[role="button"]:has-text("Another")',
-                    'a:has-text("Other ways")',
-                    'a:has-text("Another way")',
-                    'button[aria-label*="other" i]',
-                    'button[aria-label*="another" i]',
-                    'button[aria-label*="different" i]'
-                ]
+                // Try to find "Other ways to sign in" link
+                const otherWaysLink = await page
+                    .waitForSelector(this.selectors.otherWaysToSignIn, { state: 'visible', timeout: 3000 })
+                    .catch(() => null)
 
-                for (const selector of otherWaysSelectors) {
-                    try {
-                        const element = await page.waitForSelector(selector, { state: 'visible', timeout: 1000 }).catch(() => null)
-                        if (element) {
-                            const text = await element.textContent().catch(() => '')
-                            const lowerText = text?.toLowerCase() || ''
-                            
-                            // Check if this looks like an "other ways" button
-                            if (lowerText.includes('other') || lowerText.includes('another') || lowerText.includes('different')) {
-                                this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Found "Other ways" button: "${text?.trim()}"`)
-                                await this.bot.browser.utils.ghostClick(page, selector)
-                                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after clicking other ways')
-                                })
-                                this.bot.logger.info(this.bot.isMobile, 'LOGIN', '"Other ways to sign in" clicked successfully')
-                                return true
-                            }
-                        }
-                    } catch { /* ignore per-selector errors */ }
+                if (otherWaysLink) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Found "Other ways to sign in" link')
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.otherWaysToSignIn)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
+                        this.bot.logger.debug(
+                            this.bot.isMobile,
+                            'LOGIN',
+                            'Network idle timeout after clicking other ways'
+                        )
+                    })
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', '"Other ways to sign in" clicked')
+                    return true
                 }
 
-                // If no "other ways" found, try clicking back button
-                const backBtn = await page.waitForSelector(this.selectors.backButton, { state: 'visible', timeout: 2000 }).catch(() => null)
+                // Fallback: try the generic viewFooter selector
+                const footerLink = await page
+                    .waitForSelector(this.selectors.viewFooter, { state: 'visible', timeout: 2000 })
+                    .catch(() => null)
+
+                if (footerLink) {
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.viewFooter)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
+                        this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after footer click')
+                    })
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Footer link clicked')
+                    return true
+                }
+
+                // If no links found, try clicking back button
+                const backBtn = await page
+                    .waitForSelector(this.selectors.backButton, { state: 'visible', timeout: 2000 })
+                    .catch(() => null)
+
                 if (backBtn) {
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'No "Other ways" found, clicking back button')
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'No sign in options found, clicking back button')
                     await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
                     await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                         this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after back button')
@@ -554,49 +376,7 @@ export class Login {
             }
 
             case 'GET_A_CODE_2': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Handling "Get a code" flow - looking for "Other ways to sign in"')
-
-                // Future-proof: Look for any button/link containing "other", "another", "different" text
-                const otherWaysSelectors = [
-                    this.selectors.otherWaysToSignIn,
-                    this.selectors.viewFooter,
-                    'button:has-text("Other ways to sign in")',
-                    'button:has-text("Sign in another way")',
-                    'button:has-text("Use another way")',
-                    'button:has-text("Try another way")',
-                    'button:has-text("Different way")',
-                    'span[role="button"]:has-text("Other")',
-                    'span[role="button"]:has-text("Another")',
-                    'a:has-text("Other ways")',
-                    'a:has-text("Another way")',
-                    'button[aria-label*="other" i]',
-                    'button[aria-label*="another" i]',
-                    'button[aria-label*="different" i]'
-                ]
-
-                for (const selector of otherWaysSelectors) {
-                    try {
-                        const element = await page.waitForSelector(selector, { state: 'visible', timeout: 1000 }).catch(() => null)
-                        if (element) {
-                            const text = await element.textContent().catch(() => '')
-                            const lowerText = text?.toLowerCase() || ''
-                            
-                            // Check if this looks like an "other ways" button
-                            if (lowerText.includes('other') || lowerText.includes('another') || lowerText.includes('different')) {
-                                this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Found "Other ways" button: "${text?.trim()}"`)
-                                await this.bot.browser.utils.ghostClick(page, selector)
-                                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after clicking other ways')
-                                })
-                                this.bot.logger.info(this.bot.isMobile, 'LOGIN', '"Other ways to sign in" clicked successfully')
-                                return true
-                            }
-                        }
-                    } catch { /* ignore per-selector errors */ }
-                }
-
-                // If no "other ways" found, click primary button
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'No "Other ways" found, clicking primary button')
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Handling "Get a code" flow')
                 await this.bot.browser.utils.ghostClick(page, this.selectors.primaryButton)
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after primary button click')
@@ -780,9 +560,6 @@ export class Login {
     private async finalizeLogin(page: Page, email: string) {
         this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Finalizing login')
 
-        // Dismiss any remaining login messages
-        await this.dismissLoginMessages(page)
-
         await page.goto(this.bot.config.baseURL, { waitUntil: 'networkidle', timeout: 10000 }).catch(() => {})
 
         const loginRewardsSuccess = new URL(page.url()).hostname === 'rewards.bing.com'
@@ -797,10 +574,6 @@ export class Login {
 
         this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Starting rewards session verification')
         await this.getRewardsSession(page)
-
-        // Dismiss welcome modal after rewards page loads
-        await this.dismissWelcomeModal(page)
-        await this.handleOptionalPrompts(page)
 
         const browser = page.context()
         const cookies = await browser.cookies()
