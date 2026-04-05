@@ -36,8 +36,8 @@ export class Search extends Workers {
     private readonly modelConfig = [
         { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 4, supportsReasoning: false },
         { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'liquid/lfm-2.5-1.2b-instruct:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'meta-llama/llama-3.3-70b-instruct:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'minimax/minimax-m2.5:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'nvidia/nemotron-nano-12b-v2-vl:free', weight: 1 / 4, supportsReasoning: false },
     ]
 
     public async doSearch(data: DashboardData, page: Page, isMobile: boolean, maxSearches?: number): Promise<number> {
