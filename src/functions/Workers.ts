@@ -27,18 +27,17 @@ export class Workers {
                     earnPageData = earnNextData
                     this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Fetched additional data from /earn page')
                 }
-            } catch (e) {
+            } catch {
                 this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Could not fetch /earn page data')
             }
 
             // Combine both sources of data
             const combinedData = earnPageData ? [...v4Data, ...earnPageData] : v4Data
 
-            // Get today's date in MM/DD/YYYY format (matching V4 API format)
+            // Get today's date in MM/DD/YYYY format
             const today = new Date()
             const todayStr = `${String(today.getMonth() + 1).padStart(2, '0')}/${String(today.getDate()).padStart(2, '0')}/${today.getFullYear()}`
 
-            // Filter by today's date and uncompleted status
             const dailySetItems = this.bot.nextParser.find(combinedData, 'dailySetItems') ?? []
             const todayItems = dailySetItems.filter((x: any) => x.date === todayStr)
             const uncompleted = todayItems.filter((x: any) => !x.isCompleted && x.points > 0)
@@ -49,7 +48,6 @@ export class Workers {
                 `Date: ${todayStr}, Found ${dailySetItems.length} total items, ${todayItems.length} for today, ${uncompleted.length} uncompleted`
             )
 
-            // If no items from /earn page, also check all items (not just today)
             if (uncompleted.length === 0 && dailySetItems.length > 0) {
                 const allUncompleted = dailySetItems.filter((x: any) => !x.isCompleted && x.points > 0)
                 if (allUncompleted.length > 0) {
@@ -58,6 +56,7 @@ export class Workers {
                         'DAILY-SET',
                         `Found ${allUncompleted.length} uncompleted items (any date)`
                     )
+
                     const mapped = allUncompleted.map((x: any) => ({
                         title: x.title || 'Unknown Title',
                         offerId: x.offerId || 'Unknown ID',
@@ -67,16 +66,11 @@ export class Workers {
                         complete: false,
                         pointProgressMax: x.points || x.pointProgressMax || 0
                     }))
-                    await this.solveActivities(mapped, page)
+
+                    await this.solveActivities(mapped, page, undefined, 'dailySet')
                     return
                 }
             }
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'DAILY-SET',
-                `Date: ${todayStr}, Found ${dailySetItems.length} total items, ${todayItems.length} for today, ${uncompleted.length} uncompleted`
-            )
 
             if (uncompleted.length) {
                 this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', `Solving ${uncompleted.length} modern items`)
@@ -89,7 +83,7 @@ export class Workers {
                     complete: false,
                     pointProgressMax: x.points || x.pointProgressMax || 0
                 }))
-                await this.solveActivities(mapped, page)
+                await this.solveActivities(mapped, page, undefined, 'dailySet')
             } else {
                 this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'All modern daily items already completed')
             }
@@ -108,7 +102,7 @@ export class Workers {
                 'DAILY-SET',
                 `Found ${activitiesUncompleted.length} uncompleted items`
             )
-            await this.solveActivities(activitiesUncompleted, page)
+            await this.solveActivities(activitiesUncompleted, page, undefined, 'dailySet')
         }
     }
 
@@ -116,7 +110,7 @@ export class Workers {
         // V4 MODERN UI LOGIC
         if (this.bot.rewardsVersion === 'modern' && (data as any).v4Data) {
             this.bot.logger.debug(this.bot.isMobile, 'MORE-PROMOTIONS', 'Using Modern UI (V4) detection logic')
-            let v4Data = (data as any).v4Data
+            const v4Data = (data as any).v4Data
 
             // Also try to get data from /earn page for "Keep earning" activities
             let earnPageData = null
@@ -134,14 +128,12 @@ export class Workers {
                         'Fetched /earn page data for Keep earning'
                     )
                 }
-            } catch (e) {
+            } catch {
                 this.bot.logger.debug(this.bot.isMobile, 'MORE-PROMOTIONS', 'Could not fetch /earn page data')
             }
 
-            // Combine both sources of data
             const combinedData = earnPageData ? [...v4Data, ...earnPageData] : v4Data
 
-            // Debug: Find ALL objects with offerId
             const allWithOfferId = this.findAllWithOfferId(combinedData)
             this.bot.logger.debug(
                 this.bot.isMobile,
@@ -149,10 +141,8 @@ export class Workers {
                 `Found ${allWithOfferId.length} items with offerId in Next.js data`
             )
 
-            // Try multiple keys
             let moreActivities = this.bot.nextParser.find(combinedData, 'moreActivities') ?? []
             if (!moreActivities.length) {
-                // Try alternative keys
                 moreActivities =
                     this.bot.nextParser.find(combinedData, 'moreActivities') ??
                     this.bot.nextParser.find(combinedData, 'more_activity') ??
@@ -165,14 +155,13 @@ export class Workers {
                 `Found ${moreActivities.length} moreActivities items`
             )
 
-            // Get morePromotions from panel flyout data (contains "Do you know the answer?" etc)
-            // Note: API response structure - check both userInfo.promotions and flyoutResult.morePromotions
             const panelDataRaw = this.bot.panelData as any
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'MORE-PROMOTIONS',
                 `Panel data keys: ${panelDataRaw ? Object.keys(panelDataRaw).join(', ') : 'undefined'}`
             )
+
             const userInfoData = panelDataRaw?.userInfo
             this.bot.logger.debug(
                 this.bot.isMobile,
@@ -180,10 +169,8 @@ export class Workers {
                 `UserInfo keys: ${userInfoData ? Object.keys(userInfoData).join(', ') : 'undefined'}`
             )
 
-            // Try multiple sources for morePromotions
             let panelFlyoutPromos: any[] = []
 
-            // Try flyoutResult.morePromotions (original path)
             if (panelDataRaw?.flyoutResult?.morePromotions) {
                 panelFlyoutPromos = panelDataRaw.flyoutResult.morePromotions
                 this.bot.logger.debug(
@@ -193,13 +180,9 @@ export class Workers {
                 )
             }
 
-            // Also try userInfo.promotions (contains "Do you know the answer?" and other activities)
-            // Combine with flyoutResult.morePromotions
             if (userInfoData?.promotions) {
                 const userInfoPromos = userInfoData.promotions
 
-                // Transform userInfo.promotions to match expected format
-                // Structure: { name, attributes: { offerid, title, complete, max, destination } }
                 const transformedPromos = userInfoPromos.map((p: any) => {
                     const attrs = p.attributes || {}
                     const isComplete = attrs.complete === 'True' || attrs.complete === true
@@ -215,7 +198,6 @@ export class Workers {
                     }
                 })
 
-                // Combine both arrays, avoiding duplicates by offerId
                 const existingIds = new Set(panelFlyoutPromos.map((p: any) => p.offerId))
                 const newPromos = transformedPromos.filter((p: any) => !existingIds.has(p.offerId))
                 panelFlyoutPromos = [...panelFlyoutPromos, ...newPromos]
@@ -226,6 +208,7 @@ export class Workers {
                     `Combined ${panelFlyoutPromos.length} items from flyoutResult + userInfo.promotions`
                 )
             }
+
             const panelUncompleted = panelFlyoutPromos
                 .filter((p: any) => !p.isCompleted && !p.complete && p.offerId)
                 .map((p: any) => ({
@@ -247,7 +230,6 @@ export class Workers {
                 )
             }
 
-            // Map moreActivities to same format
             const mappedMoreActivities = moreActivities
                 .filter((x: any) => !x.isLocked && x.points > 0)
                 .filter((x: any) => !x.isCompleted)
@@ -262,7 +244,6 @@ export class Workers {
                     isLocked: x.isLocked || false
                 }))
 
-            // Combine both sources
             const allUncompleted = [...mappedMoreActivities, ...panelUncompleted]
 
             if (allUncompleted.length) {
@@ -271,7 +252,7 @@ export class Workers {
                     'MORE-PROMOTIONS',
                     `Solving ${allUncompleted.length} modern items`
                 )
-                await this.solveActivities(allUncompleted, page)
+                await this.solveActivities(allUncompleted, page, undefined, 'morePromotions')
             } else {
                 this.bot.logger.info(this.bot.isMobile, 'MORE-PROMOTIONS', 'All modern more items already completed')
             }
@@ -289,7 +270,7 @@ export class Workers {
                 'MORE-PROMOTIONS',
                 `Found ${activitiesUncompleted.length} uncompleted items`
             )
-            await this.solveActivities(activitiesUncompleted as any, page)
+            await this.solveActivities(activitiesUncompleted as any, page, undefined, 'morePromotions')
         }
     }
 
@@ -312,11 +293,15 @@ export class Workers {
         return results
     }
 
-    protected async solveActivities(activities: any[], page: Page, punchCard?: PunchCard) {
-        // ✅ ✅ ✅ FIXED ORDER: NAVIGATE FIRST BEFORE ANYTHING ELSE ✅ ✅ ✅
+    protected async solveActivities(
+        activities: any[],
+        page: Page,
+        punchCard?: PunchCard,
+        context: 'dailySet' | 'morePromotions' | 'punchCard' | 'other' = 'other'
+    ) {
+        const isDailySetContext = context === 'dailySet'
 
         for (const activity of activities) {
-            // Skip locked activities
             if (activity.isLocked) {
                 this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Skipping locked: ${activity.title}`)
                 continue
@@ -324,81 +309,66 @@ export class Workers {
 
             this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Solving: ${activity.title}`)
 
-            // ✅ NAVIGATE FIRST BEFORE ANY SCROLLING / CARD SEARCHING
+            // Navigation happens for everything.
+            // Daily Set expansion only happens when context is dailySet.
             try {
-                const isDailyActivity = activity.title.toLowerCase().includes('daily') || (activity?.name?.toLowerCase() || '').includes('daily')
+                const currentUrl = page.url()
+                const isDailyActivity =
+                    isDailySetContext ||
+                    activity?.source === 'dailySet' ||
+                    (activity?.title?.toLowerCase?.().includes('daily set') ?? false) ||
+                    (activity?.name?.toLowerCase?.().includes('daily') ?? false)
 
                 if (!isDailyActivity) {
-                    // ALWAYS go to earn page for non-daily activities FIRST
-                    if (!page.url().includes('/earn')) {
+                    if (!currentUrl.includes('/earn')) {
                         this.bot.logger.info(this.bot.isMobile, 'NAVIGATION', `NAVIGATING TO EARN PAGE FOR: ${activity.title}`)
-
-                        // Direct navigation instead of clicking tab (more reliable)
                         await page.goto('https://rewards.bing.com/earn', {
                             waitUntil: 'domcontentloaded',
                             timeout: 15000
                         }).catch(() => { })
-
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
                     }
                 } else {
-                    // For daily activities stay on dashboard
-                    if (!page.url().includes('rewards.bing.com') || page.url().includes('/earn')) {
+                    if (!currentUrl.includes('rewards.bing.com') || currentUrl.includes('/earn')) {
                         await page.goto('https://rewards.bing.com/', {
                             waitUntil: 'networkidle',
                             timeout: 20000
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
                     }
-
-                    // ✅ Auto expand Daily set if it's collapsed
-                    try {
-                        const dailySetContainer = page.locator(':text("Daily set")').locator('..')
-                        if (await dailySetContainer.count() > 0) {
-                            const collapsedArrow = dailySetContainer.locator('svg[viewBox*="0 0 20 20"]:has(path[d*="M6 8l4 4 4-4"]), button:has(svg[style*="rotate(180deg)"])')
-                            if (await collapsedArrow.count() > 0) {
-                                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Daily set is collapsed, expanding...')
-                                await collapsedArrow.click({ timeout: 2000 }).catch(() => { })
-                                await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-                            }
-                        }
-                    } catch (expandError) {
-                        this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', `Expand handler skipped: ${expandError instanceof Error ? expandError.message : String(expandError)}`)
-                    }
                 }
             } catch (navError) {
-                this.bot.logger.warn(this.bot.isMobile, 'NAVIGATION', `Navigation failed: ${navError instanceof Error ? navError.message : String(navError)}`)
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'NAVIGATION',
+                    `Navigation failed: ${navError instanceof Error ? navError.message : String(navError)}`
+                )
             }
 
             try {
                 const url = activity.destinationUrl ?? activity.destination
 
                 if (url) {
-                    // Optimized Desktop V4 Selectors
+                    const escapedTitle = activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
                     const selectors = [
-                        // ✅ ✅ ✅ FIRST PRIORITY: CLICK DIRECTLY ON THE TEXT ELEMENT ✅ ✅ ✅
-                        // Finds ANY element (p, span, div, anything) that contains the activity title text
-                        // Case insensitive, partial match - clicks exactly where the text is on screen
-                        `text=/.*${activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*/i`,
-
-                        // Then try closest clickable parent as fallback
-                        `text=/.*${activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*/i >> xpath=ancestor::*[self::button or self::a or @role="button" or @onclick or @tabindex][1]`,
-
-                        // Original selectors fallbacks
+                        `text=/.*${escapedTitle}.*/i`,
+                        `text=/.*${escapedTitle}.*/i >> xpath=ancestor::*[self::button or self::a or @role="button" or @onclick or @tabindex][1]`,
                         `a[href*="${activity.offerId}"]`,
                         `a[data-bi-id*="${activity.offerId}"]`,
                         `*:text("${activity.title}")`,
                         `a[href*="${encodeURIComponent(url).substring(0, 15)}"]`
                     ]
 
-                    // ✅ 3 ITERATION DASHBOARD RETRY LOOP
-                    let cardElement = null
+                    let cardElement: any = null
                     const maxDashboardAttempts = 3
 
                     for (let dashboardAttempt = 1; dashboardAttempt <= maxDashboardAttempts; dashboardAttempt++) {
-
-                        // Always go back to dashboard first on each attempt
-                        this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Dashboard attempt ${dashboardAttempt}/${maxDashboardAttempts} for ${activity.title}`)
+                        this.bot.logger.debug(
+                            this.bot.isMobile,
+                            'ACTIVITY',
+                            `Dashboard attempt ${dashboardAttempt}/${maxDashboardAttempts} for ${activity.title}`
+                        )
 
                         await page.goto('https://rewards.bing.com/', {
                             waitUntil: 'networkidle',
@@ -406,27 +376,27 @@ export class Workers {
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
 
-                        // ✅ NEW HUMAN-LIKE INCREMENTAL SCROLL + CHECK LOOP ✅
-                        this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Starting incremental search for: ${activity.title}`)
+                        this.bot.logger.debug(
+                            this.bot.isMobile,
+                            'ACTIVITY',
+                            `Starting incremental search for: ${activity.title}`
+                        )
 
-                        // Start at absolute top of page
                         await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
                         await this.bot.utils.wait(300)
 
-                        const isDashboardPage = page.url() === 'https://rewards.bing.com/' || !page.url().includes('/earn')
+                        const isDashboardPage = !page.url().includes('/earn')
 
-                        // Loop: Check -> Expand (if needed) -> Check -> Scroll small amount
                         for (let loopIteration = 0; loopIteration < 35; loopIteration++) {
-
-                            // 🔍 FIRST: Check if target is already visible RIGHT NOW
+                            // First: check whether the target is already visible
                             for (const selector of selectors) {
                                 try {
                                     const elements = page.locator(selector)
                                     const count = await elements.count()
+
                                     for (let i = 0; i < count; i++) {
                                         const el = elements.nth(i)
 
-                                        // ✅ Check if element is actually in viewport before clicking
                                         const isInViewport = await el.evaluate((element: HTMLElement) => {
                                             const rect = element.getBoundingClientRect()
                                             return rect.top >= 0
@@ -448,25 +418,26 @@ export class Workers {
                                             }
                                         }
                                     }
+
                                     if (cardElement) break
                                 } catch { }
                             }
 
                             if (cardElement) break
 
-                            // 📅 ONLY ON DASHBOARD: Check for Daily Set toggle and expand if collapsed
-                            if (isDashboardPage) {
-                                // ✅ Use proper geometric targeting expand method
-                                await this.expandDailySetIfNeeded(page)
+                            // Only Daily Set context can expand Daily Set.
+                            if (isDashboardPage && isDailySetContext) {
+                                await this.expandDailySetIfNeeded(page, context)
 
-                                // ✅ ALWAYS re-check for target card AFTER attempting expand
-                                // This catches cards that were just revealed when Daily Set opened
+                                // Re-check after expansion
                                 for (const selector of selectors) {
                                     try {
                                         const elements = page.locator(selector)
                                         const count = await elements.count()
+
                                         for (let i = 0; i < count; i++) {
                                             const el = elements.nth(i)
+
                                             const isInViewport = await el.evaluate((element: HTMLElement) => {
                                                 const rect = element.getBoundingClientRect()
                                                 return rect.top >= 0
@@ -478,11 +449,12 @@ export class Workers {
                                                 const text = await el.innerText().catch(() => '')
                                                 if (text.toLowerCase().includes(activity.title.toLowerCase())) {
                                                     cardElement = el
-                                                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `✅ Found card inside expanded Daily Set!`)
+                                                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', '✅ Found card inside expanded Daily Set!')
                                                     break
                                                 }
                                             }
                                         }
+
                                         if (cardElement) break
                                     } catch { }
                                 }
@@ -490,14 +462,12 @@ export class Workers {
                                 if (cardElement) break
                             }
 
-                            // 📜 Scroll down ONLY 65px (very small human-like increment)
                             await page.evaluate(() => window.scrollBy({
                                 top: 65,
                                 left: 0,
                                 behavior: 'smooth'
                             })).catch(() => { })
 
-                            // ⏱️ Wait for elements to render and lazy load
                             await this.bot.utils.wait(500)
                         }
 
@@ -507,7 +477,6 @@ export class Workers {
 
                         if (cardElement) break
 
-                        // Refresh page before next attempt (unless last attempt)
                         if (dashboardAttempt < maxDashboardAttempts) {
                             this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card not found, refreshing dashboard`)
                             await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
@@ -521,13 +490,11 @@ export class Workers {
                         await cardElement.scrollIntoViewIfNeeded().catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
 
-                        // DESKTOP SPECIFIC: Trigger human-like events
                         if (!this.bot.isMobile) {
                             await this.bot.utils.wait(this.bot.utils.humanHoverDelay())
                             await cardElement.hover().catch(() => { })
                             await this.bot.utils.wait(500)
 
-                            // Manually dispatch events
                             await page
                                 .evaluate(
                                     (sel: any) => {
@@ -550,11 +517,9 @@ export class Workers {
                         }
 
                         await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+
                         const [newPage] = await Promise.all([
-                            page
-                                .context()
-                                .waitForEvent('page', { timeout: 10000 })
-                                .catch(() => null),
+                            page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
                             cardElement.click({ delay: this.bot.utils.randomDelay(200, 500) }).catch(() => {
                                 return page.evaluate(targetUrl => {
                                     window.open(targetUrl, '_blank')
@@ -565,19 +530,17 @@ export class Workers {
                         if (newPage) {
                             await newPage.waitForLoadState('domcontentloaded').catch(() => { })
                             await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-                            this.bot.logger.debug(
-                                this.bot.isMobile,
-                                'ACTIVITY',
-                                `New tab opened for: ${activity.title}`
-                            )
+                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `New tab opened for: ${activity.title}`)
 
-                            // ✅ Handle SearchOnBing / Explore on Bing activities
                             const pageUrl = newPage.url()
-                            if (pageUrl.includes('bing.com') && (
-                                activity.title.toLowerCase().includes('search on bing') ||
-                                activity.title.toLowerCase().includes('explore on bing') ||
-                                activity.title.toLowerCase().includes('search bing')
-                            )) {
+                            if (
+                                pageUrl.includes('bing.com') &&
+                                (
+                                    activity.title.toLowerCase().includes('search on bing') ||
+                                    activity.title.toLowerCase().includes('explore on bing') ||
+                                    activity.title.toLowerCase().includes('search bing')
+                                )
+                            ) {
                                 try {
                                     const { SearchOnBing } = await import('./activities/browser/SearchOnBing.js')
                                     const searchOnBing = new SearchOnBing(this.bot)
@@ -590,7 +553,6 @@ export class Workers {
                                     )
                                 }
                             } else {
-                                // Try to complete via API for V4 (even without hash, try using panel data)
                                 if (this.bot.rewardsVersion === 'modern') {
                                     await this.completeActivity(activity, newPage)
                                 }
@@ -610,7 +572,6 @@ export class Workers {
                         await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
 
-                        // Try to complete via API for V4 (even without hash, try using panel data)
                         if (this.bot.rewardsVersion === 'modern') {
                             await this.completeActivity(activity, page)
                         }
@@ -620,31 +581,26 @@ export class Workers {
                 }
 
                 this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Finished attempt for: ${activity.title}`)
-            } catch (error) {
+            } catch {
                 this.bot.logger.error(this.bot.isMobile, 'ACTIVITY', `Failed: ${activity.title}`)
             }
         }
     }
 
+
     public async doSpecialPromotions(data: DashboardData) { }
     public async doPunchCards(data: DashboardData, page: Page) { }
 
-    /**
-     * Expand Daily Set section - Using Playwright locators (not native DOM selectors)
-     */
-    /**
-     * Expand Daily Set section - Targeting icon buttons and aria-labels directly
-     */
-    protected async expandDailySetIfNeeded(page: Page): Promise<void> {
+    protected async expandDailySetIfNeeded(
+        page: Page,
+        context: 'dailySet' | 'morePromotions' | 'punchCard' | 'other' = 'other'
+    ): Promise<void> {
+        if (context !== 'dailySet') return
+
         try {
             this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Scanning for Daily Set expand button...')
 
-            // ✅ Ensure we're at the top of the page (optional, but safe for consistency)
-            await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
-            await this.bot.utils.wait(this.bot.isMobile ? 1000 : 600)
-
-            // ✅ STRATEGY 1: Direct targeting by aria-label and expanded state
-            // Matches: aria-label="Daily set" (case insensitive) AND aria-expanded="false"
+            // Strategy 1: Direct targeting by aria-label and expanded state
             const directButton = page.locator('button[aria-label="Daily set" i][aria-expanded="false"]').first()
 
             if (await directButton.count() > 0 && await directButton.isVisible().catch(() => false)) {
@@ -653,15 +609,13 @@ export class Workers {
                 return
             }
 
-            // ✅ STRATEGY 2: Find button with SVG inside that is collapsed
-            // This catches the chevron button even if aria-label varies slightly
+            // Strategy 2: SVG proximity
             const svgButtons = page.locator('button:has(svg)[aria-expanded="false"]')
             const svgCount = await svgButtons.count()
 
             if (svgCount > 0) {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', `Found ${svgCount} collapsed buttons with SVGs. Filtering by proximity to "Daily set".`)
+                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', `Found ${svgCount} collapsed buttons with SVGs. Filtering...`)
 
-                // Get bounding box of "Daily set" text to use as reference
                 const headerBox = await page.locator(':has-text("Daily set")').first().boundingBox().catch(() => null)
 
                 let bestButton: any = null
@@ -674,34 +628,30 @@ export class Workers {
                     const box = await btn.boundingBox().catch(() => null)
                     if (!box) continue
 
-                    // If we have a header reference, calculate distance
                     if (headerBox) {
                         const dist = Math.hypot(
                             (box.x + box.width / 2) - (headerBox.x + headerBox.width / 2),
                             (box.y + box.height / 2) - (headerBox.y + headerBox.height / 2)
                         )
 
-                        // Prioritize buttons close to the header (within 200px)
                         if (dist < 200 && dist < minDistance) {
                             minDistance = dist
                             bestButton = btn
                         }
                     } else {
-                        // Fallback: if no header found, just take the first visible SVG button
                         bestButton = btn
                         break
                     }
                 }
 
                 if (bestButton) {
-                    this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via SVG + Proximity match!')
-                await this.clickButton(page, bestButton)
+                    this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via SVG + Proximity!')
+                    await this.clickButton(page, bestButton)
                     return
                 }
             }
 
-            // ✅ STRATEGY 3: Broad search for any collapsed button near "Daily set"
-            // Checks all buttons on page, filters by text/label and position
+            // Strategy 3: Broad Y-alignment
             const allCollapsed = page.locator('button[aria-expanded="false"]')
             const totalCount = await allCollapsed.count()
 
@@ -710,8 +660,6 @@ export class Workers {
 
                 const headerBox = await page.locator(':has-text("Daily set")').first().boundingBox().catch(() => null)
 
-                // We look for a button that is on the same line as "Daily set"
-                // We iterate backwards to find the right-most one first (often the chevron)
                 for (let i = totalCount - 1; i >= 0; i--) {
                     const btn = allCollapsed.nth(i)
                     if (!(await btn.isVisible().catch(() => false))) continue
@@ -719,17 +667,15 @@ export class Workers {
                     const box = await btn.boundingBox().catch(() => null)
                     if (!box) continue
 
-                    // Check Y-alignment with "Daily set" header
                     if (headerBox) {
                         const yDiff = Math.abs(box.y - headerBox.y)
-                        if (yDiff < 50) { // Same row
-                            // Check if it's NOT "See more tasks"
+                        if (yDiff < 50) {
                             const btnText = await btn.innerText().catch(() => '')
                             const btnLabel = await btn.getAttribute('aria-label').catch(() => '')
 
                             if (!btnText.includes('See more') && !(btnLabel || '').includes('See more')) {
-                                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via Broad Y-alignment search!')
-                await this.clickButton(page, btn)
+                                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via Y-alignment!')
+                                await this.clickButton(page, btn)
                                 return
                             }
                         }
@@ -737,8 +683,62 @@ export class Workers {
                 }
             }
 
-            this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'No valid expand button found.')
+            // Strategy 4: Refresh + Tab fallback
+            this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'Falling back to refresh + keyboard navigation...')
 
+            try {
+                await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
+                await this.bot.utils.wait(1000)
+
+                await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
+                await this.bot.utils.wait(500)
+
+                await page.locator('body').click().catch(() => { })
+                await this.bot.utils.wait(300)
+
+                let found = false
+
+                for (let i = 0; i < 25; i++) {
+                    await page.keyboard.press('Tab')
+                    await this.bot.utils.wait(50)
+
+                    const isTarget = await page.evaluate(() => {
+                        const el = document.activeElement as HTMLElement | null
+                        if (!el) return false
+
+                        const text = (el.innerText || '').toLowerCase()
+                        const label = (el.getAttribute('aria-label') || '').toLowerCase()
+                        const expanded = el.getAttribute('aria-expanded')
+
+                        return (
+                            expanded === 'false' &&
+                            (text.includes('daily') || label.includes('daily'))
+                        )
+                    })
+
+                    if (isTarget) {
+                        this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', `Focused correct element after ${i + 1} Tabs`)
+                        await page.keyboard.press('Enter')
+                        found = true
+                        break
+                    }
+                }
+
+                if (!found) {
+                    this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'Tab fallback failed, pressing Enter blindly...')
+                    await page.keyboard.press('Enter')
+                }
+
+                return
+            } catch (e) {
+                this.bot.logger.error(
+                    this.bot.isMobile,
+                    'DAILY-SET',
+                    `Keyboard fallback failed: ${e instanceof Error ? e.message : String(e)}`
+                )
+            }
+
+            this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'No valid expand button found.')
         } catch (e) {
             this.bot.logger.error(this.bot.isMobile, 'DAILY-SET', `Expand failed: ${e instanceof Error ? e.message : String(e)}`)
         }
