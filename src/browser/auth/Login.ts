@@ -160,6 +160,14 @@ export class Login {
     private async detectCurrentState(page: Page, account?: Account): Promise<LoginState> {
         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
 
+        const pageContent = await page.innerText('body').catch(() => '')
+        if (
+            pageContent.toLowerCase().includes('too many requests') ||
+            pageContent.toLowerCase().includes('banyak permintaan')
+        ) {
+            return 'ERROR_ALERT'
+        }
+
         const url = new URL(page.url())
         this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Current URL: ${url.hostname}${url.pathname}`)
 
@@ -292,9 +300,23 @@ export class Login {
             }
 
             case 'ERROR_ALERT': {
-                const alertEl = page.locator(this.selectors.errorAlert)
-                const errorMsg = await alertEl.innerText().catch(() => 'Unknown Error')
-                this.bot.logger.error(this.bot.isMobile, 'LOGIN', `Account error: ${errorMsg}`)
+                const alertEl = page.locator(this.selectors.errorAlert).first()
+                let errorMsg = await alertEl.innerText().catch(() => '')
+
+                if (!errorMsg) {
+                    const bodyText = await page.innerText('body').catch(() => '')
+                    if (
+                        bodyText.toLowerCase().includes('too many requests') ||
+                        bodyText.toLowerCase().includes('banyak permintaan')
+                    ) {
+                        errorMsg = 'Too many requests'
+                    } else {
+                        errorMsg = 'Unknown Error (Check screenshot)'
+                    }
+                }
+
+                this.bot.logger.error(this.bot.isMobile, 'LOGIN', `Account error detected: ${errorMsg}`)
+
                 throw new Error(`Microsoft login error: ${errorMsg}`)
             }
 
@@ -303,20 +325,24 @@ export class Login {
 
             case 'EMAIL_INPUT': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Entering email')
+                await this.bot.utils.wait(this.bot.utils.humanFormInputDelay())
                 await this.emailLogin.enterEmail(page, account.email)
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after email entry')
                 })
+                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Email entered successfully')
                 return true
             }
 
             case 'PASSWORD_INPUT': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Entering password')
+                await this.bot.utils.wait(this.bot.utils.humanFormInputDelay())
                 await this.emailLogin.enterPassword(page, account.password)
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after password entry')
                 })
+                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Password entered successfully')
                 return true
             }
