@@ -14,6 +14,7 @@ export default class BrowserUtils {
     async tryDismissAllMessages(page: Page): Promise<void> {
         try {
             const buttons = [
+                { selector: 'button:has-text("Reject")', label: 'Cookie Popup Reject' },
                 { selector: '#acceptButton', label: 'AcceptButton' },
                 { selector: '#wcpConsentBannerCtrl > * > button:first-child', label: 'Bing Cookies Accept' },
                 { selector: '.ext-secondary.ext-button', label: '"Skip for now" Button' },

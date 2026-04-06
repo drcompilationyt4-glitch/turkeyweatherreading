@@ -309,8 +309,12 @@ export class Workers {
 
             this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Solving: ${activity.title}`)
 
-            // Navigation happens for everything.
-            // Daily Set expansion only happens when context is dailySet.
+            // For daily set, ensure the section is expanded before any navigation/search
+            if (isDailySetContext) {
+                await this.expandDailySetIfNeeded(page, context)
+            }
+
+            // Navigation logic
             try {
                 const currentUrl = page.url()
                 const isDailyActivity =
@@ -361,7 +365,7 @@ export class Workers {
                     ]
 
                     let cardElement: any = null
-                    const maxDashboardAttempts = 3
+                    const maxDashboardAttempts = 2
 
                     for (let dashboardAttempt = 1; dashboardAttempt <= maxDashboardAttempts; dashboardAttempt++) {
                         this.bot.logger.debug(
@@ -376,6 +380,11 @@ export class Workers {
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
 
+                        // Re‑expand after page reload (important for daily set)
+                        if (isDailySetContext) {
+                            await this.expandDailySetIfNeeded(page, context)
+                        }
+
                         this.bot.logger.debug(
                             this.bot.isMobile,
                             'ACTIVITY',
@@ -388,7 +397,7 @@ export class Workers {
                         const isDashboardPage = !page.url().includes('/earn')
 
                         for (let loopIteration = 0; loopIteration < 35; loopIteration++) {
-                            // First: check whether the target is already visible
+                            // Check visible elements
                             for (const selector of selectors) {
                                 try {
                                     const elements = page.locator(selector)
@@ -425,11 +434,10 @@ export class Workers {
 
                             if (cardElement) break
 
-                            // Only Daily Set context can expand Daily Set.
+                            // Fallback expand inside scroll (in case something collapsed it)
                             if (isDashboardPage && isDailySetContext) {
                                 await this.expandDailySetIfNeeded(page, context)
 
-                                // Re-check after expansion
                                 for (const selector of selectors) {
                                     try {
                                         const elements = page.locator(selector)
@@ -587,7 +595,6 @@ export class Workers {
         }
     }
 
-
     public async doSpecialPromotions(data: DashboardData) { }
     public async doPunchCards(data: DashboardData, page: Page) { }
 
@@ -598,184 +605,55 @@ export class Workers {
         if (context !== 'dailySet') return
 
         try {
-            this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Scanning for Daily Set expand button...')
+            this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Trying simple Daily Set expand...')
 
-            // Strategy 1: Direct targeting by aria-label and expanded state
-            const directButton = page.locator('button[aria-label="Daily set" i][aria-expanded="false"]').first()
+            const expandButton = page.locator(
+                'button[aria-label="Daily set"][aria-expanded="false"]:has(svg)'
+            ).first()
 
-            if (await directButton.count() > 0 && await directButton.isVisible().catch(() => false)) {
-                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via direct aria-label match!')
-                await this.clickButton(page, directButton)
+            const exists = await expandButton.count()
+
+            if (exists === 0) {
+                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand button not found or already expanded')
                 return
             }
 
-            // Strategy 2: SVG proximity
-            const svgButtons = page.locator('button:has(svg)[aria-expanded="false"]')
-            const svgCount = await svgButtons.count()
-
-            if (svgCount > 0) {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', `Found ${svgCount} collapsed buttons with SVGs. Filtering...`)
-
-                const headerBox = await page.locator(':has-text("Daily set")').first().boundingBox().catch(() => null)
-
-                let bestButton: any = null
-                let minDistance = 99999
-
-                for (let i = 0; i < svgCount; i++) {
-                    const btn = svgButtons.nth(i)
-                    if (!(await btn.isVisible().catch(() => false))) continue
-
-                    const box = await btn.boundingBox().catch(() => null)
-                    if (!box) continue
-
-                    if (headerBox) {
-                        const dist = Math.hypot(
-                            (box.x + box.width / 2) - (headerBox.x + headerBox.width / 2),
-                            (box.y + box.height / 2) - (headerBox.y + headerBox.height / 2)
-                        )
-
-                        if (dist < 200 && dist < minDistance) {
-                            minDistance = dist
-                            bestButton = btn
-                        }
-                    } else {
-                        bestButton = btn
-                        break
-                    }
-                }
-
-                if (bestButton) {
-                    this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via SVG + Proximity!')
-                    await this.clickButton(page, bestButton)
-                    return
-                }
-            }
-
-            // Strategy 3: Broad Y-alignment
-            const allCollapsed = page.locator('button[aria-expanded="false"]')
-            const totalCount = await allCollapsed.count()
-
-            if (totalCount > 0) {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', `Checking ${totalCount} collapsed buttons...`)
-
-                const headerBox = await page.locator(':has-text("Daily set")').first().boundingBox().catch(() => null)
-
-                for (let i = totalCount - 1; i >= 0; i--) {
-                    const btn = allCollapsed.nth(i)
-                    if (!(await btn.isVisible().catch(() => false))) continue
-
-                    const box = await btn.boundingBox().catch(() => null)
-                    if (!box) continue
-
-                    if (headerBox) {
-                        const yDiff = Math.abs(box.y - headerBox.y)
-                        if (yDiff < 50) {
-                            const btnText = await btn.innerText().catch(() => '')
-                            const btnLabel = await btn.getAttribute('aria-label').catch(() => '')
-
-                            if (!btnText.includes('See more') && !(btnLabel || '').includes('See more')) {
-                                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Found button via Y-alignment!')
-                                await this.clickButton(page, btn)
-                                return
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Strategy 4: Refresh + Tab fallback
-            this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'Falling back to refresh + keyboard navigation...')
-
-            try {
-                await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
-                await this.bot.utils.wait(1000)
-
-                await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
-                await this.bot.utils.wait(500)
-
-                await page.locator('body').click().catch(() => { })
-                await this.bot.utils.wait(300)
-
-                let found = false
-
-                for (let i = 0; i < 25; i++) {
-                    await page.keyboard.press('Tab')
-                    await this.bot.utils.wait(50)
-
-                    const isTarget = await page.evaluate(() => {
-                        const el = document.activeElement as HTMLElement | null
-                        if (!el) return false
-
-                        const text = (el.innerText || '').toLowerCase()
-                        const label = (el.getAttribute('aria-label') || '').toLowerCase()
-                        const expanded = el.getAttribute('aria-expanded')
-
-                        return (
-                            expanded === 'false' &&
-                            (text.includes('daily') || label.includes('daily'))
-                        )
-                    })
-
-                    if (isTarget) {
-                        this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', `Focused correct element after ${i + 1} Tabs`)
-                        await page.keyboard.press('Enter')
-                        found = true
-                        break
-                    }
-                }
-
-                if (!found) {
-                    this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'Tab fallback failed, pressing Enter blindly...')
-                    await page.keyboard.press('Enter')
-                }
-
+            const isVisible = await expandButton.isVisible().catch(() => false)
+            if (!isVisible) {
+                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand button not visible')
                 return
-            } catch (e) {
-                this.bot.logger.error(
-                    this.bot.isMobile,
-                    'DAILY-SET',
-                    `Keyboard fallback failed: ${e instanceof Error ? e.message : String(e)}`
-                )
             }
 
-            this.bot.logger.warn(this.bot.isMobile, 'DAILY-SET', 'No valid expand button found.')
-        } catch (e) {
-            this.bot.logger.error(this.bot.isMobile, 'DAILY-SET', `Expand failed: ${e instanceof Error ? e.message : String(e)}`)
-        }
-    }
+            this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Clicking Daily Set expand button')
 
-    /**
-     * Helper to click and verify
-     */
-    private async clickButton(page: Page, locator: any): Promise<void> {
-        try {
-            const box = await locator.boundingBox()
-            if (box) {
-                await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
-                await this.bot.utils.wait(50)
-                await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { delay: this.bot.isMobile ? 150 : 50 })
+            await expandButton.scrollIntoViewIfNeeded().catch(() => { })
+            await this.bot.utils.wait(200)
 
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Click sent.')
-                await this.bot.utils.wait(1500) // Wait for animation
+            await expandButton.click({ delay: this.bot.isMobile ? 150 : 50 }).catch(() => { })
 
-                // Verify
-                const itemsVisible = await page.locator(':has-text("Daily set") >> a, :has-text("Daily set") >> [role="listitem"]').count().catch(() => 0)
-                if (itemsVisible > 0) {
-                    this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', '✅ Daily Set items visible', 'green')
-                } else {
-                    this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Clicked button, checking for content...')
-                }
+            await this.bot.utils.wait(1000)
+
+            // Optional verification (lightweight)
+            const expanded = await expandButton.getAttribute('aria-expanded').catch(() => null)
+
+            if (expanded === 'true') {
+                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', '✅ Daily Set expanded')
+            } else {
+                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand click sent, no state change detected')
             }
+
         } catch (e) {
-            this.bot.logger.error(this.bot.isMobile, 'DAILY-SET', `Click failed: ${e}`)
+            this.bot.logger.error(
+                this.bot.isMobile,
+                'DAILY-SET',
+                `Expand failed: ${e instanceof Error ? e.message : String(e)}`
+            )
         }
     }
-
     public async claimReadyPoints(page: Page): Promise<void> {
         try {
             this.bot.logger.debug(this.bot.isMobile, 'CLAIM-POINTS', 'Checking Ready to claim widget')
 
-            // Check if widget exists on page
             const widgetExists = await page.locator(':text("Ready to claim")').count() > 0
 
             if (!widgetExists) {
@@ -783,7 +661,6 @@ export class Workers {
                 return
             }
 
-            // Get points value
             const pointsText = await page.locator(':text("Ready to claim") ~ div span, :text("Ready to claim") + div span').innerText().catch(() => '0')
             const points = parseInt(pointsText.trim()) || 0
 
@@ -794,14 +671,12 @@ export class Workers {
 
             this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', `Ready to claim widget found, ${points} points available`)
 
-            // Click claim button
             const claimButton = page.locator('button:text("Claim"), div[role="button"]:text("Claim")')
             if (await claimButton.count() > 0) {
                 await claimButton.click({ timeout: 3000 }).catch(() => { })
                 await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
                 this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', `Successfully claimed ${points} points`, 'green')
             }
-
         } catch (error) {
             this.bot.logger.debug(this.bot.isMobile, 'CLAIM-POINTS', `Claim skipped: ${error instanceof Error ? error.message : String(error)}`)
         }
@@ -820,24 +695,17 @@ export class Workers {
         try {
             const url = activity.destination || activity.destinationUrl
             if (url) {
-                // For URL activities, visit the page first
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { })
-
-                // Wait for page to load and any potential auto-complete
                 await this.bot.utils.wait(3000)
 
-                // Check if it's a quiz/poll that needs interaction
                 const pageText = await page.innerText('body').catch(() => '')
 
-                // If it's a quiz/poll, try to find and click answers (basic)
                 if (pageText.toLowerCase().includes('quiz') || pageText.toLowerCase().includes('poll')) {
                     this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', 'Detected quiz/poll, attempting interaction')
-                    // Try clicking common quiz buttons
                     await page.click('button, [role="button"]', { timeout: 2000 }).catch(() => { })
                     await this.bot.utils.wait(2000)
                 }
 
-                // Now call the API to report completion
                 const panelData = this.bot.panelData
                 const todayKey = this.bot.utils.getFormattedDate()
 
@@ -908,7 +776,6 @@ export class Workers {
                 panelData?.flyoutResult?.morePromotions?.find(p => p.offerId === offerId) ||
                 panelData?.flyoutResult?.dailySetPromotions?.[todayKey]?.find(p => p.offerId === offerId)
 
-            // Try desktop API endpoint (form data) - works for URL activities
             const formData = new URLSearchParams({
                 id: offerId,
                 hash: activity.hash || panelPromotion?.hash || '',
@@ -941,8 +808,6 @@ export class Workers {
 
             if (response.status === 200) {
                 const result = response.data
-
-                // Check for V3/V4 success format
                 const earnedCredits = result?.EarnedCredits || result?.earnedCredits || 0
                 const activityComplete = result?.ActivityComplete || result?.activityComplete || false
                 const errorCode = result?.ErrorDetail?.ErrorCode || result?.errorDetail?.errorCode

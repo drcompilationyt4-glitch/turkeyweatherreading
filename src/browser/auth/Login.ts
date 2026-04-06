@@ -587,6 +587,9 @@ export class Login {
         this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Finalizing login')
 
         await page.goto(this.bot.config.baseURL, { waitUntil: 'networkidle', timeout: 10000 }).catch(() => {})
+        
+        // Handle cookie popup - click Reject if it appears
+        await this.bot.browser.utils.tryDismissAllMessages(page)
 
         const loginRewardsSuccess = new URL(page.url()).hostname === 'rewards.bing.com'
         if (loginRewardsSuccess) {
