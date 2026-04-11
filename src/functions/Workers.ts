@@ -21,6 +21,7 @@ export class Workers {
                 await page
                     .goto('https://rewards.bing.com/earn', { waitUntil: 'networkidle', timeout: 15000 })
                     .catch(() => { })
+                await this.bot.browser.utils.wakePage(page)
                 const earnHtml = await page.content()
                 const earnNextData = this.bot.nextParser.parse(earnHtml)
                 if (earnNextData.length > 0) {
@@ -118,6 +119,7 @@ export class Workers {
                 await page
                     .goto('https://rewards.bing.com/earn', { waitUntil: 'networkidle', timeout: 15000 })
                     .catch(() => { })
+                await this.bot.browser.utils.wakePage(page)
                 const earnHtml = await page.content()
                 const earnNextData = this.bot.nextParser.parse(earnHtml)
                 if (earnNextData.length > 0) {
@@ -331,6 +333,7 @@ export class Workers {
                             timeout: 15000
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                        await this.bot.browser.utils.wakePage(page)
                     }
                 } else {
                     if (!currentUrl.includes('rewards.bing.com') || currentUrl.includes('/earn')) {
@@ -339,6 +342,7 @@ export class Workers {
                             timeout: 20000
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                        await this.bot.browser.utils.wakePage(page)
                     }
                 }
             } catch (navError) {
@@ -379,6 +383,7 @@ export class Workers {
                             timeout: 20000
                         }).catch(() => { })
                         await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                        await this.bot.browser.utils.wakePage(page)
 
                         // Re‑expand after page reload (important for daily set)
                         if (isDailySetContext) {
@@ -489,6 +494,7 @@ export class Workers {
                             this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card not found, refreshing dashboard`)
                             await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
                             await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                            await this.bot.browser.utils.wakePage(page)
                         }
                     }
 
@@ -652,36 +658,46 @@ export class Workers {
     }
     public async claimReadyPoints(page: Page): Promise<void> {
         try {
-            this.bot.logger.debug(this.bot.isMobile, 'CLAIM-POINTS', 'Checking Ready to claim widget')
+            this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Trying to open Ready to claim card')
 
-            const widgetExists = await page.locator(':text("Ready to claim")').count() > 0
+            const readyText = page.getByText('Ready to claim').first()
 
-            if (!widgetExists) {
-                this.bot.logger.debug(this.bot.isMobile, 'CLAIM-POINTS', 'Ready to claim widget does NOT exist on dashboard')
+            if (await readyText.count() === 0) {
+                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'No Ready to claim card found')
                 return
             }
 
-            const pointsText = await page.locator(':text("Ready to claim") ~ div span, :text("Ready to claim") + div span').innerText().catch(() => '0')
-            const points = parseInt(pointsText.trim()) || 0
+            // Step 1: Click the card
+            await readyText.click().catch(() => { })
+            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
 
-            if (points <= 0) {
-                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', `Ready to claim widget shows ${points} points, nothing to collect`)
+            // Step 2: Look specifically for "Claim points" button
+            const claimBtn = page.getByText(/^claim points$/i)
+
+            if (await claimBtn.count() === 0) {
+                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'No "Claim points" button found (probably 0 points)')
+
+                // Close popup if possible
+                await page.goBack().catch(() => { })
                 return
             }
 
-            this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', `Ready to claim widget found, ${points} points available`)
+            this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', '"Claim points" button found, attempting to claim...')
 
-            const claimButton = page.locator('button:text("Claim"), div[role="button"]:text("Claim")')
-            if (await claimButton.count() > 0) {
-                await claimButton.click({ timeout: 3000 }).catch(() => { })
-                await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', `Successfully claimed ${points} points`, 'green')
-            }
+            // Step 3: Click it
+            await claimBtn.click().catch(() => { })
+            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+
+            this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Claim attempt finished', 'green')
+
         } catch (error) {
-            this.bot.logger.debug(this.bot.isMobile, 'CLAIM-POINTS', `Claim skipped: ${error instanceof Error ? error.message : String(error)}`)
+            this.bot.logger.debug(
+                this.bot.isMobile,
+                'CLAIM-POINTS',
+                `Claim skipped: ${error instanceof Error ? error.message : String(error)}`
+            )
         }
     }
-
     private async completeActivity(activity: any, page: Page): Promise<boolean> {
         const offerId = activity.offerId
 

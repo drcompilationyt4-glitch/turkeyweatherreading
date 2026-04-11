@@ -273,4 +273,23 @@ export default class BrowserUtils {
             }
         })
     }
+
+    async wakePage(page: Page): Promise<boolean> {
+        try {
+            this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', 'Waking page by clicking dashboard heading')
+            
+            // Click only verified safe dashboard headings - exactly matching text
+            const result = await this.ghostClick(page, 'h1:has-text("Your perks"), h1:has-text("Earn rewards"), h2:has-text("Your perks"), h2:has-text("Earn rewards")')
+            
+            if (result) {
+                this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', 'Page woken successfully')
+                await this.bot.utils.wait(500)
+            }
+            
+            return result
+        } catch (error) {
+            this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', `Wake failed: ${error instanceof Error ? error.message : String(error)}`)
+            return false
+        }
+    }
 }

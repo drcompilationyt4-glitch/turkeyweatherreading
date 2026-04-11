@@ -467,47 +467,6 @@ export class MicrosoftRewardsBot {
                     this.logger.debug(this.isMobile, 'COOKIE', `Cookie popup handler skipped: ${cookieError instanceof Error ? cookieError.message : String(cookieError)}`)
                 }
 
-                // ✅ Handle new Claim Points system
-                try {
-                    this.logger.debug(this.isMobile, 'CLAIM-POINTS', 'Checking for ready to claim points...')
-                    
-                    // First check if claim card exists at all (backwards compatible)
-                    const claimCard = this.mainMobilePage.locator(':has-text("Ready to claim")')
-                    if (await claimCard.count() > 0) {
-                        // Get points value
-                        const pointsText = await claimCard.locator('text=/[0-9]+/').innerText().catch(() => '0')
-                        const points = parseInt(pointsText.trim()) || 0
-                        
-                        if (points > 0) {
-                            this.logger.info(this.isMobile, 'CLAIM-POINTS', `Found ${points} points ready to claim`)
-                            
-                            // Open claim panel
-                            await claimCard.click({ timeout: 3000 }).catch(() => {})
-                            await this.utils.wait(this.utils.humanActivityDelay())
-                            
-                            // Look for claim button
-                            const claimButtons = this.mainMobilePage.locator('button:has-text(/claim/i), [role="button"]:has-text(/claim/i)')
-                            if (await claimButtons.count() > 0) {
-                                this.logger.info(this.isMobile, 'CLAIM-POINTS', 'Claiming points...')
-                                await claimButtons.first().click({ timeout: 3000 }).catch(() => {})
-                                await this.utils.wait(this.utils.humanNavigationDelay())
-                            }
-                            
-                            // Always close the panel
-                            const closeButton = this.mainMobilePage.locator('[aria-label="Close"], button:has-text("×")')
-                            if (await closeButton.count() > 0) {
-                                await closeButton.click({ timeout: 1000 }).catch(() => {})
-                            }
-                        } else {
-                            this.logger.debug(this.isMobile, 'CLAIM-POINTS', 'No points ready to claim')
-                        }
-                    } else {
-                        this.logger.debug(this.isMobile, 'CLAIM-POINTS', 'Claim system not available on this account')
-                    }
-                } catch (claimError) {
-                    this.logger.debug(this.isMobile, 'CLAIM-POINTS', `Claim points handler skipped: ${claimError instanceof Error ? claimError.message : String(claimError)}`)
-                }
-
                 try {
                     this.accessToken = await this.login.getAppAccessToken(this.mainMobilePage, accountEmail)
                 } catch (error) {
@@ -554,37 +513,11 @@ export class MicrosoftRewardsBot {
 
                 // ✅ Claim any pending points here - GUARANTEED EXECUTION
                 try {
-                    if (this.pointsCanCollect > 0) {
-                        this.logger.debug(this.isMobile, 'CLAIM-POINTS', `Checking for ${this.pointsCanCollect} points to claim`)
-                        
-                        // Check if claim cards actually exist on dashboard first
-                        const claimCards = this.mainMobilePage.locator(':has-text("Ready to claim"), [data-bi-id*="claim"]')
-                        
-                        if (await claimCards.count() > 0) {
-                            this.logger.info(this.isMobile, 'CLAIM-POINTS', `Found claimable cards on dashboard`)
-                            
-                            const claimButtons = this.mainMobilePage.locator('button:has-text(/claim/i), [role="button"]:has-text(/claim/i)')
-                            const buttonCount = await claimButtons.count()
-                            
-                            if (buttonCount > 0) {
-                                for (let i = 0; i < buttonCount; i++) {
-                                    const button = claimButtons.nth(i)
-                                    if (await button.isVisible() && await button.isEnabled()) {
-                                        const pointsMatch = await button.locator('../..').locator('text=/[0-9]+ points?/').innerText().catch(() => '0')
-                                        this.logger.info(this.isMobile, 'CLAIM-POINTS', `Claiming ${pointsMatch || 'points'}...`)
-                                        await button.click({ timeout: 2500 }).catch(() => {})
-                                        await this.utils.wait(this.utils.humanActivityDelay())
-                                    }
-                                }
-                                this.logger.info(this.isMobile, 'CLAIM-POINTS', `Successfully processed all claim buttons`)
-                            }
-                        } else {
-                            this.logger.debug(this.isMobile, 'CLAIM-POINTS', `No claim cards found on dashboard`)
-                        }
-                    }
+                    await this.workers.claimReadyPoints(this.mainMobilePage)
                 } catch (claimError) {
-                    this.logger.debug(this.isMobile, 'CLAIM-POINTS', `Claim points skipped: ${claimError instanceof Error ? claimError.message : String(claimError)}`)
+                    this.logger.debug(this.isMobile, 'CLAIM-POINTS', `Claim points handler skipped: ${claimError instanceof Error ? claimError.message : String(claimError)}`)
                 }
+
 
                 // Randomly choose whether to do mobile or desktop activities first
                 const doMobileFirst = randomInt(0, 2) === 0
