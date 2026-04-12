@@ -295,6 +295,167 @@ export class Workers {
         return results
     }
 
+    private async clickBestMatchingTextOnPage(
+        page: Page,
+        title: string,
+        minScore = 0.7
+    ): Promise<{ clicked: boolean; score: number; text: string }> {
+        return await page.evaluate(
+            ({ title, minScore }) => {
+                const normalize = (value: string) =>
+                    (value ?? '')
+                        .replace(/[\u200B-\u200D\uFEFF]/g, '') // zero-width chars
+                        .replace(/[^a-z0-9]+/gi, ' ')
+                        .toLowerCase()
+                        .replace(/\s+/g, ' ')
+                        .trim()
+
+                const levenshtein = (a: string, b: string) => {
+                    const m = a.length
+                    const n = b.length
+
+                    if (m === 0) return n
+                    if (n === 0) return m
+
+                    const dp = new Array(n + 1)
+                    for (let j = 0; j <= n; j++) dp[j] = j
+
+                    for (let i = 1; i <= m; i++) {
+                        let prev = dp[0]
+                        dp[0] = i
+
+                        for (let j = 1; j <= n; j++) {
+                            const temp = dp[j]
+                            const cost = a[i - 1] === b[j - 1] ? 0 : 1
+                            dp[j] = Math.min(
+                                dp[j] + 1,
+                                dp[j - 1] + 1,
+                                prev + cost
+                            )
+                            prev = temp
+                        }
+                    }
+
+                    return dp[n]
+                }
+
+                const similarity = (a: string, b: string) => {
+                    const left = normalize(a)
+                    const right = normalize(b)
+
+                    if (!left || !right) return 0
+                    if (left === right) return 1
+
+                    if (left.includes(right) || right.includes(left)) {
+                        const shorter = Math.min(left.length, right.length)
+                        const longer = Math.max(left.length, right.length)
+                        return Math.max(0.7, shorter / longer)
+                    }
+
+                    const distance = levenshtein(left, right)
+                    return 1 - distance / Math.max(left.length, right.length)
+                }
+
+                const isVisibleInViewport = (el: Element) => {
+                    const node = el as HTMLElement
+                    const style = window.getComputedStyle(node)
+                    if (
+                        style.display === 'none' ||
+                        style.visibility === 'hidden' ||
+                        style.opacity === '0'
+                    ) {
+                        return false
+                    }
+
+                    const rect = node.getBoundingClientRect()
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        rect.top >= 0 &&
+                        rect.left >= 0 &&
+                        rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+                        rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+                    )
+                }
+
+                const nearestClickableAncestor = (el: Element) => {
+                    let current: Element | null = el
+                    let depth = 0
+
+                    while (current && depth < 6) {
+                        const tag = current.tagName?.toLowerCase()
+                        const node = current as HTMLElement
+
+                        if (
+                            tag === 'a' ||
+                            tag === 'button' ||
+                            node.getAttribute('role') === 'button' ||
+                            node.hasAttribute('onclick') ||
+                            node.hasAttribute('tabindex')
+                        ) {
+                            return current
+                        }
+
+                        current = current.parentElement
+                        depth++
+                    }
+
+                    return el
+                }
+
+                const target = normalize(title)
+                if (!target) {
+                    return { clicked: false, score: 0, text: '' }
+                }
+
+                const candidates: Array<{ el: Element; score: number; text: string }> = []
+
+                for (const el of Array.from(document.querySelectorAll('body *'))) {
+                    if (!isVisibleInViewport(el)) continue
+
+                    const rawText = (el as HTMLElement).innerText || el.textContent || ''
+                    const text = normalize(rawText)
+                    if (!text) continue
+
+                    const score = similarity(text, target)
+                    if (score >= minScore) {
+                        candidates.push({ el, score, text })
+                    }
+                }
+
+                candidates.sort((a, b) => {
+                    if (b.score !== a.score) return b.score - a.score
+                    return a.text.length - b.text.length
+                })
+
+                const best = candidates[0]
+                if (!best) {
+                    return { clicked: false, score: 0, text: '' }
+                }
+
+                const clickTarget = nearestClickableAncestor(best.el) as HTMLElement
+
+                clickTarget.scrollIntoView({
+                    block: 'center',
+                    inline: 'center'
+                })
+
+                try {
+                    clickTarget.click()
+                } catch {
+                    const rect = clickTarget.getBoundingClientRect()
+                    const x = rect.left + rect.width / 2
+                    const y = rect.top + rect.height / 2
+                    const elAtPoint = document.elementFromPoint(x, y) as HTMLElement | null
+                    elAtPoint?.click()
+                }
+
+                return { clicked: true, score: best.score, text: best.text }
+            },
+            { title, minScore }
+        )
+    }
+
     protected async solveActivities(
         activities: any[],
         page: Page,
@@ -311,12 +472,10 @@ export class Workers {
 
             this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Solving: ${activity.title}`)
 
-            // For daily set, ensure the section is expanded before any navigation/search
             if (isDailySetContext) {
                 await this.expandDailySetIfNeeded(page, context)
             }
 
-            // Navigation logic
             try {
                 const currentUrl = page.url()
                 const isDailyActivity =
@@ -357,92 +516,56 @@ export class Workers {
                 const url = activity.destinationUrl ?? activity.destination
 
                 if (url) {
-                    const escapedTitle = activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    if (
+                        isDailySetContext ||
+                        activity?.source === 'dailySet' ||
+                        (activity?.title?.toLowerCase?.().includes('daily set') ?? false) ||
+                        (activity?.name?.toLowerCase?.().includes('daily') ?? false)
+                    ) {
+                        const escapedTitle = activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-                    const selectors = [
-                        `text=/.*${escapedTitle}.*/i`,
-                        `text=/.*${escapedTitle}.*/i >> xpath=ancestor::*[self::button or self::a or @role="button" or @onclick or @tabindex][1]`,
-                        `a[href*="${activity.offerId}"]`,
-                        `a[data-bi-id*="${activity.offerId}"]`,
-                        `*:text("${activity.title}")`,
-                        `a[href*="${encodeURIComponent(url).substring(0, 15)}"]`
-                    ]
+                        const selectors = [
+                            `text=/.*${escapedTitle}.*/i`,
+                            `text=/.*${escapedTitle}.*/i >> xpath=ancestor::*[self::button or self::a or @role="button" or @onclick or @tabindex][1]`,
+                            `a[href*="${activity.offerId}"]`,
+                            `a[data-bi-id*="${activity.offerId}"]`,
+                            `*:text("${activity.title}")`,
+                            `a[href*="${encodeURIComponent(url).substring(0, 15)}"]`
+                        ]
 
-                    let cardElement: any = null
-                    const maxDashboardAttempts = 2
+                        let cardElement: any = null
+                        const maxDashboardAttempts = 2
 
-                    for (let dashboardAttempt = 1; dashboardAttempt <= maxDashboardAttempts; dashboardAttempt++) {
-                        this.bot.logger.debug(
-                            this.bot.isMobile,
-                            'ACTIVITY',
-                            `Dashboard attempt ${dashboardAttempt}/${maxDashboardAttempts} for ${activity.title}`
-                        )
+                        for (let dashboardAttempt = 1; dashboardAttempt <= maxDashboardAttempts; dashboardAttempt++) {
+                            this.bot.logger.debug(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Dashboard attempt ${dashboardAttempt}/${maxDashboardAttempts} for ${activity.title}`
+                            )
 
-                        await page.goto('https://rewards.bing.com/', {
-                            waitUntil: 'networkidle',
-                            timeout: 20000
-                        }).catch(() => { })
-                        await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                        await this.bot.browser.utils.wakePage(page)
+                            await page.goto('https://rewards.bing.com/', {
+                                waitUntil: 'networkidle',
+                                timeout: 20000
+                            }).catch(() => { })
+                            await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                            await this.bot.browser.utils.wakePage(page)
 
-                        // Re‑expand after page reload (important for daily set)
-                        if (isDailySetContext) {
-                            await this.expandDailySetIfNeeded(page, context)
-                        }
-
-                        this.bot.logger.debug(
-                            this.bot.isMobile,
-                            'ACTIVITY',
-                            `Starting incremental search for: ${activity.title}`
-                        )
-
-                        await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
-                        await this.bot.utils.wait(300)
-
-                        const isDashboardPage = !page.url().includes('/earn')
-
-                        for (let loopIteration = 0; loopIteration < 35; loopIteration++) {
-                            // Check visible elements
-                            for (const selector of selectors) {
-                                try {
-                                    const elements = page.locator(selector)
-                                    const count = await elements.count()
-
-                                    for (let i = 0; i < count; i++) {
-                                        const el = elements.nth(i)
-
-                                        const isInViewport = await el.evaluate((element: HTMLElement) => {
-                                            const rect = element.getBoundingClientRect()
-                                            return rect.top >= 0
-                                                && rect.left >= 0
-                                                && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
-                                                && rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-                                        }).catch(() => false)
-
-                                        if (isInViewport) {
-                                            const text = await el.innerText().catch(() => '')
-                                            const href = await el.getAttribute('href').catch(() => null)
-                                            if (
-                                                text.toLowerCase().includes(activity.title.toLowerCase()) ||
-                                                (href && href.includes(activity.offerId))
-                                            ) {
-                                                cardElement = el
-                                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `✅ Found card on iteration ${loopIteration}`)
-                                                break
-                                            }
-                                        }
-                                    }
-
-                                    if (cardElement) break
-                                } catch { }
+                            if (isDailySetContext) {
+                                await this.expandDailySetIfNeeded(page, context)
                             }
 
-                            if (cardElement) break
+                            this.bot.logger.debug(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Starting incremental search for: ${activity.title}`
+                            )
 
-                            // Fallback expand inside scroll (in case something collapsed it)
-                            if (isDashboardPage && isDailySetContext) {
-                                await this.expandDailySetIfNeeded(page, context)
+                            await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
+                            await this.bot.utils.wait(300)
 
+                            const isDashboardPage = !page.url().includes('/earn')
+
+                            for (let loopIteration = 0; loopIteration < 35; loopIteration++) {
                                 for (const selector of selectors) {
                                     try {
                                         const elements = page.locator(selector)
@@ -456,13 +579,18 @@ export class Workers {
                                                 return rect.top >= 0
                                                     && rect.left >= 0
                                                     && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
+                                                    && rect.right <= (window.innerWidth || document.documentElement.clientWidth)
                                             }).catch(() => false)
 
                                             if (isInViewport) {
                                                 const text = await el.innerText().catch(() => '')
-                                                if (text.toLowerCase().includes(activity.title.toLowerCase())) {
+                                                const href = await el.getAttribute('href').catch(() => null)
+                                                if (
+                                                    text.toLowerCase().includes(activity.title.toLowerCase()) ||
+                                                    (href && href.includes(activity.offerId))
+                                                ) {
                                                     cardElement = el
-                                                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', '✅ Found card inside expanded Daily Set!')
+                                                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `✅ Found card on iteration ${loopIteration}`)
                                                     break
                                                 }
                                             }
@@ -473,6 +601,188 @@ export class Workers {
                                 }
 
                                 if (cardElement) break
+
+                                if (isDashboardPage && isDailySetContext) {
+                                    await this.expandDailySetIfNeeded(page, context)
+
+                                    for (const selector of selectors) {
+                                        try {
+                                            const elements = page.locator(selector)
+                                            const count = await elements.count()
+
+                                            for (let i = 0; i < count; i++) {
+                                                const el = elements.nth(i)
+
+                                                const isInViewport = await el.evaluate((element: HTMLElement) => {
+                                                    const rect = element.getBoundingClientRect()
+                                                    return rect.top >= 0
+                                                        && rect.left >= 0
+                                                        && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
+                                                }).catch(() => false)
+
+                                                if (isInViewport) {
+                                                    const text = await el.innerText().catch(() => '')
+                                                    if (text.toLowerCase().includes(activity.title.toLowerCase())) {
+                                                        cardElement = el
+                                                        this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', '✅ Found card inside expanded Daily Set!')
+                                                        break
+                                                    }
+                                                }
+                                            }
+
+                                            if (cardElement) break
+                                        } catch { }
+                                    }
+
+                                    if (cardElement) break
+                                }
+
+                                await page.evaluate(() => window.scrollBy({
+                                    top: 65,
+                                    left: 0,
+                                    behavior: 'smooth'
+                                })).catch(() => { })
+
+                                await this.bot.utils.wait(500)
+                            }
+
+                            if (!cardElement) {
+                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Completed full search loop, card not found`)
+                            }
+
+                            if (cardElement) break
+
+                            if (dashboardAttempt < maxDashboardAttempts) {
+                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card not found, refreshing dashboard`)
+                                await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
+                                await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                                await this.bot.browser.utils.wakePage(page)
+                            }
+                        }
+
+                        if (cardElement) {
+                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card found for: ${activity.title}`)
+
+                            await cardElement.scrollIntoViewIfNeeded().catch(() => { })
+                            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+
+                            if (!this.bot.isMobile) {
+                                await this.bot.utils.wait(this.bot.utils.humanHoverDelay())
+                                await cardElement.hover().catch(() => { })
+                                await this.bot.utils.wait(500)
+
+                                await page
+                                    .evaluate(
+                                        (sel: any) => {
+                                            const el = document.querySelector(sel)
+                                            if (el) {
+                                                ;['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(evt => {
+                                                    el.dispatchEvent(
+                                                        new MouseEvent(evt, {
+                                                            bubbles: true,
+                                                            cancelable: true,
+                                                            view: window
+                                                        })
+                                                    )
+                                                })
+                                            }
+                                        },
+                                        (cardElement as any)._selector
+                                    )
+                                    .catch(() => { })
+                            }
+
+                            await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+
+                            const [newPage] = await Promise.all([
+                                page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
+                                cardElement.click({ delay: this.bot.utils.randomDelay(200, 500) }).catch(() => {
+                                    return page.evaluate(targetUrl => {
+                                        window.open(targetUrl, '_blank')
+                                    }, url)
+                                })
+                            ])
+
+                            if (newPage) {
+                                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
+                                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
+                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `New tab opened for: ${activity.title}`)
+
+                                const pageUrl = newPage.url()
+                                if (
+                                    pageUrl.includes('bing.com') &&
+                                    (
+                                        activity.title.toLowerCase().includes('search on bing') ||
+                                        activity.title.toLowerCase().includes('explore on bing') ||
+                                        activity.title.toLowerCase().includes('search bing')
+                                    )
+                                ) {
+                                    try {
+                                        const { SearchOnBing } = await import('./activities/browser/SearchOnBing.js')
+                                        const searchOnBing = new SearchOnBing(this.bot)
+                                        await searchOnBing.doSearchOnBing(activity, newPage)
+                                    } catch (searchError) {
+                                        this.bot.logger.warn(
+                                            this.bot.isMobile,
+                                            'SEARCH-ON-BING',
+                                            `Failed to handle search activity: ${searchError instanceof Error ? searchError.message : String(searchError)}`
+                                        )
+                                    }
+                                } else {
+                                    if (this.bot.rewardsVersion === 'modern') {
+                                        await this.completeActivity(activity, newPage)
+                                    }
+                                }
+
+                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
+                                await newPage.close().catch(() => { })
+                            } else {
+                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
+                            }
+                        } else {
+                            this.bot.logger.warn(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Card NOT found on dashboard for: ${activity.title}. Navigating directly.`
+                            )
+                            await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
+                            await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
+
+                            if (this.bot.rewardsVersion === 'modern') {
+                                await this.completeActivity(activity, page)
+                            }
+
+                            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
+                        }
+                    } else {
+                        if (!page.url().includes('/earn')) {
+                            await page.goto('https://rewards.bing.com/earn', {
+                                waitUntil: 'domcontentloaded',
+                                timeout: 15000
+                            }).catch(() => { })
+                            await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
+                            await this.bot.browser.utils.wakePage(page)
+                        }
+
+                        await this.bot.utils.wait(700)
+
+                        const beforePages = page.context().pages().slice()
+                        let clicked = false
+                        let lastScore = 0
+
+                        for (let i = 0; i < 35; i++) {
+                            const result = await this.clickBestMatchingTextOnPage(page, activity.title, 0.7)
+
+                            if (result.clicked) {
+                                clicked = true
+                                lastScore = result.score
+
+                                this.bot.logger.debug(
+                                    this.bot.isMobile,
+                                    'ACTIVITY',
+                                    `✅ Found earn text on iteration ${i} (${Math.round(result.score * 100)}%)`
+                                )
+                                break
                             }
 
                             await page.evaluate(() => window.scrollBy({
@@ -484,123 +794,60 @@ export class Workers {
                             await this.bot.utils.wait(500)
                         }
 
-                        if (!cardElement) {
-                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Completed full search loop, card not found`)
-                        }
+                        if (clicked) {
+                            await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+                            await this.bot.utils.wait(1500)
 
-                        if (cardElement) break
+                            const afterPages = page.context().pages()
+                            const newPage = afterPages.find(p => !beforePages.includes(p) && !p.isClosed())
 
-                        if (dashboardAttempt < maxDashboardAttempts) {
-                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card not found, refreshing dashboard`)
-                            await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                            await this.bot.browser.utils.wakePage(page)
-                        }
-                    }
-
-                    if (cardElement) {
-                        this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card found for: ${activity.title}`)
-
-                        await cardElement.scrollIntoViewIfNeeded().catch(() => { })
-                        await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-                        if (!this.bot.isMobile) {
-                            await this.bot.utils.wait(this.bot.utils.humanHoverDelay())
-                            await cardElement.hover().catch(() => { })
-                            await this.bot.utils.wait(500)
-
-                            await page
-                                .evaluate(
-                                    (sel: any) => {
-                                        const el = document.querySelector(sel)
-                                        if (el) {
-                                            ;['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(evt => {
-                                                el.dispatchEvent(
-                                                    new MouseEvent(evt, {
-                                                        bubbles: true,
-                                                        cancelable: true,
-                                                        view: window
-                                                    })
-                                                )
-                                            })
-                                        }
-                                    },
-                                    (cardElement as any)._selector
+                            if (newPage) {
+                                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
+                                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
+                                this.bot.logger.debug(
+                                    this.bot.isMobile,
+                                    'ACTIVITY',
+                                    `New tab opened for earn item: ${activity.title} (${Math.round(lastScore * 100)}%)`
                                 )
-                                .catch(() => { })
-                        }
 
-                        await this.bot.utils.wait(this.bot.utils.humanClickDelay())
-
-                        const [newPage] = await Promise.all([
-                            page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
-                            cardElement.click({ delay: this.bot.utils.randomDelay(200, 500) }).catch(() => {
-                                return page.evaluate(targetUrl => {
-                                    window.open(targetUrl, '_blank')
-                                }, url)
-                            })
-                        ])
-
-                        if (newPage) {
-                            await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `New tab opened for: ${activity.title}`)
-
-                            const pageUrl = newPage.url()
-                            if (
-                                pageUrl.includes('bing.com') &&
-                                (
-                                    activity.title.toLowerCase().includes('search on bing') ||
-                                    activity.title.toLowerCase().includes('explore on bing') ||
-                                    activity.title.toLowerCase().includes('search bing')
-                                )
-                            ) {
-                                try {
-                                    const { SearchOnBing } = await import('./activities/browser/SearchOnBing.js')
-                                    const searchOnBing = new SearchOnBing(this.bot)
-                                    await searchOnBing.doSearchOnBing(activity, newPage)
-                                } catch (searchError) {
-                                    this.bot.logger.warn(
-                                        this.bot.isMobile,
-                                        'SEARCH-ON-BING',
-                                        `Failed to handle search activity: ${searchError instanceof Error ? searchError.message : String(searchError)}`
-                                    )
-                                }
-                            } else {
                                 if (this.bot.rewardsVersion === 'modern') {
                                     await this.completeActivity(activity, newPage)
                                 }
+
+                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
+                                await newPage.close().catch(() => { })
+                            } else {
+                                if (this.bot.rewardsVersion === 'modern') {
+                                    await this.completeActivity(activity, page)
+                                }
+
+                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
+                            }
+                        } else {
+                            this.bot.logger.warn(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Text match not found for: ${activity.title}. Navigating directly.`
+                            )
+
+                            await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
+                            await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
+
+                            if (this.bot.rewardsVersion === 'modern') {
+                                await this.completeActivity(activity, page)
                             }
 
                             await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                            await newPage.close().catch(() => { })
-                        } else {
-                            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
                         }
-                    } else {
-                        this.bot.logger.warn(
-                            this.bot.isMobile,
-                            'ACTIVITY',
-                            `Card NOT found on dashboard for: ${activity.title}. Navigating directly.`
-                        )
-                        await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
-                        await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-
-                        if (this.bot.rewardsVersion === 'modern') {
-                            await this.completeActivity(activity, page)
-                        }
-
-                        await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
                     }
-                }
 
-                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Finished attempt for: ${activity.title}`)
+                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Finished attempt for: ${activity.title}`)
+                }
             } catch {
                 this.bot.logger.error(this.bot.isMobile, 'ACTIVITY', `Failed: ${activity.title}`)
             }
         }
     }
-
     public async doSpecialPromotions(data: DashboardData) { }
     public async doPunchCards(data: DashboardData, page: Page) { }
 
