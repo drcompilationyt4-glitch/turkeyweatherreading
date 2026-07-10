@@ -2,6 +2,7 @@ import { type Page, type BrowserContext } from 'patchright'
 import { CheerioAPI, load } from 'cheerio'
 import { ClickOptions, createCursor } from 'ghost-cursor-playwright-port'
 
+
 import type { MicrosoftRewardsBot } from '../index'
 
 export default class BrowserUtils {
