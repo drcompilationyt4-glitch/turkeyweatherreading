@@ -61,8 +61,6 @@ export class Login {
         otpCodeEntry: '[data-testid="codeEntry"]',
         backButton: '#back-button',
         bingProfile: '#id_n',
-        requestToken: 'input[name="__RequestVerificationToken"]',
-        requestTokenMeta: 'meta[name="__RequestVerificationToken"]',
         otpInput: 'div[data-testid="codeEntry"]'
     } as const
 
@@ -587,7 +585,7 @@ export class Login {
         this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Finalizing login')
 
         await page.goto(this.bot.config.baseURL, { waitUntil: 'networkidle', timeout: 10000 }).catch(() => {})
-        
+
         // Handle cookie popup - click Reject if it appears
         await this.bot.browser.utils.tryDismissAllMessages(page)
 
@@ -671,85 +669,42 @@ export class Login {
     }
 
     private async getRewardsSession(page: Page) {
-        const loopMax = 5
-
-        this.bot.logger.info(this.bot.isMobile, 'GET-REWARD-SESSION', 'Fetching request token')
+        this.bot.logger.info(this.bot.isMobile, 'GET-REWARD-SESSION', 'Bootstrapping rewards context')
 
         try {
-            await page
-                .goto(`${this.bot.config.baseURL}?_=${Date.now()}`, { waitUntil: 'networkidle', timeout: 10000 })
-                .catch(() => {})
+            await this.bot.browser.func.bootstrap(page)
 
-            for (let i = 0; i < loopMax; i++) {
-                if (page.isClosed()) break
+            const actionsCount = Object.keys(this.bot.nextActions).length
+            const snapshot = this.bot.reactSnapshot
+            const reportableCount = snapshot?.reportable.length ?? 0
+            const availablePoints = snapshot?.account.availablePoints ?? null
 
-                this.bot.logger.debug(this.bot.isMobile, 'GET-REWARD-SESSION', `Token fetch loop ${i + 1}/${loopMax}`)
-
-                const u = new URL(page.url())
-                const atRewardHome = u.hostname === 'rewards.bing.com' && u.pathname === '/'
-
-                if (atRewardHome) {
-                    await this.bot.browser.utils.tryDismissAllMessages(page)
-
-                    const html = await page.content()
-                    const $ = await this.bot.browser.utils.loadInCheerio(html)
-
-                    // Check which version of the dashboard is being used, disable requestToken req on new dash
-                    const isModernDashboard = $('section#dailyset').length > 0 // Only on new UI and on dashboard/overview page
-
-                    if (isModernDashboard) {
-                        this.bot.rewardsVersion = 'modern'
-
-                        this.bot.logger.warn(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            'Modern Rewards dashboard detected. This script version may not fully support it.'
-                        )
-
-                        this.bot.logger.warn(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            'RequestToken disabled for this session (expected behavior).'
-                        )
-                    }
-
-                    const token =
-                        $(this.selectors.requestToken).attr('value') ??
-                        $(this.selectors.requestTokenMeta).attr('content') ??
-                        null
-
-                    if (token) {
-                        this.bot.requestToken = token
-                        this.bot.logger.info(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            `Request token retrieved: ${token.substring(0, 10)}...`
-                        )
-                        return
-                    }
-
-                    this.bot.logger.debug(this.bot.isMobile, 'GET-REWARD-SESSION', 'Token not found on page')
-                } else {
-                    this.bot.logger.debug(
-                        this.bot.isMobile,
-                        'GET-REWARD-SESSION',
-                        `Not at reward home: ${u.hostname}${u.pathname}`
-                    )
-                }
-
-                await this.bot.utils.wait(1000)
+            if (!actionsCount) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'GET-REWARD-SESSION',
+                    'No action ids resolved - server-action calls (report/streak protection) will be skipped this run'
+                )
             }
 
-            this.bot.logger.warn(
+            if (!snapshot || !snapshot.offers.length) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'GET-REWARD-SESSION',
+                    'Page snapshot empty - neither /earn nor /dashboard rendered a usable RSC payload'
+                )
+            }
+
+            this.bot.logger.info(
                 this.bot.isMobile,
                 'GET-REWARD-SESSION',
-                'No RequestVerificationToken found, some activities may not work'
+                `Context ready | actions=${actionsCount} | reportable=${reportableCount} | available=${availablePoints}`
             )
         } catch (error) {
             throw this.bot.logger.error(
                 this.bot.isMobile,
                 'GET-REWARD-SESSION',
-                `Fatal error: ${error instanceof Error ? error.message : String(error)}`
+                `Failed to acquire rewards context: ${error instanceof Error ? error.message : String(error)}`
             )
         }
     }

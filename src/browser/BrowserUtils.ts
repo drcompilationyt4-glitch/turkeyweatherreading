@@ -1,7 +1,6 @@
+import { REWARDS_BASE_URL } from '../constants/urls'
 import { type Page, type BrowserContext } from 'patchright'
-import { CheerioAPI, load } from 'cheerio'
 import { ClickOptions, createCursor } from 'ghost-cursor-playwright-port'
-
 
 import type { MicrosoftRewardsBot } from '../index'
 
@@ -50,7 +49,6 @@ export default class BrowserUtils {
                 await Promise.allSettled(
                     visibleButtons.map(async b => {
                         if (b) {
-                            await this.bot.utils.wait(this.bot.utils.humanClickDelay())
                             const clicked = await this.ghostClick(page, b.selector)
                             if (clicked) {
                                 this.bot.logger.debug(
@@ -68,7 +66,6 @@ export default class BrowserUtils {
             // Overlay
             const overlay = await page.$('#bnp_overlay_wrapper')
             if (overlay) {
-                await this.bot.utils.wait(this.bot.utils.humanClickDelay())
                 const rejected = await this.ghostClick(page, '#bnp_btn_reject, button[aria-label*="Reject" i]')
                 if (rejected) {
                     this.bot.logger.debug(this.bot.isMobile, 'DISMISS-ALL-MESSAGES', 'Dismissed: Bing Overlay Reject')
@@ -117,9 +114,9 @@ export default class BrowserUtils {
     async reloadBadPage(page: Page): Promise<boolean> {
         try {
             const html = await page.content().catch(() => '')
-            const $ = load(html)
+            const isBadPage = /<body[^>]*\bclass=["'][^"']*\bneterror\b/i.test(html)
 
-            if ($('body.neterror').length) {
+            if (isBadPage) {
                 this.bot.logger.info(this.bot.isMobile, 'RELOAD-BAD-PAGE', 'Bad page detected, reloading!')
                 try {
                     await page.reload({ waitUntil: 'load' })
@@ -182,7 +179,7 @@ export default class BrowserUtils {
                 const newTabPromises = Array.from({ length: tabsNeeded }, async () => {
                     try {
                         const newPage = await browser.newPage()
-                        await newPage.goto(this.bot.config.baseURL, { waitUntil: 'domcontentloaded', timeout: 15000 })
+                        await newPage.goto(REWARDS_BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 })
                         return newPage
                     } catch (error) {
                         this.bot.logger.warn(
@@ -209,12 +206,6 @@ export default class BrowserUtils {
         }
     }
 
-    async loadInCheerio(data: Page | string): Promise<CheerioAPI> {
-        const html: string = typeof data === 'string' ? data : await data.content()
-        const $ = load(html)
-        return $
-    }
-
     async ghostClick(page: Page, selector: string, options?: ClickOptions): Promise<boolean> {
         try {
             this.bot.logger.debug(
@@ -226,6 +217,8 @@ export default class BrowserUtils {
             // Wait for selector to exist before clicking
             await page.waitForSelector(selector, { timeout: 1000 }).catch(() => {})
 
+            // ghost-cursor expects its own Playwright Page type from a different
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const cursor = createCursor(page as any)
             await cursor.click(selector, options)
 
@@ -273,24 +266,5 @@ export default class BrowserUtils {
                 route.continue()
             }
         })
-    }
-
-    async wakePage(page: Page): Promise<boolean> {
-        try {
-            this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', 'Waking page by clicking dashboard heading')
-            
-            // Click only verified safe dashboard headings - exactly matching text
-            const result = await this.ghostClick(page, 'h1:has-text("Your perks"), h1:has-text("Earn rewards"), h2:has-text("Your perks"), h2:has-text("Earn rewards")')
-            
-            if (result) {
-                this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', 'Page woken successfully')
-                await this.bot.utils.wait(500)
-            }
-            
-            return result
-        } catch (error) {
-            this.bot.logger.debug(this.bot.isMobile, 'PAGE-WAKE', `Wake failed: ${error instanceof Error ? error.message : String(error)}`)
-            return false
-        }
     }
 }

@@ -2,7 +2,7 @@
     "compilerOptions": {
         /* Visit https://aka.ms/tsconfig.json to read more about this file */
         /* Basic Options */
-        "target": "ES2020" /* Specify ECMAScript target version: 'ES3' (default), 'ES5', 'ES2015', 'ES2016', 'ES2017', 'ES2018', 'ES2019', 'ES2020', 'ES2021', or 'ESNEXT'. */,
+        "target": "ES2022" /* Specify ECMAScript target version: 'ES3' (default), 'ES5', 'ES2015', 'ES2016', 'ES2017', 'ES2018', 'ES2019', 'ES2020', 'ES2021', or 'ESNEXT'. */,
         "module": "commonjs" /* Specify module code generation: 'none', 'commonjs', 'amd', 'system', 'umd', 'es2015', 'es2020', or 'ESNext'. */,
         // "lib": [], /* Specify library files to be included in the compilation. */
         // "allowJs": true,                             /* Allow javascript files to be compiled. */
@@ -40,6 +40,7 @@
         // "noPropertyAccessFromIndexSignature": true,  /* Require undeclared properties from index signatures to use element accesses. */
         /* Module Resolution Options */
         "moduleResolution": "node" /* Specify module resolution strategy: 'node' (Node.js) or 'classic' (TypeScript pre-1.6). */,
+        "ignoreDeprecations": "6.0",
         "types": ["node"],
         "typeRoots": ["./node_modules/@types"],
         // Keep explicit typeRoots to ensure resolution in environments that don't auto-detect before full install.

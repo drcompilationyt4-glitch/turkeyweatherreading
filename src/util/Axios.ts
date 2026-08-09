@@ -1,6 +1,9 @@
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios'
+// @ts-ignore - ESM-only package; Node resolves the root export at runtime
 import { HttpProxyAgent } from 'http-proxy-agent'
+// @ts-ignore - ESM-only package; Node resolves the root export at runtime
 import { HttpsProxyAgent } from 'https-proxy-agent'
+// @ts-ignore - ESM-only package; Node resolves the root export at runtime
 import { SocksProxyAgent } from 'socks-proxy-agent'
 import { AccountProxy } from '../interface/Account'
 

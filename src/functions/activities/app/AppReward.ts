@@ -1,4 +1,6 @@
-import type { AxiosRequestConfig } from 'axios'
+import { URLs } from '../../../constants/urls'
+import { BING_APP_USER_AGENT } from '../../../constants/userAgents'
+import type { HttpRequestConfig } from '../../../util/Http'
 import { randomUUID } from 'crypto'
 import type { Promotion } from '../../../interface/AppDashBoardData'
 import { Workers } from '../../Workers'
@@ -23,7 +25,7 @@ export class AppReward extends Workers {
         this.bot.logger.info(
             this.bot.isMobile,
             'APP-REWARD',
-            `Starting AppReward | offerId=${offerId} | country=${this.bot.userData.geoLocale} | oldBalance=${this.oldBalance}`
+            `Starting AppReward | offerId=${offerId} | country=${this.bot.userData.geoLocale} | currentBalance=${this.oldBalance}`
         )
 
         try {
@@ -43,16 +45,15 @@ export class AppReward extends Workers {
                 `Prepared activity payload | offerId=${offerId} | id=${jsonData.id} | amount=${jsonData.amount} | type=${jsonData.type} | country=${jsonData.country}`
             )
 
-            const request: AxiosRequestConfig = {
-                url: 'https://prod.rewardsplatform.microsoft.com/dapi/me/activities',
+            const request: HttpRequestConfig = {
+                url: URLs.platform.activities,
                 method: 'POST',
                 headers: {
                     Authorization: `Bearer ${this.bot.accessToken}`,
-                    'User-Agent':
-                        'Bing/32.5.431027001 (com.microsoft.bing; build:431027001; iOS 17.6.1) Alamofire/5.10.2',
+                    'User-Agent': BING_APP_USER_AGENT,
                     'Content-Type': 'application/json',
                     'X-Rewards-Country': this.bot.userData.geoLocale,
-                    'X-Rewards-Language': 'en',
+                    'X-Rewards-Language': this.bot.userData.langCode,
                     'X-Rewards-ismobile': 'true'
                 },
                 data: JSON.stringify(jsonData)
@@ -64,7 +65,7 @@ export class AppReward extends Workers {
                 `Sending activity request | offerId=${offerId} | url=${request.url}`
             )
 
-            const response = await this.bot.axios.request(request)
+            const response = await this.bot.http.request<{ response?: { balance?: number } }>(request)
 
             this.bot.logger.debug(
                 this.bot.isMobile,
@@ -78,7 +79,7 @@ export class AppReward extends Workers {
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'APP-REWARD',
-                `Balance delta after AppReward | offerId=${offerId} | oldBalance=${this.oldBalance} | newBalance=${newBalance} | gainedPoints=${this.gainedPoints}`
+                `Balance delta after AppReward | offerId=${offerId} | previousBalance=${this.oldBalance} | currentBalance=${newBalance} | pointsGained=${this.gainedPoints}`
             )
 
             if (this.gainedPoints > 0) {
@@ -88,14 +89,14 @@ export class AppReward extends Workers {
                 this.bot.logger.info(
                     this.bot.isMobile,
                     'APP-REWARD',
-                    `Completed AppReward | offerId=${offerId} | gainedPoints=${this.gainedPoints} | oldBalance=${this.oldBalance} | newBalance=${newBalance}`,
+                    `Completed AppReward | offerId=${offerId} | pointsGained=${this.gainedPoints} | currentBalance=${newBalance}`,
                     'green'
                 )
             } else {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'APP-REWARD',
-                    `Completed AppReward with no points | offerId=${offerId} | oldBalance=${this.oldBalance} | newBalance=${newBalance}`
+                    `Completed AppReward with no points | offerId=${offerId} | pointsGained=0 | currentBalance=${newBalance}`
                 )
             }
 
@@ -106,7 +107,7 @@ export class AppReward extends Workers {
             this.bot.logger.info(
                 this.bot.isMobile,
                 'APP-REWARD',
-                `Finished AppReward | offerId=${offerId} | finalBalance=${this.bot.userData.currentPoints}`
+                `Finished AppReward | offerId=${offerId} | currentBalance=${this.bot.userData.currentPoints}`
             )
         } catch (error) {
             this.bot.logger.error(

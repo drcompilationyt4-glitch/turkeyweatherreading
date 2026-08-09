@@ -1,300 +1,171 @@
-import axios from 'axios'
-import { randomInt } from 'crypto'
 import type { Page } from 'patchright'
-import * as fs from 'fs'
-import path from 'path'
-
 import { Workers } from '../../Workers'
-import { QueryCore } from '../../QueryEngine'
+import { activateSearchOnBing, findSearchOnBingOffer, getSearchOnBingQueries } from '../SearchOnBingShared'
+import { URLs } from '../../../constants/urls'
 
 import type { BasePromotion } from '../../../interface/DashboardData'
 
 export class SearchOnBing extends Workers {
-
-    private gainedPoints: number = 0
-    private success: boolean = false
-    private oldBalance: number = this.bot.userData.currentPoints
-
-    // Model configuration with weights
-    private readonly modelConfig = [
-        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'minimax/minimax-m2.5:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'nvidia/nemotron-nano-12b-v2-vl:free', weight: 1 / 4, supportsReasoning: false },
-    ]
+    private gainedPoints = 0
+    private success = false
+    private oldBalance = 0
 
     public async doSearchOnBing(promotion: BasePromotion, page: Page) {
+        const offerId = promotion.offerId
         this.oldBalance = Number(this.bot.userData.currentPoints ?? 0)
+        this.gainedPoints = 0
+        this.success = false
 
         this.bot.logger.info(
             this.bot.isMobile,
             'SEARCH-ON-BING',
-            `Starting SearchOnBing | ${promotion.title}`
+            `Starting SearchOnBing | offerId=${offerId} | title="${promotion.title}" | currentBalance=${this.oldBalance}`
         )
 
         try {
-            const queries = await this.getSearchQueries(promotion)
-            await this.searchBing(page, queries)
+            const activated = await activateSearchOnBing(this.bot, promotion)
+            if (!activated) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'SEARCH-ON-BING',
+                    `Search activity couldn't be activated, aborting | offerId=${offerId}`
+                )
+                return
+            }
+
+            const queries = await getSearchOnBingQueries(this.bot, promotion)
+            await this.searchBing(page, queries, promotion)
 
             if (this.success) {
                 this.bot.logger.info(
                     this.bot.isMobile,
                     'SEARCH-ON-BING',
-                    `Completed | gained=${this.gainedPoints}`
+                    `Completed SearchOnBing | offerId=${offerId} | pointsGained=${this.gainedPoints} | currentBalance=${this.bot.userData.currentPoints} | previousBalance=${this.oldBalance}`,
+                    'green'
+                )
+            } else {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'SEARCH-ON-BING',
+                    `Failed SearchOnBing | offerId=${offerId} | pointsGained=${this.gainedPoints} | currentBalance=${this.bot.userData.currentPoints} | previousBalance=${this.oldBalance}`
                 )
             }
         } catch (error) {
             this.bot.logger.error(
                 this.bot.isMobile,
                 'SEARCH-ON-BING',
-                `Error: ${error}`
+                `Error in doSearchOnBing | offerId=${offerId} | message=${error instanceof Error ? error.message : String(error)}`
             )
+        } finally {
+            await page.goto(URLs.rewards.earn).catch(() => {})
         }
     }
 
-    private async searchBing(page: Page, queries: string[]) {
+    private async searchBing(page: Page, queries: string[], promotion: BasePromotion) {
         queries = [...new Set(queries)]
+        const offerId = promotion.offerId
+
+        this.bot.logger.debug(
+            this.bot.isMobile,
+            'SEARCH-ON-BING-SEARCH',
+            `Starting search loop | queriesCount=${queries.length} | targetPoints=${promotion.pointProgressMax} | currentBalance=${this.oldBalance}`
+        )
+
+        await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-ON-BING-COOKIE-SEED', true)
+        await this.ensureSearchReady(page)
+
+        let lastBalance = this.oldBalance
+        let i = 0
 
         for (const query of queries) {
             try {
-                this.bot.logger.info(
+                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING-SEARCH', `Processing query | query="${query}"`)
+
+                await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-ON-BING-COOKIE-SEED', true)
+                await this.typeSearch(page, query)
+
+                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 7000))
+
+                await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-ON-BING-COOKIE-CAPTURE')
+                const dashboard = (await this.bot.browser.func.getDashboardData()).dashboard
+                const newBalance = dashboard.userStatus.availablePoints
+                const offer = findSearchOnBingOffer(dashboard, offerId)
+
+                const delta = newBalance - lastBalance
+                if (delta > 0) {
+                    this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + delta
+                    lastBalance = newBalance
+                }
+                this.bot.userData.currentPoints = newBalance
+                this.gainedPoints = newBalance - this.oldBalance
+
+                const offerProgress = offer ? `${offer.pointProgress}/${offer.pointProgressMax}` : 'unknown'
+                const offerComplete =
+                    !!offer &&
+                    (offer.complete || (offer.pointProgressMax > 0 && offer.pointProgress >= offer.pointProgressMax))
+
+                this.bot.logger.debug(
                     this.bot.isMobile,
-                    'SEARCH-ON-BING',
-                    `Searching for: "${query}"`
+                    'SEARCH-ON-BING-SEARCH',
+                    `Progress check | query="${query}" | offerProgress=${offerProgress} | offerComplete=${offerComplete} | currentBalance=${newBalance}`
                 )
 
-                // ✅ Go to Bing homepage first
-                await page.goto('https://bing.com', { waitUntil: 'domcontentloaded' }).catch(() => {})
-                await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-
-                await this.bot.browser.utils.tryDismissAllMessages(page)
-
-                // ✅ USE ALT+D THAT ALWAYS WORKS!
-                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Pressing Alt + D')
-                await page.keyboard.press('Alt+D')
-                await this.bot.utils.wait(500)
-
-                // Fallback: try Ctrl+L if Alt+D didn't work
-                try {
-                    const isFocused = await page.evaluate(() => document.activeElement?.tagName === 'INPUT')
-                    if (!isFocused) {
-                        this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Fallback: Pressing Ctrl + L')
-                        await page.keyboard.press('Control+L')
-                        await this.bot.utils.wait(500)
-                    }
-                } catch {}
-
-                // ✅ Type query human like
-                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Typing query...')
-                await page.keyboard.type(query, {
-                    delay: this.bot.utils.randomDelay(60, 120)
-                })
-
-                await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-                // ✅ Press Enter
-                this.bot.logger.debug(this.bot.isMobile, 'SEARCH-ON-BING', 'Pressing Enter')
-                await page.keyboard.press('Enter')
-
-                await page.waitForLoadState('domcontentloaded').catch(() => {})
-                await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-
-                await this.bot.browser.utils.tryDismissAllMessages(page)
-
-                const newBalance = await this.bot.browser.func.getCurrentPoints()
-                const gained = newBalance - this.oldBalance
-
-                if (gained > 0) {
-                    this.gainedPoints = gained
-                    this.bot.userData.currentPoints = newBalance
+                if (offerComplete) {
                     this.success = true
+                    this.bot.logger.info(
+                        this.bot.isMobile,
+                        'SEARCH-ON-BING-SEARCH',
+                        `SearchOnBing activity completed | pointsGained=${this.gainedPoints} | currentBalance=${newBalance} | query="${query}" | offerProgress=${offerProgress}`,
+                        'green'
+                    )
                     return
                 }
-            } catch (err) {
+
                 this.bot.logger.warn(
                     this.bot.isMobile,
-                    'SEARCH-ON-BING',
-                    `Query failed: ${query}`
+                    'SEARCH-ON-BING-SEARCH',
+                    `${++i}/${queries.length} | activity not complete | offerProgress=${offerProgress} | query="${query}"`
                 )
+            } catch (error) {
+                this.bot.logger.error(
+                    this.bot.isMobile,
+                    'SEARCH-ON-BING-SEARCH',
+                    `Error during search loop | query="${query}" | message=${error instanceof Error ? error.message : String(error)}`
+                )
+            } finally {
+                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 15000))
             }
-
-            await this.bot.utils.wait(this.bot.utils.randomDelay(4000, 9000))
         }
+
+        this.bot.logger.warn(
+            this.bot.isMobile,
+            'SEARCH-ON-BING-SEARCH',
+            `Finished all queries without completing the activity | queriesTried=${queries.length} | offerId=${offerId} | pointsGained=${this.gainedPoints} | currentBalance=${this.bot.userData.currentPoints} | previousBalance=${this.oldBalance}`
+        )
     }
 
-    // 🔥 UPDATED: Hybrid Query System
-    private async getSearchQueries(promotion: BasePromotion): Promise<string[]> {
-        interface Queries {
-            title: string
-            queries: string[]
-        }
+    private async ensureSearchReady(page: Page) {
+        const searchBox = page.locator('#sb_form_q')
+        if (await searchBox.isVisible().catch(() => false)) return
 
-        let queries: Queries[] = []
-        let originalQuery = promotion.title
-
-        try {
-            // -----------------------------
-            // LOAD ORIGINAL QUERY
-            // -----------------------------
-            if (this.bot.config.searchOnBingLocalQueries) {
-                const data = fs.readFileSync(
-                    path.join(__dirname, '../../bing-search-activity-queries.json'),
-                    'utf8'
-                )
-                queries = JSON.parse(data)
-            } else {
-                const response = await this.bot.axios.request({
-                    method: 'GET',
-                    url: 'https://raw.githubusercontent.com/TheNetsky/Microsoft-Rewards-Script/refs/heads/v3/src/functions/bing-search-activity-queries.json'
-                })
-                queries = response.data
-            }
-
-            const match = queries.find(
-                x => this.bot.utils.normalizeString(x.title) ===
-                     this.bot.utils.normalizeString(promotion.title)
-            )
-
-            if (match && match.queries.length > 0) {
-                originalQuery = this.bot.utils.shuffleArray(match.queries)[0]!
-            } else {
-                // ✅ WHEN QUERY NOT FOUND LOCALLY: USE LLM DIRECTLY
-                const apiKey = process.env.OPENROUTER_API_KEY 
-                if (apiKey) {
-                    this.bot.logger.info(this.bot.isMobile, 'SEARCH-ON-BING', `No local query found, requesting from LLM: ${promotion.title}`)
-                    const llmResult = await this.callLLM(promotion.title, promotion.description || '', promotion.title, apiKey)
-                    if (llmResult) {
-                        originalQuery = llmResult
-                    } else {
-                        // Fallback to suggestion system if LLM fails
-                        const queryCore = new QueryCore(this.bot)
-                        const desc = promotion.description?.toLowerCase().replace('search on bing', '').trim() || ''
-                        const suggestions = await queryCore.getBingSuggestions(desc)
-                        if (suggestions.length) {
-                            originalQuery = this.bot.utils.shuffleArray(suggestions)[0]!
-                        }
-                    }
-                } else {
-                    // No API key, use original suggestion system
-                    const queryCore = new QueryCore(this.bot)
-                    const desc = promotion.description?.toLowerCase().replace('search on bing', '').trim() || ''
-                    const suggestions = await queryCore.getBingSuggestions(desc)
-                    if (suggestions.length) {
-                        originalQuery = this.bot.utils.shuffleArray(suggestions)[0]!
-                    }
-                }
-            }
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'SEARCH-QUERY',
-                `Original: ${originalQuery}`
-            )
-
-            // -----------------------------
-            // LLM PART
-            // -----------------------------
-            let llmQuery: string | null = null
-
-            const apiKey =
-                process.env.OPENROUTER_API_KEY 
-
-            if (apiKey) {
-                llmQuery = await this.callLLM(
-                    promotion.title,
-                    promotion.description || '',
-                    originalQuery,
-                    apiKey
-                )
-            }
-
-            // -----------------------------
-            // 60/40 DECISION
-            // -----------------------------
-            const useLLM = llmQuery && randomInt(0, 100) < 60
-            const finalQuery = useLLM ? llmQuery! : originalQuery
-
-            this.bot.logger.info(
-                this.bot.isMobile,
-                'SEARCH-QUERY',
-                `Final (${useLLM ? 'LLM' : 'ORIGINAL'}): ${finalQuery}`
-            )
-
-            return [finalQuery]
-
-        } catch (error) {
-            this.bot.logger.error(
-                this.bot.isMobile,
-                'SEARCH-QUERY',
-                `Error: ${error}`
-            )
-            return [promotion.title]
-        }
+        await page.goto(URLs.bing.origin)
+        await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
+        await this.bot.browser.utils.tryDismissAllMessages(page)
     }
 
-    private selectRandomModel(): { name: string, supportsReasoning: boolean } {
-        const random = randomInt(0, 1000000) / 1000000
-        let cumulativeWeight = 0
-        for (const model of this.modelConfig) {
-            cumulativeWeight += model.weight
-            if (random <= cumulativeWeight) {
-                return { name: model.name, supportsReasoning: model.supportsReasoning }
-            }
-        }
-        return this.modelConfig[0]!
-    }
+    private async typeSearch(page: Page, query: string) {
+        await this.ensureSearchReady(page)
 
-    // 🔥 CLEAN LLM CALL
-    private async callLLM(
-        title: string,
-        description: string,
-        originalQuery: string,
-        apiKey: string
-    ): Promise<string | null> {
-        try {
-            const client = axios.create({
-                baseURL: 'https://openrouter.ai/api/v1',
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
-                },
-                proxy: false,
-                timeout: 20000
-            })
+        const selector = '#sb_form_q'
+        const searchBox = page.locator(selector)
+        await searchBox.waitFor({ state: 'visible', timeout: 15000 })
 
-            const selectedModel = this.selectRandomModel()
+        await this.bot.utils.wait(500)
+        await this.bot.browser.utils.ghostClick(page, selector, { clickCount: 3 })
+        await searchBox.fill('')
 
-            const prompt = `
-Generate a natural Bing search query.
-
-Title: "${title}"
-Description: "${description}"
-Original query: "${originalQuery}"
-
-Improve it to sound human.
-2-8 words only.
-Return ONLY the query.
-`
-
-            const res = await client.post('/chat/completions', {
-                model: selectedModel.name,
-                messages: [{ role: 'user', content: prompt }],
-                temperature: 0.3,
-                max_tokens: 50
-            })
-
-            const text = res.data?.choices?.[0]?.message?.content?.trim()
-            if (!text) return null
-
-            return text.split('\n')[0].trim()
-
-        } catch (err) {
-            this.bot.logger.warn(
-                this.bot.isMobile,
-                'LLM',
-                `Failed: ${err}`
-            )
-            return null
-        }
+        await page.keyboard.type(query, { delay: this.bot.utils.randomDelay(45, 90) })
+        await page.keyboard.press('Enter')
+        await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
     }
 }

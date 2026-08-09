@@ -1,1144 +1,508 @@
-import type { Page } from 'patchright'
+import { URLs } from '../constants/urls'
 import type { MicrosoftRewardsBot } from '../index'
-import type { DashboardData, PunchCard } from '../interface/DashboardData'
+import type { DashboardData, PunchCard, BasePromotion } from '../interface/DashboardData'
+import type { AppDashboardData } from '../interface/AppDashBoardData'
+import type { QuestChild, ParentQuest } from '../browser/ReactFunc'
 
 export class Workers {
-    protected bot: MicrosoftRewardsBot
+    public bot: MicrosoftRewardsBot
 
     constructor(bot: MicrosoftRewardsBot) {
         this.bot = bot
     }
 
-    public async doDailySet(data: DashboardData, page: Page) {
-        // V4 MODERN UI LOGIC
-        if (this.bot.rewardsVersion === 'modern' && (data as any).v4Data) {
-            this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Using Modern UI (V4) detection logic')
-            const v4Data = (data as any).v4Data
+    public async doDailySet(data: DashboardData) {
+        const todayKey = this.bot.utils.getFormattedDate()
+        const todayData = data.dashboard.dailySetPromotions[todayKey]
 
-            // Also try to get data from /earn page for additional activities
-            let earnPageData = null
-            try {
-                await page
-                    .goto('https://rewards.bing.com/earn', { waitUntil: 'networkidle', timeout: 15000 })
-                    .catch(() => { })
-                await this.bot.browser.utils.wakePage(page)
-                const earnHtml = await page.content()
-                const earnNextData = this.bot.nextParser.parse(earnHtml)
-                if (earnNextData.length > 0) {
-                    earnPageData = earnNextData
-                    this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Fetched additional data from /earn page')
-                }
-            } catch {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Could not fetch /earn page data')
+        let activitiesUncompleted: BasePromotion[] = todayData?.filter(x => !x?.complete && x.pointProgressMax > 0) ?? []
+
+        // Backup for the modern (V4) dashboard: when the HTTP API doesn't surface
+        // any daily-set offers, parse today's items from the /earn RSC payload.
+        if (!activitiesUncompleted.length) {
+            const rscBackup = await this.fetchRscDailySetBackup(todayKey)
+            if (rscBackup.length) {
+                activitiesUncompleted = rscBackup
             }
+        }
 
-            // Combine both sources of data
-            const combinedData = earnPageData ? [...v4Data, ...earnPageData] : v4Data
-
-            // Get today's date in MM/DD/YYYY format
-            const today = new Date()
-            const todayStr = `${String(today.getMonth() + 1).padStart(2, '0')}/${String(today.getDate()).padStart(2, '0')}/${today.getFullYear()}`
-
-            const dailySetItems = this.bot.nextParser.find(combinedData, 'dailySetItems') ?? []
-            const todayItems = dailySetItems.filter((x: any) => x.date === todayStr)
-            const uncompleted = todayItems.filter((x: any) => !x.isCompleted && x.points > 0)
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'DAILY-SET',
-                `Date: ${todayStr}, Found ${dailySetItems.length} total items, ${todayItems.length} for today, ${uncompleted.length} uncompleted`
-            )
-
-            if (uncompleted.length === 0 && dailySetItems.length > 0) {
-                const allUncompleted = dailySetItems.filter((x: any) => !x.isCompleted && x.points > 0)
-                if (allUncompleted.length > 0) {
-                    this.bot.logger.info(
-                        this.bot.isMobile,
-                        'DAILY-SET',
-                        `Found ${allUncompleted.length} uncompleted items (any date)`
-                    )
-
-                    const mapped = allUncompleted.map((x: any) => ({
-                        title: x.title || 'Unknown Title',
-                        offerId: x.offerId || 'Unknown ID',
-                        destination: x.destination || x.destinationUrl,
-                        hash: x.hash || '',
-                        type: x.type || x.activityType || '',
-                        complete: false,
-                        pointProgressMax: x.points || x.pointProgressMax || 0
-                    }))
-
-                    await this.solveActivities(mapped, page, undefined, 'dailySet')
-                    return
-                }
-            }
-
-            if (uncompleted.length) {
-                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', `Solving ${uncompleted.length} modern items`)
-                const mapped = uncompleted.map((x: any) => ({
-                    title: x.title || 'Unknown Title',
-                    offerId: x.offerId || 'Unknown ID',
-                    destination: x.destination || x.destinationUrl,
-                    hash: x.hash || '',
-                    type: x.type || x.activityType || '',
-                    complete: false,
-                    pointProgressMax: x.points || x.pointProgressMax || 0
-                }))
-                await this.solveActivities(mapped, page, undefined, 'dailySet')
-            } else {
-                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'All modern daily items already completed')
-            }
+        if (!activitiesUncompleted.length) {
+            this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'All "Daily Set" items have already been completed')
             return
         }
 
-        // V3 LEGACY LOGIC
-        this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Using Legacy UI (V3) detection logic')
-        const todayKey = this.bot.utils.getFormattedDate()
-        const todayData = data.dailySetPromotions?.[todayKey] ?? []
-        const activitiesUncompleted = todayData.filter(x => !x?.complete && x.pointProgressMax > 0)
+        this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Started solving "Daily Set" items')
 
-        if (activitiesUncompleted.length > 0) {
-            this.bot.logger.info(
-                this.bot.isMobile,
-                'DAILY-SET',
-                `Found ${activitiesUncompleted.length} uncompleted items`
-            )
-            await this.solveActivities(activitiesUncompleted, page, undefined, 'dailySet')
-        }
+        await this.solveActivities(activitiesUncompleted)
+
+        this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'All "Daily Set" items have been completed')
     }
 
-    public async doMorePromotions(data: DashboardData, page: Page) {
-        // V4 MODERN UI LOGIC
-        if (this.bot.rewardsVersion === 'modern' && (data as any).v4Data) {
-            this.bot.logger.debug(this.bot.isMobile, 'MORE-PROMOTIONS', 'Using Modern UI (V4) detection logic')
-            const v4Data = (data as any).v4Data
+    // Modern-dashboard backup: pulls `dailySetItems` from the /earn RSC payload
+    // (self.__next_f chunks) and maps them to the shape the activity solvers use.
+    private async fetchRscDailySetBackup(todayKey: string): Promise<BasePromotion[]> {
+        try {
+            const earn = await this.bot.browser.func.getRewardsPageHtml(URLs.rewards.earn, '/earn')
+            if (!earn) return []
 
-            // Also try to get data from /earn page for "Keep earning" activities
-            let earnPageData = null
-            try {
-                await page
-                    .goto('https://rewards.bing.com/earn', { waitUntil: 'networkidle', timeout: 15000 })
-                    .catch(() => { })
-                await this.bot.browser.utils.wakePage(page)
-                const earnHtml = await page.content()
-                const earnNextData = this.bot.nextParser.parse(earnHtml)
-                if (earnNextData.length > 0) {
-                    earnPageData = earnNextData
-                    this.bot.logger.debug(
-                        this.bot.isMobile,
-                        'MORE-PROMOTIONS',
-                        'Fetched /earn page data for Keep earning'
-                    )
-                }
-            } catch {
-                this.bot.logger.debug(this.bot.isMobile, 'MORE-PROMOTIONS', 'Could not fetch /earn page data')
-            }
+            const parsed = this.bot.nextParser.parse(earn)
+            const dailySetItems = this.bot.nextParser.find(parsed, 'dailySetItems')
+            if (!Array.isArray(dailySetItems) || !dailySetItems.length) return []
 
-            const combinedData = earnPageData ? [...v4Data, ...earnPageData] : v4Data
-
-            const allWithOfferId = this.findAllWithOfferId(combinedData)
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'MORE-PROMOTIONS',
-                `Found ${allWithOfferId.length} items with offerId in Next.js data`
-            )
-
-            let moreActivities = this.bot.nextParser.find(combinedData, 'moreActivities') ?? []
-            if (!moreActivities.length) {
-                moreActivities =
-                    this.bot.nextParser.find(combinedData, 'moreActivities') ??
-                    this.bot.nextParser.find(combinedData, 'more_activity') ??
-                    allWithOfferId.filter((x: any) => x.destination && !x.isCompleted)
-            }
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'MORE-PROMOTIONS',
-                `Found ${moreActivities.length} moreActivities items`
-            )
-
-            const panelDataRaw = this.bot.panelData as any
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'MORE-PROMOTIONS',
-                `Panel data keys: ${panelDataRaw ? Object.keys(panelDataRaw).join(', ') : 'undefined'}`
-            )
-
-            const userInfoData = panelDataRaw?.userInfo
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'MORE-PROMOTIONS',
-                `UserInfo keys: ${userInfoData ? Object.keys(userInfoData).join(', ') : 'undefined'}`
-            )
-
-            let panelFlyoutPromos: any[] = []
-
-            if (panelDataRaw?.flyoutResult?.morePromotions) {
-                panelFlyoutPromos = panelDataRaw.flyoutResult.morePromotions
-                this.bot.logger.debug(
-                    this.bot.isMobile,
-                    'MORE-PROMOTIONS',
-                    `Found ${panelFlyoutPromos.length} items in flyoutResult.morePromotions`
-                )
-            }
-
-            if (userInfoData?.promotions) {
-                const userInfoPromos = userInfoData.promotions
-
-                const transformedPromos = userInfoPromos.map((p: any) => {
-                    const attrs = p.attributes || {}
-                    const isComplete = attrs.complete === 'True' || attrs.complete === true
-                    return {
-                        title: attrs.title || p.name || 'Unknown Title',
-                        offerId: attrs.offerid || p.name || 'Unknown ID',
-                        destination: attrs.destination || '',
-                        complete: isComplete,
-                        isCompleted: isComplete,
-                        points: parseInt(attrs.max) || 0,
-                        pointProgressMax: parseInt(attrs.max) || 0,
-                        activityType: 0
+            const items = (dailySetItems as Array<Record<string, unknown>>)
+                .filter(item => String(item.date ?? '') === todayKey && !item.isCompleted && Number(item.points ?? 0) > 0)
+                .map(
+                    (item): BasePromotion => {
+                        const title = String(item.title ?? 'Unknown title')
+                        const rawType = String(item.type ?? item.activityType ?? '').toLowerCase()
+                        return {
+                            title,
+                            name: title.toLowerCase(),
+                            offerId: String(item.offerId ?? ''),
+                            promotionType: rawType === 'quiz' ? 'quiz' : 'urlreward',
+                            destinationUrl: String(item.destination ?? item.destinationUrl ?? ''),
+                            hash: String(item.hash ?? ''),
+                            complete: false,
+                            pointProgressMax: Number(item.points ?? item.pointProgressMax ?? 0),
+                            activityProgressMax: Number(item.activityProgressMax ?? 0),
+                            activityType: Number(item.activityType ?? 0)
+                        } as unknown as BasePromotion
                     }
-                })
-
-                const existingIds = new Set(panelFlyoutPromos.map((p: any) => p.offerId))
-                const newPromos = transformedPromos.filter((p: any) => !existingIds.has(p.offerId))
-                panelFlyoutPromos = [...panelFlyoutPromos, ...newPromos]
-
-                this.bot.logger.debug(
-                    this.bot.isMobile,
-                    'MORE-PROMOTIONS',
-                    `Combined ${panelFlyoutPromos.length} items from flyoutResult + userInfo.promotions`
                 )
-            }
+                .filter(p => p.offerId)
 
-            const panelUncompleted = panelFlyoutPromos
-                .filter((p: any) => !p.isCompleted && !p.complete && p.offerId)
-                .map((p: any) => ({
-                    title: p.title || 'Unknown Title',
-                    offerId: p.offerId || p.name || 'Unknown ID',
-                    destination: p.destinationUrl || p.destination || '',
-                    hash: p.hash || '',
-                    complete: false,
-                    pointProgressMax: p.points || p.pointProgressMax || 0,
-                    activityType: p.activityType || 0,
-                    isLocked: false
-                }))
-
-            if (panelUncompleted.length) {
-                this.bot.logger.debug(
-                    this.bot.isMobile,
-                    'MORE-PROMOTIONS',
-                    `Panel flyout items to solve: ${panelUncompleted.map((m: any) => `${m.title} (${m.offerId})`).join(', ')}`
-                )
-            }
-
-            const mappedMoreActivities = moreActivities
-                .filter((x: any) => !x.isLocked && x.points > 0)
-                .filter((x: any) => !x.isCompleted)
-                .map((x: any) => ({
-                    title: x.title || 'Unknown Title',
-                    offerId: x.offerId || 'Unknown ID',
-                    destination: x.destination || x.destinationUrl,
-                    hash: x.hash || '',
-                    complete: false,
-                    pointProgressMax: x.points || x.pointProgressMax || 0,
-                    activityType: x.activityType || 0,
-                    isLocked: x.isLocked || false
-                }))
-
-            const allUncompleted = [...mappedMoreActivities, ...panelUncompleted]
-
-            if (allUncompleted.length) {
+            if (items.length) {
                 this.bot.logger.info(
                     this.bot.isMobile,
-                    'MORE-PROMOTIONS',
-                    `Solving ${allUncompleted.length} modern items`
+                    'DAILY-SET',
+                    `Fetched ${items.length} daily set items from /earn RSC payload`
                 )
-                await this.solveActivities(allUncompleted, page, undefined, 'morePromotions')
-            } else {
-                this.bot.logger.info(this.bot.isMobile, 'MORE-PROMOTIONS', 'All modern more items already completed')
             }
-            return
+            return items
+        } catch (error) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'DAILY-SET',
+                `RSC daily set backup failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+            return []
         }
+    }
 
-        // V3 LEGACY LOGIC
-        this.bot.logger.debug(this.bot.isMobile, 'MORE-PROMOTIONS', 'Using Legacy UI (V3) detection logic')
-        const morePromotions = data.morePromotions ?? []
-        const activitiesUncompleted = morePromotions.filter(x => !x?.complete && x.pointProgressMax > 0)
+    public async doMorePromotions(data: DashboardData) {
+        const morePromotions: BasePromotion[] = [
+            ...new Map(
+                [
+                    ...(data.dashboard.morePromotions ?? []),
+                    ...(data.dashboard.morePromotionsWithoutPromotionalItems ?? [])
+                ]
+                    .filter(Boolean)
+                    .map(p => [p.offerId, p as BasePromotion] as const)
+            ).values()
+        ]
 
-        if (activitiesUncompleted.length > 0) {
+        const activitiesUncompleted: BasePromotion[] =
+            morePromotions?.filter(x => {
+                if (x.complete) return false
+                if (x.pointProgressMax <= 0) return false
+                if (x.exclusiveLockedFeatureStatus === 'locked') return false
+                if (!x.promotionType) return false
+                if (x.priority < 0 && x.exclusiveLockedFeatureStatus !== 'unlocked') return false
+                if (this.getPromotionAttribute(x, 'promotional') === 'True') return false
+                return true
+            }) ?? []
+
+        if (!activitiesUncompleted.length) {
             this.bot.logger.info(
                 this.bot.isMobile,
                 'MORE-PROMOTIONS',
-                `Found ${activitiesUncompleted.length} uncompleted items`
+                'All "More Promotion" items have already been completed'
             )
-            await this.solveActivities(activitiesUncompleted as any, page, undefined, 'morePromotions')
+            return
         }
-    }
 
-    public async doAppPromotions(data: any) { }
-
-    private findAllWithOfferId(data: any, results: any[] = []): any[] {
-        if (!data) return results
-        if (Array.isArray(data)) {
-            for (const item of data) {
-                this.findAllWithOfferId(item, results)
-            }
-        } else if (typeof data === 'object') {
-            if (data.offerId && data.destination) {
-                results.push(data)
-            }
-            for (const key in data) {
-                this.findAllWithOfferId(data[key], results)
-            }
-        }
-        return results
-    }
-
-    private async clickBestMatchingTextOnPage(
-        page: Page,
-        title: string,
-        minScore = 0.7
-    ): Promise<{ clicked: boolean; score: number; text: string }> {
-        return await page.evaluate(
-            ({ title, minScore }) => {
-                const normalize = (value: string) =>
-                    (value ?? '')
-                        .replace(/[\u200B-\u200D\uFEFF]/g, '') // zero-width chars
-                        .replace(/[^a-z0-9]+/gi, ' ')
-                        .toLowerCase()
-                        .replace(/\s+/g, ' ')
-                        .trim()
-
-                const levenshtein = (a: string, b: string) => {
-                    const m = a.length
-                    const n = b.length
-
-                    if (m === 0) return n
-                    if (n === 0) return m
-
-                    const dp = new Array(n + 1)
-                    for (let j = 0; j <= n; j++) dp[j] = j
-
-                    for (let i = 1; i <= m; i++) {
-                        let prev = dp[0]
-                        dp[0] = i
-
-                        for (let j = 1; j <= n; j++) {
-                            const temp = dp[j]
-                            const cost = a[i - 1] === b[j - 1] ? 0 : 1
-                            dp[j] = Math.min(
-                                dp[j] + 1,
-                                dp[j - 1] + 1,
-                                prev + cost
-                            )
-                            prev = temp
-                        }
-                    }
-
-                    return dp[n]
-                }
-
-                const similarity = (a: string, b: string) => {
-                    const left = normalize(a)
-                    const right = normalize(b)
-
-                    if (!left || !right) return 0
-                    if (left === right) return 1
-
-                    if (left.includes(right) || right.includes(left)) {
-                        const shorter = Math.min(left.length, right.length)
-                        const longer = Math.max(left.length, right.length)
-                        return Math.max(0.7, shorter / longer)
-                    }
-
-                    const distance = levenshtein(left, right)
-                    return 1 - distance / Math.max(left.length, right.length)
-                }
-
-                const isVisibleInViewport = (el: Element) => {
-                    const node = el as HTMLElement
-                    const style = window.getComputedStyle(node)
-                    if (
-                        style.display === 'none' ||
-                        style.visibility === 'hidden' ||
-                        style.opacity === '0'
-                    ) {
-                        return false
-                    }
-
-                    const rect = node.getBoundingClientRect()
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        rect.top >= 0 &&
-                        rect.left >= 0 &&
-                        rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-                        rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-                    )
-                }
-
-                const nearestClickableAncestor = (el: Element) => {
-                    let current: Element | null = el
-                    let depth = 0
-
-                    while (current && depth < 6) {
-                        const tag = current.tagName?.toLowerCase()
-                        const node = current as HTMLElement
-
-                        if (
-                            tag === 'a' ||
-                            tag === 'button' ||
-                            node.getAttribute('role') === 'button' ||
-                            node.hasAttribute('onclick') ||
-                            node.hasAttribute('tabindex')
-                        ) {
-                            return current
-                        }
-
-                        current = current.parentElement
-                        depth++
-                    }
-
-                    return el
-                }
-
-                const target = normalize(title)
-                if (!target) {
-                    return { clicked: false, score: 0, text: '' }
-                }
-
-                const candidates: Array<{ el: Element; score: number; text: string }> = []
-
-                for (const el of Array.from(document.querySelectorAll('body *'))) {
-                    if (!isVisibleInViewport(el)) continue
-
-                    const rawText = (el as HTMLElement).innerText || el.textContent || ''
-                    const text = normalize(rawText)
-                    if (!text) continue
-
-                    const score = similarity(text, target)
-                    if (score >= minScore) {
-                        candidates.push({ el, score, text })
-                    }
-                }
-
-                candidates.sort((a, b) => {
-                    if (b.score !== a.score) return b.score - a.score
-                    return a.text.length - b.text.length
-                })
-
-                const best = candidates[0]
-                if (!best) {
-                    return { clicked: false, score: 0, text: '' }
-                }
-
-                const clickTarget = nearestClickableAncestor(best.el) as HTMLElement
-
-                clickTarget.scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                })
-
-                try {
-                    clickTarget.click()
-                } catch {
-                    const rect = clickTarget.getBoundingClientRect()
-                    const x = rect.left + rect.width / 2
-                    const y = rect.top + rect.height / 2
-                    const elAtPoint = document.elementFromPoint(x, y) as HTMLElement | null
-                    elAtPoint?.click()
-                }
-
-                return { clicked: true, score: best.score, text: best.text }
-            },
-            { title, minScore }
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'MORE-PROMOTIONS',
+            `Started solving ${activitiesUncompleted.length} "More Promotions" items`
         )
+
+        await this.solveActivities(activitiesUncompleted)
+
+        this.bot.logger.info(this.bot.isMobile, 'MORE-PROMOTIONS', 'All "More Promotion" items have been completed')
     }
 
-    protected async solveActivities(
-        activities: any[],
-        page: Page,
-        punchCard?: PunchCard,
-        context: 'dailySet' | 'morePromotions' | 'punchCard' | 'other' = 'other'
-    ) {
-        const isDailySetContext = context === 'dailySet'
+    public async doAppPromotions(data: AppDashboardData) {
+        const appRewards = data.response.promotions.filter(x => {
+            if (x.attributes['complete']?.toLowerCase() !== 'false') return false
+            if (!x.attributes['offerid']) return false
+            if (!x.attributes['type']) return false
+            if (x.attributes['type'] !== 'sapphire') return false
 
-        for (const activity of activities) {
-            if (activity.isLocked) {
-                this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Skipping locked: ${activity.title}`)
+            return true
+        })
+
+        if (!appRewards.length) {
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'APP-PROMOTIONS',
+                'All "App Promotions" items have already been completed'
+            )
+            return
+        }
+
+        for (const reward of appRewards) {
+            await this.bot.activities.doAppReward(reward)
+            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 15000))
+        }
+
+        this.bot.logger.info(this.bot.isMobile, 'APP-PROMOTIONS', 'All "App Promotions" items have been completed')
+    }
+
+    public async doPunchCards(data: DashboardData) {
+        let parents: ParentQuest[]
+
+        try {
+            const earn = await this.bot.browser.func.getRewardsPageHtml(URLs.rewards.earn, '/earn')
+            if (!earn) {
+                this.bot.logger.warn(this.bot.isMobile, 'PUNCHCARD', '/earn unavailable - cannot list quests')
+                return
+            }
+            parents = this.bot.browser.react.snapshotQuestList(earn)
+
+            if (!parents.length) {
+                const dashboard = await this.bot.browser.func.getRewardsPageHtml(URLs.rewards.dashboard, '/dashboard')
+                if (dashboard) parents = this.bot.browser.react.snapshotQuestList(earn, dashboard)
+            }
+        } catch (error) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'PUNCHCARD',
+                `Failed fetching /earn for quest list | ${error instanceof Error ? error.message : String(error)}`
+            )
+            return
+        }
+
+        const apiById = new Map(
+            (data.dashboard.punchCards ?? [])
+                .filter(c => c.parentPromotion?.offerId)
+                .map(c => [c.parentPromotion.offerId, c] as const)
+        )
+
+        const seen = new Set(parents.map(p => p.offerId))
+        for (const card of apiById.values()) {
+            const pp = card.parentPromotion
+            if (!pp?.offerId || seen.has(pp.offerId)) continue
+            parents.push({
+                offerId: pp.offerId,
+                title: pp.title ?? '',
+                pointProgressMax: pp.pointProgressMax ?? 0,
+                complete: !!pp.complete
+            })
+            seen.add(pp.offerId)
+        }
+
+        for (const p of parents) {
+            if (p.pointProgressMax <= 0) {
+                p.pointProgressMax = apiById.get(p.offerId)?.parentPromotion?.pointProgressMax ?? p.pointProgressMax
+            }
+        }
+
+        const incomplete = parents.filter(p => {
+            if (p.complete) return false
+            if (this.bot.config.skipNonPointTasks && p.pointProgressMax <= 0) return false
+            return true
+        })
+        if (!incomplete.length) {
+            this.bot.logger.info(this.bot.isMobile, 'PUNCHCARD', 'No actionable quests')
+            return
+        }
+
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'PUNCHCARD',
+            `Found ${incomplete.length} incomplete quest(s) on /earn | api-matched=${incomplete.filter(p => apiById.has(p.offerId)).length}`
+        )
+
+        for (const parent of incomplete) {
+            try {
+                await this.solvePunchCard(parent, apiById.get(parent.offerId))
+            } catch (error) {
+                this.bot.logger.error(
+                    this.bot.isMobile,
+                    'PUNCHCARD',
+                    `Error solving quest "${parent.title || parent.offerId}" | message=${error instanceof Error ? error.message : String(error)}`
+                )
+            }
+        }
+
+        this.bot.logger.info(this.bot.isMobile, 'PUNCHCARD', 'Finished processing quests')
+    }
+
+    public async doClaimBonusPoints() {
+        // Let's just always try to do this
+        await this.bot.activities.doClaimBonusPoints()
+    }
+
+    private async solvePunchCard(parent: ParentQuest, apiCard: PunchCard | undefined) {
+        const parentId = parent.offerId
+        const title = parent.title || apiCard?.parentPromotion?.title || parentId
+
+        let questChildren: QuestChild[]
+        try {
+            const questUrl = URLs.rewards.quest(parentId)
+            const html = await this.bot.browser.func.getRewardsPageHtml(questUrl, `/earn/quest/${parentId}`)
+            if (!html) {
+                this.bot.logger.warn(this.bot.isMobile, 'PUNCHCARD', `Quest page unavailable for "${title}" - skipping`)
+                return
+            }
+            questChildren = this.bot.browser.react.snapshotQuestPage(html)
+        } catch (error) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'PUNCHCARD',
+                `Failed fetching quest page for "${title}" | ${error instanceof Error ? error.message : String(error)}`
+            )
+            return
+        }
+
+        if (!questChildren.length) {
+            this.bot.logger.info(this.bot.isMobile, 'PUNCHCARD', `No actionable children rendered for "${title}"`)
+            return
+        }
+
+        const apiChildById = new Map(
+            (apiCard?.childPromotions ?? []).filter(c => c.offerId).map(c => [c.offerId, c] as const)
+        )
+        const ordered = [...questChildren].sort(
+            (a, b) =>
+                (apiChildById.get(a.offerId)?.priority ?? Number.MAX_SAFE_INTEGER) -
+                (apiChildById.get(b.offerId)?.priority ?? Number.MAX_SAFE_INTEGER)
+        )
+
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'PUNCHCARD',
+            `Solving "${title}" | children=${ordered.length} | reportable=${ordered.filter(c => c.reportable).length}`
+        )
+
+        const startBalance = this.bot.userData.currentPoints
+        let reported = 0
+        let remaining = 0
+
+        for (const child of ordered) {
+            const offerId = child.offerId
+            const api = apiChildById.get(offerId)
+
+            if (!child.reportable) {
+                remaining++
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'PUNCHCARD',
+                    `Skip ${offerId}: not reportable (locked=${child.isLocked} disabled=${child.isDisabled} done=${child.isCompleted} hash=${!!child.hash})`
+                )
                 continue
             }
 
-            this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Solving: ${activity.title}`)
-
-            if (isDailySetContext) {
-                await this.expandDailySetIfNeeded(page, context)
+            if (this.isSearchQuotaChild(offerId, api)) {
+                remaining++
+                this.bot.logger.info(this.bot.isMobile, 'PUNCHCARD', `Skip ${offerId}: multi-day search task`)
+                continue
             }
 
-            try {
-                const currentUrl = page.url()
-                const isDailyActivity =
-                    isDailySetContext ||
-                    activity?.source === 'dailySet' ||
-                    (activity?.title?.toLowerCase?.().includes('daily set') ?? false) ||
-                    (activity?.name?.toLowerCase?.().includes('daily') ?? false)
-
-                if (!isDailyActivity) {
-                    if (!currentUrl.includes('/earn')) {
-                        this.bot.logger.info(this.bot.isMobile, 'NAVIGATION', `NAVIGATING TO EARN PAGE FOR: ${activity.title}`)
-                        await page.goto('https://rewards.bing.com/earn', {
-                            waitUntil: 'domcontentloaded',
-                            timeout: 15000
-                        }).catch(() => { })
-                        await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                        await this.bot.browser.utils.wakePage(page)
-                    }
-                } else {
-                    if (!currentUrl.includes('rewards.bing.com') || currentUrl.includes('/earn')) {
-                        await page.goto('https://rewards.bing.com/', {
-                            waitUntil: 'networkidle',
-                            timeout: 20000
-                        }).catch(() => { })
-                        await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                        await this.bot.browser.utils.wakePage(page)
-                    }
+            if (this.isClaimChild(offerId, api)) {
+                if (!this.bot.config.autoClaimPunchcardRewards) {
+                    remaining++
+                    this.bot.logger.info(
+                        this.bot.isMobile,
+                        'PUNCHCARD',
+                        `Reward for "${title}" ready to claim - left for manual redemption (autoClaimPunchcardRewards=false) | ${offerId}`
+                    )
+                    continue
                 }
-            } catch (navError) {
-                this.bot.logger.warn(
-                    this.bot.isMobile,
-                    'NAVIGATION',
-                    `Navigation failed: ${navError instanceof Error ? navError.message : String(navError)}`
-                )
+                await this.bot.activities.doClaimReward(child, parentId)
+                reported++
+                continue
             }
 
-            try {
-                const url = activity.destinationUrl ?? activity.destination
-
-                if (url) {
-                    if (
-                        isDailySetContext ||
-                        activity?.source === 'dailySet' ||
-                        (activity?.title?.toLowerCase?.().includes('daily set') ?? false) ||
-                        (activity?.name?.toLowerCase?.().includes('daily') ?? false)
-                    ) {
-                        const escapedTitle = activity.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-                        const selectors = [
-                            `text=/.*${escapedTitle}.*/i`,
-                            `text=/.*${escapedTitle}.*/i >> xpath=ancestor::*[self::button or self::a or @role="button" or @onclick or @tabindex][1]`,
-                            `a[href*="${activity.offerId}"]`,
-                            `a[data-bi-id*="${activity.offerId}"]`,
-                            `*:text("${activity.title}")`,
-                            `a[href*="${encodeURIComponent(url).substring(0, 15)}"]`
-                        ]
-
-                        let cardElement: any = null
-                        const maxDashboardAttempts = 2
-
-                        for (let dashboardAttempt = 1; dashboardAttempt <= maxDashboardAttempts; dashboardAttempt++) {
-                            this.bot.logger.debug(
-                                this.bot.isMobile,
-                                'ACTIVITY',
-                                `Dashboard attempt ${dashboardAttempt}/${maxDashboardAttempts} for ${activity.title}`
-                            )
-
-                            await page.goto('https://rewards.bing.com/', {
-                                waitUntil: 'networkidle',
-                                timeout: 20000
-                            }).catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                            await this.bot.browser.utils.wakePage(page)
-
-                            if (isDailySetContext) {
-                                await this.expandDailySetIfNeeded(page, context)
-                            }
-
-                            this.bot.logger.debug(
-                                this.bot.isMobile,
-                                'ACTIVITY',
-                                `Starting incremental search for: ${activity.title}`
-                            )
-
-                            await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { })
-                            await this.bot.utils.wait(300)
-
-                            const isDashboardPage = !page.url().includes('/earn')
-
-                            for (let loopIteration = 0; loopIteration < 35; loopIteration++) {
-                                for (const selector of selectors) {
-                                    try {
-                                        const elements = page.locator(selector)
-                                        const count = await elements.count()
-
-                                        for (let i = 0; i < count; i++) {
-                                            const el = elements.nth(i)
-
-                                            const isInViewport = await el.evaluate((element: HTMLElement) => {
-                                                const rect = element.getBoundingClientRect()
-                                                return rect.top >= 0
-                                                    && rect.left >= 0
-                                                    && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
-                                                    && rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-                                            }).catch(() => false)
-
-                                            if (isInViewport) {
-                                                const text = await el.innerText().catch(() => '')
-                                                const href = await el.getAttribute('href').catch(() => null)
-                                                if (
-                                                    text.toLowerCase().includes(activity.title.toLowerCase()) ||
-                                                    (href && href.includes(activity.offerId))
-                                                ) {
-                                                    cardElement = el
-                                                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `✅ Found card on iteration ${loopIteration}`)
-                                                    break
-                                                }
-                                            }
-                                        }
-
-                                        if (cardElement) break
-                                    } catch { }
-                                }
-
-                                if (cardElement) break
-
-                                if (isDashboardPage && isDailySetContext) {
-                                    await this.expandDailySetIfNeeded(page, context)
-
-                                    for (const selector of selectors) {
-                                        try {
-                                            const elements = page.locator(selector)
-                                            const count = await elements.count()
-
-                                            for (let i = 0; i < count; i++) {
-                                                const el = elements.nth(i)
-
-                                                const isInViewport = await el.evaluate((element: HTMLElement) => {
-                                                    const rect = element.getBoundingClientRect()
-                                                    return rect.top >= 0
-                                                        && rect.left >= 0
-                                                        && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
-                                                }).catch(() => false)
-
-                                                if (isInViewport) {
-                                                    const text = await el.innerText().catch(() => '')
-                                                    if (text.toLowerCase().includes(activity.title.toLowerCase())) {
-                                                        cardElement = el
-                                                        this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', '✅ Found card inside expanded Daily Set!')
-                                                        break
-                                                    }
-                                                }
-                                            }
-
-                                            if (cardElement) break
-                                        } catch { }
-                                    }
-
-                                    if (cardElement) break
-                                }
-
-                                await page.evaluate(() => window.scrollBy({
-                                    top: 65,
-                                    left: 0,
-                                    behavior: 'smooth'
-                                })).catch(() => { })
-
-                                await this.bot.utils.wait(500)
-                            }
-
-                            if (!cardElement) {
-                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Completed full search loop, card not found`)
-                            }
-
-                            if (cardElement) break
-
-                            if (dashboardAttempt < maxDashboardAttempts) {
-                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card not found, refreshing dashboard`)
-                                await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => { })
-                                await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                                await this.bot.browser.utils.wakePage(page)
-                            }
-                        }
-
-                        if (cardElement) {
-                            this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Card found for: ${activity.title}`)
-
-                            await cardElement.scrollIntoViewIfNeeded().catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-                            if (!this.bot.isMobile) {
-                                await this.bot.utils.wait(this.bot.utils.humanHoverDelay())
-                                await cardElement.hover().catch(() => { })
-                                await this.bot.utils.wait(500)
-
-                                await page
-                                    .evaluate(
-                                        (sel: any) => {
-                                            const el = document.querySelector(sel)
-                                            if (el) {
-                                                ;['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(evt => {
-                                                    el.dispatchEvent(
-                                                        new MouseEvent(evt, {
-                                                            bubbles: true,
-                                                            cancelable: true,
-                                                            view: window
-                                                        })
-                                                    )
-                                                })
-                                            }
-                                        },
-                                        (cardElement as any)._selector
-                                    )
-                                    .catch(() => { })
-                            }
-
-                            await this.bot.utils.wait(this.bot.utils.humanClickDelay())
-
-                            const [newPage] = await Promise.all([
-                                page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
-                                cardElement.click({ delay: this.bot.utils.randomDelay(200, 500) }).catch(() => {
-                                    return page.evaluate(targetUrl => {
-                                        window.open(targetUrl, '_blank')
-                                    }, url)
-                                })
-                            ])
-
-                            if (newPage) {
-                                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-                                this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `New tab opened for: ${activity.title}`)
-
-                                const pageUrl = newPage.url()
-                                if (
-                                    pageUrl.includes('bing.com') &&
-                                    (
-                                        activity.title.toLowerCase().includes('search on bing') ||
-                                        activity.title.toLowerCase().includes('explore on bing') ||
-                                        activity.title.toLowerCase().includes('search bing')
-                                    )
-                                ) {
-                                    try {
-                                        const { SearchOnBing } = await import('./activities/browser/SearchOnBing.js')
-                                        const searchOnBing = new SearchOnBing(this.bot)
-                                        await searchOnBing.doSearchOnBing(activity, newPage)
-                                    } catch (searchError) {
-                                        this.bot.logger.warn(
-                                            this.bot.isMobile,
-                                            'SEARCH-ON-BING',
-                                            `Failed to handle search activity: ${searchError instanceof Error ? searchError.message : String(searchError)}`
-                                        )
-                                    }
-                                } else {
-                                    if (this.bot.rewardsVersion === 'modern') {
-                                        await this.completeActivity(activity, newPage)
-                                    }
-                                }
-
-                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                                await newPage.close().catch(() => { })
-                            } else {
-                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                            }
-                        } else {
-                            this.bot.logger.warn(
-                                this.bot.isMobile,
-                                'ACTIVITY',
-                                `Card NOT found on dashboard for: ${activity.title}. Navigating directly.`
-                            )
-                            await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-
-                            if (this.bot.rewardsVersion === 'modern') {
-                                await this.completeActivity(activity, page)
-                            }
-
-                            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                        }
-                    } else {
-                        if (!page.url().includes('/earn')) {
-                            await page.goto('https://rewards.bing.com/earn', {
-                                waitUntil: 'domcontentloaded',
-                                timeout: 15000
-                            }).catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanPageLoadDelay())
-                            await this.bot.browser.utils.wakePage(page)
-                        }
-
-                        await this.bot.utils.wait(700)
-
-                        const beforePages = page.context().pages().slice()
-                        let clicked = false
-                        let lastScore = 0
-
-                        for (let i = 0; i < 35; i++) {
-                            const result = await this.clickBestMatchingTextOnPage(page, activity.title, 0.7)
-
-                            if (result.clicked) {
-                                clicked = true
-                                lastScore = result.score
-
-                                this.bot.logger.debug(
-                                    this.bot.isMobile,
-                                    'ACTIVITY',
-                                    `✅ Found earn text on iteration ${i} (${Math.round(result.score * 100)}%)`
-                                )
-                                break
-                            }
-
-                            await page.evaluate(() => window.scrollBy({
-                                top: 65,
-                                left: 0,
-                                behavior: 'smooth'
-                            })).catch(() => { })
-
-                            await this.bot.utils.wait(500)
-                        }
-
-                        if (clicked) {
-                            await this.bot.utils.wait(this.bot.utils.humanClickDelay())
-                            await this.bot.utils.wait(1500)
-
-                            const afterPages = page.context().pages()
-                            const newPage = afterPages.find(p => !beforePages.includes(p) && !p.isClosed())
-
-                            if (newPage) {
-                                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                                await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-                                this.bot.logger.debug(
-                                    this.bot.isMobile,
-                                    'ACTIVITY',
-                                    `New tab opened for earn item: ${activity.title} (${Math.round(lastScore * 100)}%)`
-                                )
-
-                                if (this.bot.rewardsVersion === 'modern') {
-                                    await this.completeActivity(activity, newPage)
-                                }
-
-                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                                await newPage.close().catch(() => { })
-                            } else {
-                                if (this.bot.rewardsVersion === 'modern') {
-                                    await this.completeActivity(activity, page)
-                                }
-
-                                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                            }
-                        } else {
-                            this.bot.logger.warn(
-                                this.bot.isMobile,
-                                'ACTIVITY',
-                                `Text match not found for: ${activity.title}. Navigating directly.`
-                            )
-
-                            await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => { })
-                            await this.bot.utils.wait(this.bot.utils.humanNavigationDelay())
-
-                            if (this.bot.rewardsVersion === 'modern') {
-                                await this.completeActivity(activity, page)
-                            }
-
-                            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 8000))
-                        }
-                    }
-
-                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', `Finished attempt for: ${activity.title}`)
-                }
-            } catch {
-                this.bot.logger.error(this.bot.isMobile, 'ACTIVITY', `Failed: ${activity.title}`)
-            }
+            await this.reportQuestChild(child, parentId)
+            reported++
+            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 15000))
         }
+
+        const gained = this.bot.userData.currentPoints - startBalance
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'PUNCHCARD',
+            `Quest "${title}" ${remaining === 0 ? 'COMPLETE' : 'in progress'} | reported=${reported}${remaining ? ` | remaining=${remaining}` : ''} | pointsGained=${gained} | currentBalance=${this.bot.userData.currentPoints}${parent.pointProgressMax > 0 ? ` | targetPoints=${parent.pointProgressMax}` : ''}`,
+            gained > 0 ? 'green' : undefined
+        )
     }
-    public async doSpecialPromotions(data: DashboardData) { }
-    public async doPunchCards(data: DashboardData, page: Page) { }
 
-    protected async expandDailySetIfNeeded(
-        page: Page,
-        context: 'dailySet' | 'morePromotions' | 'punchCard' | 'other' = 'other'
-    ): Promise<void> {
-        if (context !== 'dailySet') return
+    private async reportQuestChild(child: QuestChild, parentId: string) {
+        const offerId = child.offerId
+        const actionId = this.bot.nextActions.reportActivity
+        if (!actionId) {
+            this.bot.logger.warn(this.bot.isMobile, 'PUNCHCARD', `Skip ${offerId}: "reportActivity" not discovered`)
+            return
+        }
+        if (!child.hash) {
+            this.bot.logger.warn(this.bot.isMobile, 'PUNCHCARD', `Skip ${offerId}: no live hash on quest child`)
+            return
+        }
 
+        const oldBalance = this.bot.userData.currentPoints
         try {
-            this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Trying simple Daily Set expand...')
+            const questUrl = URLs.rewards.quest(parentId)
+            const { status, acknowledged } = await this.bot.browser.func.reportServerAction(
+                actionId,
+                [
+                    child.hash,
+                    11,
+                    { offerid: offerId, isPromotional: '$undefined', timezoneOffset: this.bot.userData.timezoneOffset }
+                ],
+                {
+                    url: questUrl,
+                    referer: questUrl,
+                    routerStateTree: this.bot.browser.react.questRouterStateTree(parentId)
+                }
+            )
 
-            const expandButton = page.locator(
-                'button[aria-label="Daily set"][aria-expanded="false"]:has(svg)'
-            ).first()
-
-            const exists = await expandButton.count()
-
-            if (exists === 0) {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand button not found or already expanded')
-                return
+            const newBalance = await this.bot.browser.func.getCurrentPoints()
+            const gained = newBalance - oldBalance
+            if (gained > 0) {
+                this.bot.userData.currentPoints = newBalance
+                this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + gained
             }
 
-            const isVisible = await expandButton.isVisible().catch(() => false)
-            if (!isVisible) {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand button not visible')
-                return
-            }
-
-            this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', 'Clicking Daily Set expand button')
-
-            await expandButton.scrollIntoViewIfNeeded().catch(() => { })
-            await this.bot.utils.wait(200)
-
-            await expandButton.click({ delay: this.bot.isMobile ? 150 : 50 }).catch(() => { })
-
-            await this.bot.utils.wait(1000)
-
-            // Optional verification (lightweight)
-            const expanded = await expandButton.getAttribute('aria-expanded').catch(() => null)
-
-            if (expanded === 'true') {
-                this.bot.logger.info(this.bot.isMobile, 'DAILY-SET', '✅ Daily Set expanded')
-            } else {
-                this.bot.logger.debug(this.bot.isMobile, 'DAILY-SET', 'Expand click sent, no state change detected')
-            }
-
-        } catch (e) {
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'PUNCHCARD',
+                `Reported child | offerId=${offerId} | status=${status} | acknowledged=${acknowledged} | pointsGained=${gained} | currentBalance=${newBalance}`,
+                gained > 0 || acknowledged ? 'green' : undefined
+            )
+        } catch (error) {
             this.bot.logger.error(
                 this.bot.isMobile,
-                'DAILY-SET',
-                `Expand failed: ${e instanceof Error ? e.message : String(e)}`
+                'PUNCHCARD',
+                `Error reporting child | offerId=${offerId} | message=${error instanceof Error ? error.message : String(error)}`
             )
         }
     }
-public async claimReadyPoints(page: Page): Promise<void> {
-  try {
-    this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Opening claim panel')
 
-    // 1. Open the "Ready to claim" card (strict but case-insensitive)
-    const readyCard = page.getByText(/ready to claim/i).first()
-
-    if (!(await readyCard.isVisible().catch(() => false))) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'No claim card found')
-      return
-    }
-
-    await readyCard.click()
-    await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-    // 2. Scope everything to the modal/dialog
-    const dialog = page.getByRole('dialog')
-
-    // 3. Detect "nothing to claim"
-    if (await dialog.getByText(/no points to claim/i).isVisible().catch(() => false)) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Nothing to claim')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    // Optional stricter numeric check
-    const pointsText = await dialog.locator('text=/^\\d+$/').first().textContent().catch(() => null)
-    if (pointsText && parseInt(pointsText) === 0) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Points = 0')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    // 4. Click the bottom "Claim points" button (role-based = fast)
-    const claimBtn = dialog.getByRole('button', { name: /claim points/i })
-
-    if (!(await claimBtn.isVisible().catch(() => false))) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Claim button not found')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    await claimBtn.click()
-    await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-    this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Claim successful', 'green')
-
-  } catch (error) {
-    this.bot.logger.debug(
-      this.bot.isMobile,
-      'CLAIM-POINTS',
-      `Claim skipped: ${error instanceof Error ? error.message : String(error)}`
-    )
-  }
-}
-    private async completeActivity(activity: any, page: Page): Promise<boolean> {
-        const offerId = activity.offerId
-
-        if (!offerId) {
-            this.bot.logger.warn(this.bot.isMobile, 'ACTIVITY', 'No offerId found')
-            return false
-        }
-
-        this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Completing: ${activity.title} (${offerId})`)
-
-        try {
-            const url = activity.destination || activity.destinationUrl
-            if (url) {
-                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => { })
-                await this.bot.utils.wait(3000)
-
-                const pageText = await page.innerText('body').catch(() => '')
-
-                if (pageText.toLowerCase().includes('quiz') || pageText.toLowerCase().includes('poll')) {
-                    this.bot.logger.debug(this.bot.isMobile, 'ACTIVITY', 'Detected quiz/poll, attempting interaction')
-                    await page.click('button, [role="button"]', { timeout: 2000 }).catch(() => { })
-                    await this.bot.utils.wait(2000)
-                }
-
-                const panelData = this.bot.panelData
-                const todayKey = this.bot.utils.getFormattedDate()
-
-                const userInfo = (panelData as any)?.userInfo
-                const panelPromotion =
-                    userInfo?.promotions?.find((p: any) => p.offerId === offerId || p.name === offerId) ||
-                    panelData?.flyoutResult?.dailySetPromotions?.[todayKey]?.find((p: any) => p.offerId === offerId) ||
-                    panelData?.flyoutResult?.morePromotions?.find((p: any) => p.offerId === offerId)
-
-                const jsonData = {
-                    ActivityCount: 1,
-                    ActivityType: panelPromotion?.activityType ?? activity.activityType ?? 0,
-                    ActivitySubType: '',
-                    OfferId: offerId,
-                    AuthKey: panelPromotion?.hash ?? activity.hash ?? '',
-                    Channel: panelData?.channel ?? 'BingRewards',
-                    PartnerId: panelData?.partnerId ?? 'BingRewards',
-                    UserId: panelData?.userId ?? ''
-                }
+    private async solveActivities(activities: BasePromotion[]) {
+        for (const activity of activities) {
+            try {
+                const type = activity.promotionType?.toLowerCase() ?? ''
+                const name = activity.name?.toLowerCase() ?? ''
+                const offerId = (activity as BasePromotion).offerId
 
                 this.bot.logger.debug(
                     this.bot.isMobile,
                     'ACTIVITY',
-                    `Calling reportActivity API | offerId=${offerId} | ActivityType=${jsonData.ActivityType}`
+                    `Processing activity | title="${activity.title}" | offerId=${offerId} | type=${type}`
                 )
 
-                const context = page.context() as any
-                const cookies = await context.cookies()
-                const cookieHeader = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ')
+                switch (type) {
+                    case 'urlreward': {
+                        const basePromotion = activity as BasePromotion
 
-                const request: any = {
-                    url: 'https://www.bing.com/msrewards/api/v1/reportactivity',
-                    method: 'POST',
-                    headers: {
-                        ...(this.bot.fingerprint?.headers ?? {}),
-                        Cookie: cookieHeader,
-                        'Content-Type': 'application/json',
-                        Origin: 'https://www.bing.com',
-                        Referer: url
-                    },
-                    data: JSON.stringify(jsonData)
+                        // Search on Bing are subtypes of "urlreward"
+                        const isSearchOnBing = name.includes('exploreonbing')
+
+                        if (isSearchOnBing && !this.bot.config.activities.searchOnBing) {
+                            this.bot.logger.info(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Skipping "SearchOnBing" (disabled in config) | offerId=${offerId}`
+                            )
+                            continue
+                        }
+                        if (!isSearchOnBing && !this.bot.config.activities.urlReward) {
+                            this.bot.logger.info(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Skipping "UrlReward" (disabled in config) | offerId=${offerId}`
+                            )
+                            continue
+                        }
+
+                        if (isSearchOnBing) {
+                            this.bot.logger.info(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Found activity type "SearchOnBing" | title="${activity.title}" | offerId=${offerId}`
+                            )
+
+                            const page = this.bot.isMobile ? this.bot.mainMobilePage : this.bot.mainDesktopPage
+                            await this.bot.activities.doSearchOnBing(basePromotion, page)
+                        } else {
+                            this.bot.logger.info(
+                                this.bot.isMobile,
+                                'ACTIVITY',
+                                `Found activity type "UrlReward" | title="${activity.title}" | offerId=${offerId}`
+                            )
+
+                            await this.bot.activities.doUrlReward(basePromotion)
+                        }
+                        break
+                    }
+
+                    case 'quiz': {
+                        this.bot.logger.info(
+                            this.bot.isMobile,
+                            'ACTIVITY',
+                            `Found activity type "Quiz" | title="${activity.title}" | offerId=${offerId}`
+                        )
+
+                        await this.bot.activities.doQuiz(activity as BasePromotion)
+                        break
+                    }
+
+                    default: {
+                        this.bot.logger.warn(
+                            this.bot.isMobile,
+                            'ACTIVITY',
+                            `Skipped activity "${activity.title}" | offerId=${offerId} | Reason: Unsupported type "${activity.promotionType}"`
+                        )
+                        break
+                    }
                 }
 
-                try {
-                    const response = await this.bot.axios.request(request)
-                    this.bot.logger.debug(
-                        this.bot.isMobile,
-                        'ACTIVITY',
-                        `reportActivity response | offerId=${offerId} | status=${response.status}`
-                    )
-                } catch (apiError) {
-                    this.bot.logger.warn(
-                        this.bot.isMobile,
-                        'ACTIVITY',
-                        `reportActivity API call failed | offerId=${offerId} | error=${apiError instanceof Error ? apiError.message : String(apiError)}`
-                    )
-                }
+                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 15000))
+            } catch (error) {
+                this.bot.logger.error(
+                    this.bot.isMobile,
+                    'ACTIVITY',
+                    `Error while solving activity "${activity.title}" | message=${error instanceof Error ? error.message : String(error)}`
+                )
+            }
+        }
+    }
 
-                this.bot.logger.info(this.bot.isMobile, 'ACTIVITY', `Completed: ${activity.title}`, 'green')
+    // Util
+    private getPromotionAttribute(promotion: BasePromotion, key: string): unknown {
+        const attributes = promotion.attributes
+        if (!attributes || typeof attributes !== 'object') return undefined
+        return (attributes as Record<string, unknown>)[key]
+    }
+
+    private isSearchQuotaChild(offerId: string, api?: BasePromotion): boolean {
+        if (api) {
+            const type = (api.promotionType ?? '').toLowerCase()
+            const attrType = String(this.getPromotionAttribute(api, 'type') ?? '').toLowerCase()
+            const progressMax = Number(api.activityProgressMax ?? 0)
+            if (type === 'search' || attrType === 'search' || progressMax > 1) {
                 return true
             }
-
-            // No URL - try API
-            const panelData = this.bot.panelData
-            const todayKey = this.bot.utils.getFormattedDate()
-
-            const panelPromotion =
-                panelData?.flyoutResult?.morePromotions?.find(p => p.offerId === offerId) ||
-                panelData?.flyoutResult?.dailySetPromotions?.[todayKey]?.find(p => p.offerId === offerId)
-
-            const formData = new URLSearchParams({
-                id: offerId,
-                hash: activity.hash || panelPromotion?.hash || '',
-                timeZone: '60',
-                activityAmount: '1',
-                dbs: '0',
-                form: '',
-                type: '',
-                __RequestVerificationToken: ''
-            })
-
-            const context = page.context() as any
-            const cookies = await context.cookies()
-            const cookieHeader = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ')
-
-            const request: any = {
-                url: 'https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest',
-                method: 'POST',
-                headers: {
-                    ...(this.bot.fingerprint?.headers ?? {}),
-                    Cookie: cookieHeader,
-                    Referer: 'https://rewards.bing.com/',
-                    Origin: 'https://rewards.bing.com',
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                data: formData.toString()
-            }
-
-            const response = await this.bot.axios.request(request)
-
-            if (response.status === 200) {
-                const result = response.data
-                const earnedCredits = result?.EarnedCredits || result?.earnedCredits || 0
-                const activityComplete = result?.ActivityComplete || result?.activityComplete || false
-                const errorCode = result?.ErrorDetail?.ErrorCode || result?.errorDetail?.errorCode
-                const v3ResultCode = result?.result?.resultCode ?? result?.resultCode
-
-                if (
-                    activityComplete ||
-                    earnedCredits > 0 ||
-                    errorCode === 'I_SUCCESS' ||
-                    errorCode === 0 ||
-                    v3ResultCode === 0
-                ) {
-                    if (earnedCredits > 0) {
-                        this.bot.logger.info(
-                            this.bot.isMobile,
-                            'CLAIM POINTS',
-                            `Found ${earnedCredits} points`,
-                            'green'
-                        )
-                        this.bot.logger.info(
-                            this.bot.isMobile,
-                            'CLAIM POINTS',
-                            `Claimed ${earnedCredits} points for: ${activity.title}`,
-                            'green'
-                        )
-                    } else {
-                        this.bot.logger.info(
-                            this.bot.isMobile,
-                            'CLAIM POINTS',
-                            `Completed: ${activity.title} | No points awarded`,
-                            'yellow'
-                        )
-                    }
-                    return true
-                }
-            }
-
-            this.bot.logger.warn(
-                this.bot.isMobile,
-                'ACTIVITY',
-                `API returned status ${response.status} for: ${activity.title}`
-            )
-            return false
-        } catch (error) {
-            this.bot.logger.warn(
-                this.bot.isMobile,
-                'CLAIM POINTS',
-                `Not available on this account: ${activity.title}`
-            )
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'ACTIVITY',
-                `Failed to complete: ${activity.title} - ${error instanceof Error ? error.message : String(error)}`
-            )
-            return false
         }
+
+        return /search/i.test(offerId) && /(day|streak|\dx)/i.test(offerId)
+    }
+
+    private isClaimChild(offerId: string, api?: BasePromotion): boolean {
+        const dest = (api?.destinationUrl ?? '').toLowerCase()
+        if (/\/redeem\//.test(dest)) return true
+        return /(redeem|claim|(?<!url)reward)/i.test(offerId)
     }
 }

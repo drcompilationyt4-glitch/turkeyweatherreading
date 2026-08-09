@@ -1,149 +1,250 @@
-import type { AxiosRequestConfig } from 'axios'
+import { URLs } from '../../../constants/urls'
 import type { BasePromotion } from '../../../interface/DashboardData'
-import type { PanelFlyoutData } from '../../../interface/PanelFlyoutData'
 import { Workers } from '../../Workers'
 
 export class UrlReward extends Workers {
-    private cookieHeader: string = ''
-
-    private fingerprintHeader: { [x: string]: string } = {}
-
-    private gainedPoints: number = 0
-
-    private oldBalance: number = this.bot.userData.currentPoints
-
     public async doUrlReward(promotion: BasePromotion) {
-        if (!this.bot.requestToken && this.bot.rewardsVersion === 'legacy') {
+        await this.runUrlReward(promotion, true)
+    }
+
+    private async runUrlReward(promotion: BasePromotion, allowSessionRepair: boolean) {
+        const offerId = promotion.offerId
+
+        const actionId = this.bot.nextActions.reportActivity
+        if (!actionId) {
             this.bot.logger.warn(
                 this.bot.isMobile,
                 'URL-REWARD',
-                'Skipping: Request token not available, this activity requires it!'
+                `Skipping ${offerId}: "reportActivity" not discovered in bundle - trying legacy fallback`
+            )
+            await this.legacyReportActivity(offerId)
+            return
+        }
+
+        const live = await this.bot.browser.func.ensureOffer(offerId)
+        if (!live) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Skipping ${offerId}: not present in page snapshot, even after refetching /earn and /dashboard`
+            )
+            return
+        }
+        if (!live.reportable) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Skipping ${offerId}: not reportable (completed/locked/no-hash/future-dated)`
             )
             return
         }
 
-        const offerId = promotion.offerId
+        if (this.bot.config.skipNonPointTasks && this.isNonCrediting(live.points, live.promotionSubtype, live.title)) {
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Skipping ${offerId}: awards no points (points=${live.points}${live.promotionSubtype ? ` subtype=${live.promotionSubtype}` : ''}) - likely a free trial/non-crediting offer. Set skipNonPointTasks=false to attempt anyway.`
+            )
+            return
+        }
+
+        const oldBalance = this.bot.userData.currentPoints
+        const expectedPoints = live.points
+
+        const dashboardActivityType = Number(promotion.activityType)
+        const activityType =
+            live.activityType ??
+            (Number.isInteger(dashboardActivityType) && dashboardActivityType > 0 ? dashboardActivityType : 11)
 
         this.bot.logger.info(
             this.bot.isMobile,
             'URL-REWARD',
-            `Starting UrlReward | offerId=${offerId} | geo=${this.bot.userData.geoLocale} | oldBalance=${this.oldBalance}`
+            `Starting UrlReward | offerId=${offerId} | geo=${this.bot.userData.geoLocale} | currentBalance=${oldBalance}`
         )
 
         try {
-            this.cookieHeader = this.bot.browser.func.buildCookieHeader(
-                this.bot.isMobile ? this.bot.cookies.mobile : this.bot.cookies.desktop,
-                ['bing.com', 'live.com', 'microsoftonline.com']
+            const { status, acknowledged, availablePoints } = await this.bot.browser.func.reportServerAction(
+                actionId,
+                [
+                    live.hash,
+                    activityType,
+                    {
+                        offerid: offerId,
+                        isPromotional: live.isPromotional ? true : '$undefined',
+                        timezoneOffset: this.bot.userData.timezoneOffset
+                    }
+                ],
+                {
+                    url: URLs.rewards.dashboard,
+                    referer: URLs.rewards.dashboard,
+                    routerStateTree: this.bot.browser.react.routerStateTree('dashboard')
+                }
             )
 
-            const fingerprintHeaders = { ...this.bot.fingerprint.headers }
-            delete fingerprintHeaders['Cookie']
-            delete fingerprintHeaders['cookie']
-            this.fingerprintHeader = fingerprintHeaders
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'URL-REWARD',
-                `Prepared UrlReward headers | offerId=${offerId} | cookieLength=${this.cookieHeader.length} | fingerprintHeaderKeys=${Object.keys(this.fingerprintHeader).length}`
-            )
-
-            // V4: Find promotion in panelData
-            const panelData: PanelFlyoutData = this.bot.panelData
-            const todayKey = this.bot.utils.getFormattedDate()
-            const userInfo = (panelData as any)?.userInfo
-
-            const panelPromotion =
-                userInfo?.morePromotions?.find((p: any) => p.offerId === offerId) ||
-                panelData?.flyoutResult?.dailySetPromotions?.[todayKey]?.find((p: any) => p.offerId === offerId)
-
-            if (!panelPromotion) {
+            if (!acknowledged) {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'URL-REWARD',
-                    `Promotion not found in panel data | offerId=${offerId}`
+                    `UrlReward request was not acknowledged | offerId=${offerId} | status=${status}`
                 )
-                // Fallback to original activity if panel data not available
+                if (await this.retryAfterRequestFailure(promotion, allowSessionRepair)) return
+                await this.legacyReportActivity(offerId)
             }
 
-            // V4 API uses different endpoint and JSON payload
-            const jsonData = {
-                ActivityCount: 1,
-                ActivityType: panelPromotion?.activityType ?? 0,
-                ActivitySubType: '',
-                OfferId: offerId,
-                AuthKey: panelPromotion?.hash ?? promotion.hash,
-                Channel: panelData?.channel ?? 'BingRewards',
-                PartnerId: panelData?.partnerId ?? 'BingRewards',
-                UserId: panelData?.userId ?? ''
-            }
+            const newBalance = availablePoints ?? (await this.bot.browser.func.getCurrentPoints())
+            const gainedPoints = newBalance - oldBalance
 
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'URL-REWARD',
-                `Prepared UrlReward JSON data | offerId=${offerId} | hash=${panelPromotion?.hash ?? promotion.hash}`
+                `Response | offerId=${offerId} | status=${status} | acknowledged=${acknowledged} | pointsGained=${gainedPoints} | currentBalance=${newBalance}`
             )
 
-            const request: AxiosRequestConfig = {
-                url: 'https://www.bing.com/msrewards/api/v1/reportactivity',
-                method: 'POST',
-                headers: {
-                    ...(this.bot.fingerprint?.headers ?? {}),
-                    'Content-Type': 'application/json',
-                    Origin: 'https://www.bing.com'
-                },
-                data: JSON.stringify(jsonData)
-            }
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'URL-REWARD',
-                `Sending UrlReward request | offerId=${offerId} | url=${request.url}`
-            )
-
-            const response = await this.bot.axios.request(request)
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'URL-REWARD',
-                `Received UrlReward response | offerId=${offerId} | status=${response.status}`
-            )
-
-            const newBalance = await this.bot.browser.func.getCurrentPoints()
-            this.gainedPoints = newBalance - this.oldBalance
-
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'URL-REWARD',
-                `Balance delta after UrlReward | offerId=${offerId} | oldBalance=${this.oldBalance} | newBalance=${newBalance} | gainedPoints=${this.gainedPoints}`
-            )
-
-            if (this.gainedPoints > 0) {
+            if (gainedPoints > 0) {
                 this.bot.userData.currentPoints = newBalance
-                this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + this.gainedPoints
+                this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + gainedPoints
 
+                const shortfall = expectedPoints > 0 && gainedPoints < expectedPoints
                 this.bot.logger.info(
                     this.bot.isMobile,
                     'URL-REWARD',
-                    `Completed UrlReward | offerId=${offerId} | status=${response.status} | gainedPoints=${this.gainedPoints} | newBalance=${newBalance}`,
+                    `Completed UrlReward | offerId=${offerId} | pointsGained=${gainedPoints} | currentBalance=${newBalance}${shortfall ? ' | WARNING: credited less than advertised' : ''}`,
+                    'green'
+                )
+            } else if (acknowledged && expectedPoints === 0) {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'URL-REWARD',
+                    `Completed UrlReward (no points by design) | offerId=${offerId} | acknowledged=true | pointsGained=0 | currentBalance=${newBalance}`,
                     'green'
                 )
             } else {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'URL-REWARD',
-                    `Failed UrlReward with no points | offerId=${offerId} | status=${response.status} | oldBalance=${this.oldBalance} | newBalance=${newBalance}`
+                    `UrlReward credited no points | offerId=${offerId} | acknowledged=${acknowledged} | expected=${expectedPoints} | pointsGained=0 | currentBalance=${newBalance}`
                 )
             }
-
-            this.bot.logger.debug(this.bot.isMobile, 'URL-REWARD', `Waiting after UrlReward | offerId=${offerId}`)
 
             await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 10000))
         } catch (error) {
             this.bot.logger.error(
                 this.bot.isMobile,
                 'URL-REWARD',
-                `Error in doUrlReward | offerId=${promotion.offerId} | message=${error instanceof Error ? error.message : String(error)}`
+                `Error in doUrlReward | offerId=${offerId} | message=${error instanceof Error ? error.message : String(error)}`
             )
+            await this.retryAfterRequestFailure(promotion, allowSessionRepair)
         }
+    }
+
+    private async retryAfterRequestFailure(promotion: BasePromotion, allowSessionRepair: boolean): Promise<boolean> {
+        if (!allowSessionRepair) return false
+
+        const refreshed = await this.bot.refreshCurrentRewardsContext(`URL-REWARD:${promotion.offerId}`)
+        if (!refreshed) return false
+
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'URL-REWARD',
+            `Retrying UrlReward once with refreshed cookies and bootstrap data | offerId=${promotion.offerId}`
+        )
+        await this.runUrlReward(promotion, false)
+        return true
+    }
+
+    // Fallback credit path (ported from the tourdefrance backup): when the modern
+    // server-action activation is unavailable or unacknowledged, post directly to
+    // the legacy msrewards reportactivity endpoint using the card hash.
+    private async legacyReportActivity(offerId: string): Promise<boolean> {
+        try {
+            const live = await this.bot.browser.func.ensureOffer(offerId)
+            const hash = live?.hash ?? ''
+            if (!live || !hash) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'URL-REWARD',
+                    `Legacy fallback skipped ${offerId}: no hash for activity`
+                )
+                return false
+            }
+
+            const page = this.bot.isMobile ? this.bot.mainMobilePage : this.bot.mainDesktopPage
+            const context = page?.context?.()
+            const cookies = context ? await context.cookies() : []
+            const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ')
+            const activityType = Number(live.activityType ?? 0)
+
+            const jsonData = {
+                ActivityCount: 1,
+                ActivityType: activityType,
+                ActivitySubType: '',
+                OfferId: offerId,
+                AuthKey: hash,
+                Channel: 'BingRewards',
+                PartnerId: 'BingRewards',
+                UserId: ''
+            }
+
+            this.bot.logger.debug(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Legacy reportActivity | offerId=${offerId} | ActivityType=${activityType}`
+            )
+
+            const response = await this.bot.axios?.request({
+                url: 'https://www.bing.com/msrewards/api/v1/reportactivity',
+                method: 'POST',
+                headers: {
+                    ...(this.bot.fingerprint?.headers ?? {}),
+                    Cookie: cookieHeader,
+                    'Content-Type': 'application/json',
+                    Origin: 'https://www.bing.com',
+                    Referer: 'https://www.bing.com/'
+                },
+                data: JSON.stringify(jsonData),
+                timeout: 20000
+            })
+
+            const body = (response as { data?: unknown })?.data
+            const record = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+            const earned = Number(record['EarnedCredits'] ?? record['earnedCredits'] ?? 0)
+            const complete = Boolean(record['ActivityComplete'] ?? record['activityComplete'])
+
+            if (response?.status === 200 && (earned > 0 || complete)) {
+                if (earned > 0) {
+                    this.bot.userData.currentPoints = Number(this.bot.userData.currentPoints ?? 0) + earned
+                    this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + earned
+                }
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'URL-REWARD',
+                    `Legacy fallback completed ${offerId} | earned=${earned} | complete=${complete}`,
+                    earned > 0 ? 'green' : undefined
+                )
+                return true
+            }
+
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Legacy fallback returned no credit | offerId=${offerId} | status=${response?.status} | body=${JSON.stringify(record).slice(0, 200)}`
+            )
+            return false
+        } catch (error) {
+            this.bot.logger.debug(
+                this.bot.isMobile,
+                'URL-REWARD',
+                `Legacy fallback failed | offerId=${offerId} | ${error instanceof Error ? error.message : String(error)}`
+            )
+            return false
+        }
+    }
+
+    private isNonCrediting(points: number, subtype: string | null, title: string): boolean {
+        if (points > 0) return false
+        const haystack = `${subtype ?? ''} ${title ?? ''}`.toLowerCase()
+
+        // Make proper language independant
+        return points === 0 || /free trial|trial|subscription|sign up|sign-up|signup/.test(haystack)
     }
 }

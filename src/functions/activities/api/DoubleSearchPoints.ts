@@ -92,8 +92,8 @@ export class DoubleSearchPoints extends Workers {
             )
 
             const data = await this.bot.browser.func.getDashboardData()
-            const promotionalItem = data.promotionalItems.find(item =>
-                item.name.toLowerCase().includes('ww_banner_optin_2x')
+            const promotionalItem = data.dashboard.promotionalItems.find((item: any) =>
+                String(item.name || '').toLowerCase().includes('ww_banner_optin_2x')
             )
 
             // If OK, should no longer be present in promotionalItems
