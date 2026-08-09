@@ -1,25 +1,106 @@
-import type { Cookie } from 'patchright'
-import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
 import fs from 'fs'
 import path from 'path'
 import { randomInt } from 'crypto'
+import type { Cookie } from 'patchright'
 
-import type { Account, ConfigSaveFingerprint } from '../interface/Account'
+import type { Account } from '../interface/Account'
 import type { Config } from '../interface/Config'
 import { validateAccounts, validateConfig } from './Validator'
 
 let configCache: Config
+let envLoaded = false
+
+// Loads a root/dist/src .env file into process.env if present (idempotent).
+// This lets AI/LLM keys (OPENROUTER_API_KEY, OPENAI_API_KEY, ...) and account
+// overrides be kept in a .env file for bare-metal runs.
+function ensureEnvLoaded(): void {
+    if (envLoaded) return
+    envLoaded = true
+
+    const envFile = resolveProjectFile('.env')
+    if (!envFile) return
+
+    const raw = fs.readFileSync(envFile, 'utf-8')
+    for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+
+        const eq = trimmed.indexOf('=')
+        if (eq === -1) continue
+
+        const key = trimmed.slice(0, eq).trim()
+        let value = trimmed.slice(eq + 1).trim()
+
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1)
+        }
+
+        if (process.env[key] === undefined) {
+            process.env[key] = value
+        }
+    }
+}
+
+export async function saveSessionData(
+    sessionPath: string,
+    cookies: Cookie[],
+    email: string,
+    isMobile: boolean
+): Promise<void> {
+    const dir = path.resolve(process.cwd(), sessionPath)
+    fs.mkdirSync(dir, { recursive: true })
+
+    const file = path.join(dir, `${email.replace(/[@.]/g, '_')}_${isMobile ? 'mobile' : 'desktop'}.json`)
+    const data = {
+        cookies,
+        savedAt: Date.now()
+    }
+    await fs.promises.writeFile(file, JSON.stringify(data, null, 2))
+}
+
+function getProjectRoot(): string {
+    const cwd = process.cwd()
+    if (fs.existsSync(path.join(cwd, 'package.json'))) return cwd
+
+    let dir = __dirname
+    while (dir !== path.parse(dir).root) {
+        if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+        dir = path.dirname(dir)
+    }
+
+    return cwd
+}
+
+// Check root -> dist -> src (not in dist, but root)
+function resolveProjectFile(filename: string): string | undefined {
+    const root = getProjectRoot()
+    const candidates = [
+        path.join(process.cwd(), filename),
+        path.join(root, filename),
+        path.join(root, 'dist', filename),
+        path.join(root, 'src', filename)
+    ]
+    return candidates.find(p => fs.existsSync(p))
+}
 
 export function loadAccounts(): Account[] {
     try {
+        ensureEnvLoaded()
+
         let file = 'accounts.json'
 
         if (process.argv.includes('-dev')) {
             file = 'accounts.dev.json'
         }
 
-        const accountDir = path.join(__dirname, '../', file)
-        const accounts = fs.readFileSync(accountDir, 'utf-8')
+        const accountFile = resolveProjectFile(file)
+        if (!accountFile) {
+            throw new Error(
+                `accounts.json not found - place it in the project root (dist/ and src/ are also searched as fallbacks)`
+            )
+        }
+
+        const accounts = fs.readFileSync(accountFile, 'utf-8')
         const accountsData = JSON.parse(accounts)
 
         validateAccounts(accountsData)
@@ -32,111 +113,33 @@ export function loadAccounts(): Account[] {
 
         return accountsData
     } catch (error) {
-        throw new Error(error as string)
+        throw new Error(error instanceof Error ? error.message : String(error))
     }
 }
 
 export function loadConfig(): Config {
     try {
+        ensureEnvLoaded()
+
         if (configCache) {
             return configCache
         }
 
-        const configDir = path.join(__dirname, '../', 'config.json')
-        const config = fs.readFileSync(configDir, 'utf-8')
+        // Check root -> dist -> src (not in dist, but root)
+        const configPath = resolveProjectFile('config.json')
+        if (!configPath) {
+            throw new Error(
+                'config.json not found - place it in the project root (dist/ and src/ are also searched as fallbacks)'
+            )
+        }
+        const config = fs.readFileSync(configPath, 'utf-8')
 
-        const configData = JSON.parse(config)
-        validateConfig(configData)
+        const unverifiedConfig = JSON.parse(config)
+        const configData = validateConfig(unverifiedConfig)
 
         configCache = configData
 
         return configData
-    } catch (error) {
-        throw new Error(error as string)
-    }
-}
-
-export async function loadSessionData(
-    sessionPath: string,
-    email: string,
-    saveFingerprint: ConfigSaveFingerprint,
-    isMobile: boolean
-) {
-    try {
-        const cookiesFileName = isMobile ? 'session_mobile.json' : 'session_desktop.json'
-        const cookieFile = path.join(__dirname, '../browser/', sessionPath, email, cookiesFileName)
-
-        let cookies: Cookie[] = []
-        if (fs.existsSync(cookieFile)) {
-            const cookiesData = await fs.promises.readFile(cookieFile, 'utf-8')
-            cookies = JSON.parse(cookiesData)
-
-            const hasValidAuth = cookies.some(c => c.name === '_C_Auth' && c.value && c.value.length > 0)
-            if (!hasValidAuth) {
-                return { cookies: [], fingerprint: undefined }
-            }
-        } else {
-            return { cookies: [], fingerprint: undefined }
-        }
-
-        const fingerprintFileName = isMobile ? 'session_fingerprint_mobile.json' : 'session_fingerprint_desktop.json'
-        const fingerprintFile = path.join(__dirname, '../browser/', sessionPath, email, fingerprintFileName)
-
-        let fingerprint!: BrowserFingerprintWithHeaders
-        const shouldLoadFingerprint = isMobile ? saveFingerprint.mobile : saveFingerprint.desktop
-        if (shouldLoadFingerprint && fs.existsSync(fingerprintFile)) {
-            const fingerprintData = await fs.promises.readFile(fingerprintFile, 'utf-8')
-            fingerprint = JSON.parse(fingerprintData)
-        }
-
-        return {
-            cookies: cookies,
-            fingerprint: fingerprint
-        }
-    } catch (error) {
-        throw new Error(error as string)
-    }
-}
-
-export async function saveSessionData(
-    sessionPath: string,
-    cookies: Cookie[],
-    email: string,
-    isMobile: boolean
-): Promise<string> {
-    try {
-        const sessionDir = path.join(__dirname, '../browser/', sessionPath, email)
-        const cookiesFileName = isMobile ? 'session_mobile.json' : 'session_desktop.json'
-
-        if (!fs.existsSync(sessionDir)) {
-            await fs.promises.mkdir(sessionDir, { recursive: true })
-        }
-
-        await fs.promises.writeFile(path.join(sessionDir, cookiesFileName), JSON.stringify(cookies))
-
-        return sessionDir
-    } catch (error) {
-        throw new Error(error as string)
-    }
-}
-
-export async function saveFingerprintData(
-    sessionPath: string,
-    email: string,
-    isMobile: boolean,
-    fingerpint: BrowserFingerprintWithHeaders
-): Promise<string> {
-    try {
-        const sessionDir = path.join(__dirname, '../browser/', sessionPath, email)
-        const fingerprintFileName = isMobile ? 'session_fingerprint_mobile.json' : 'session_fingerprint_desktop.json'
-
-        if (!fs.existsSync(sessionDir)) {
-            await fs.promises.mkdir(sessionDir, { recursive: true })
-        }
-
-        await fs.promises.writeFile(path.join(sessionDir, fingerprintFileName), JSON.stringify(fingerpint))
-
-        return sessionDir
     } catch (error) {
         throw new Error(error as string)
     }

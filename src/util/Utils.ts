@@ -1,6 +1,22 @@
 import ms, { StringValue } from 'ms'
 import { randomInt } from 'crypto'
 
+export function isBrowserClosedError(error: unknown): boolean {
+    const msg = (error instanceof Error ? error.message : String(error ?? '')).toLowerCase()
+    if (!msg) return false
+    return (
+        msg.includes('has been closed') ||
+        msg.includes('target closed') ||
+        msg.includes('target page, context or browser') ||
+        msg.includes('browser has disconnected') ||
+        msg.includes('browser closed') ||
+        msg.includes('connection closed') ||
+        msg.includes('session closed') ||
+        msg.includes('page closed') ||
+        msg.includes('websocket connection closed')
+    )
+}
+
 export default class Util {
     // Cryptographically secure random float between 0 and 1
     private cryptoRandom(): number {
@@ -11,6 +27,7 @@ export default class Util {
     private cryptoRandomInt(min: number, max: number): number {
         return randomInt(min, max + 1)
     }
+
     async wait(time: number | string): Promise<void> {
         if (typeof time === 'string') {
             time = this.stringToNumber(time)
@@ -98,6 +115,11 @@ export default class Util {
         return Math.floor(this.randomNumber(minMs, maxMs))
     }
 
+    serverActionAcknowledged(response: unknown): boolean {
+        const text = typeof response === 'string' ? response : String(response ?? '')
+        return /^\d+:true\s*$/m.test(text)
+    }
+
     // Human-like typing delay (200-500ms per keystroke - slow one-finger typist)
     humanTypingDelay(): number {
         // 30% chance of a longer pause (simulating thinking/looking for key)
@@ -176,7 +198,7 @@ export default class Util {
     async typeHumanLike(page: any, selector: string, text: string): Promise<void> {
         const element = await page.locator(selector)
         await element.click()
-        
+
         for (const char of text) {
             await page.keyboard.type(char, { delay: this.humanTypingDelay() })
         }
