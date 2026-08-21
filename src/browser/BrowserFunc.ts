@@ -238,10 +238,13 @@ export default class BrowserFunc {
 
     async bootstrap(page: Page): Promise<void> {
         try {
-            // /earn is the offers page
+            // /earn is the offers page. Wait for network idle (not just domcontentloaded) so the
+            // client-side SPA redirect finishes before we try to read content - otherwise the
+            // "Unable to retrieve content because the page is navigating" race aborts bootstrap.
             await page.goto(URLs.rewards.earn, { waitUntil: 'domcontentloaded' })
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
 
-            const earnDom = await page.content()
+            const earnDom = await this.getStablePageContent(page)
             const earnRaw = await this.fetchBootstrapHtml(page, URLs.rewards.earn, '/earn')
 
             this.rewardsDeploymentId = this.bot.browser.react.buildId(earnRaw || earnDom) ?? ''
@@ -318,6 +321,32 @@ export default class BrowserFunc {
                 'BOOTSTRAP',
                 `Failed to fetch ${route} HTML | error=${error instanceof Error ? error.message : String(error)} - snapshot and action discovery may be incomplete`
             )
+        }
+
+        return ''
+    }
+
+    // Read page content defensively: the SPA can still be mid-navigation right after
+    // domcontentloaded, which makes page.content() throw "page is navigating". Retry a few
+    // times with a short wait so a transient race doesn't abort the whole bootstrap.
+    private async getStablePageContent(page: Page, attempts = 4): Promise<string> {
+        for (let attempt = 0; attempt < attempts; attempt++) {
+            try {
+                const content = await page.content()
+                if (content && content.trim().length) return content
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error)
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'BOOTSTRAP',
+                    `page.content attempt ${attempt + 1}/${attempts} failed: ${msg}`
+                )
+            }
+
+            if (attempt < attempts - 1) {
+                await this.bot.utils.wait(700)
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+            }
         }
 
         return ''

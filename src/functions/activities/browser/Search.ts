@@ -49,12 +49,15 @@ export class Search extends Workers {
     private static googleTrendsCache: { queries: GoogleSearch[], timestamp: number, geoLocale: string } | null = null
     private static TRENDS_CACHE_TTL = 1000 * 60 * 300 // 5 hours in milliseconds
 
-    // Model configuration with weights
+    // Model configuration with weights (verified against OpenRouter's live free list)
+    // NOTE: minimax/minimax-m2.5 is now paid-only - OpenRouter returns HTTP 404
+    // "This model is unavailable for free. The paid version is available now".
     private readonly modelConfig = [
-        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'stepfun/step-3.5-flash:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'minimax/minimax-m2.5:free', weight: 1 / 4, supportsReasoning: false },
-        { name: 'nvidia/nemotron-nano-12b-v2-vl:free', weight: 1 / 4, supportsReasoning: false },
+        { name: 'nvidia/nemotron-3-super-120b-a12b:free', weight: 1 / 5, supportsReasoning: false },
+        { name: 'nvidia/nemotron-3-ultra-550b-a55b:free', weight: 1 / 5, supportsReasoning: false },
+        { name: 'nvidia/nemotron-3-nano-30b-a3b:free', weight: 1 / 5, supportsReasoning: false },
+        { name: 'openai/gpt-oss-20b:free', weight: 1 / 5, supportsReasoning: false },
+        { name: 'poolside/laguna-s-2.1:free', weight: 1 / 5, supportsReasoning: false },
     ]
 
     public async doSearch(page: Page, isMobile: boolean): Promise<number> {
@@ -627,7 +630,7 @@ export class Search extends Workers {
         }
 
         const selectedModel = this.selectRandomModel()
-        const fallbackModel = 'meta-llama/llama-3.3-70b-instruct:free'
+        const fallbackModel = 'nvidia/nemotron-3-ultra-550b-a55b:free'
         const categoryWeights = this.getTimeBasedCategoryWeights()
         const { systemPrompt, userPrompt } = this.generateCategoryPrompt(categoryWeights, geoLocale)
 
@@ -669,7 +672,7 @@ export class Search extends Workers {
             headers: {
                 'Content-Type': 'application/json',
                 'HTTP-Referer': '<YOUR_SITE_URL>',
-                'X-Title':'<YOUR_SITE_NAME>',
+                'X-OpenRouter-Title': '<YOUR_SITE_NAME>',
                 'Authorization': `Bearer ${apiKey}`
             },
             proxy: false,
@@ -772,7 +775,7 @@ export class Search extends Workers {
                             temperature: 0.45,
                             stream: false
                         }
-                        payload2.response_format = { type: 'json_object' }
+                        if ((this.bot.config as any)?.openRouterRequireResponseFormat) payload2.response_format = { type: 'json_object' }
                         payload2.reasoning = { enabled: true }
 
                         const resp2 = await doAxiosPost(payload2)
@@ -811,7 +814,13 @@ export class Search extends Workers {
                     }
                     if (err?.response) {
                         const data = err.response.data
-                        this.bot.logger.error(mobile, 'SEARCH-LLM', `HTTP ${status} error: ${JSON.stringify(data)}`)
+                        if (status === 404) {
+                            // Selected model is no longer available (e.g. ':free' slug went paid).
+                            // Not a hard failure - the retry loop simply moves to the next model.
+                            this.bot.logger.warn(mobile, 'SEARCH-LLM', `HTTP 404 (model unavailable) error: ${JSON.stringify(data)}`)
+                        } else {
+                            this.bot.logger.error(mobile, 'SEARCH-LLM', `HTTP ${status} error: ${JSON.stringify(data)}`)
+                        }
                         throw new Error(`HTTP ${status}: ${JSON.stringify(data)}`)
                     } else if (err.code === 'ECONNABORTED') {
                         this.bot.logger.warn(mobile, 'SEARCH-LLM', 'Request timeout')

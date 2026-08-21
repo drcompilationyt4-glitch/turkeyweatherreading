@@ -1,16 +1,30 @@
 import { Workers } from '../../Workers'
 
+// Candidate server-action names that claim all available bonus points.
+// Microsoft renames these across bundle releases, so we try known aliases,
+// then fall back to a fuzzy name search when none match exactly.
+const CLAIM_ALL_ACTION_NAMES = [
+    'reportClaimAllPoints',
+    'claimAllPoints',
+    'reportClaimReward',
+    'reportClaimPoints',
+    'claimAllRewards',
+    'reportBonusPoints',
+    'claimBonusPoints'
+]
+
 export class ClaimBonusPoints extends Workers {
     public async claimBonusPoints() {
-        const actionId = this.bot.nextActions.reportClaimAllPoints
-        if (!actionId) {
+        const resolved = this.resolveActionId()
+        if (!resolved) {
             this.bot.logger.warn(
                 this.bot.isMobile,
                 'CLAIM-BONUS-POINTS',
-                'Skipping: "reportClaimAllPoints" action id not discovered in bundle'
+                `Skipping: "claimAllPoints" action id not discovered in bundle (looked for [${CLAIM_ALL_ACTION_NAMES.join(', ')}] + any "*claim*all*" key)`
             )
             return
         }
+        const actionId = resolved.id
 
         const oldBalance = this.bot.userData.currentPoints
 
@@ -60,5 +74,26 @@ export class ClaimBonusPoints extends Workers {
                 `Error in claimBonusPoints | message=${error instanceof Error ? error.message : String(error)}`
             )
         }
+    }
+
+    /**
+     * Locate the server-action id that claims all bonus points.
+     * Tries every known alias first, then fuzzy-matches the discovered
+     * action names so a Microsoft bundle rename still resolves.
+     */
+    private resolveActionId(): { name: string; id: string } | null {
+        const actions = this.bot.nextActions
+
+        for (const name of CLAIM_ALL_ACTION_NAMES) {
+            const id = actions[name]
+            if (id) return { name, id }
+        }
+
+        const fuzzy = Object.keys(actions).find(
+            k => /claim/i.test(k) && /(?:all|every|point|bonus|reward)/i.test(k)
+        )
+        if (fuzzy) return { name: fuzzy, id: actions[fuzzy]! }
+
+        return null
     }
 }

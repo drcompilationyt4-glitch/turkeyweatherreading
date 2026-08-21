@@ -120,17 +120,21 @@ export default class Util {
         return /^\d+:true\s*$/m.test(text)
     }
 
-    // Human-like typing delay (200-500ms per keystroke - slow one-finger typist)
+    // Human-like typing delay (300-750ms per keystroke - slow one-finger typist)
     humanTypingDelay(): number {
         // 30% chance of a longer pause (simulating thinking/looking for key)
         if (this.cryptoRandom() < 0.30) {
-            return this.randomNumber(1000, 2000)
+            return this.randomNumber(1500, 3000)
         }
-        // 10% chance of very long pause (looking for key on keyboard)
+        // 12% chance of very long pause (hesitation before hitting the next key)
+        if (this.cryptoRandom() < 0.12) {
+            return this.randomNumber(3000, 6000)
+        }
+        // 10% chance of a fast key-burst (humans occasionally type several keys quickly)
         if (this.cryptoRandom() < 0.10) {
-            return this.randomNumber(2000, 4000)
+            return this.randomNumber(90, 200)
         }
-        return this.randomNumber(200, 500)
+        return this.randomNumber(300, 750)
     }
 
     // Human-like page load delay (20-45 seconds - simulating slow internet)
