@@ -8,6 +8,7 @@ export interface Config {
     autoClaimPunchcardRewards: boolean
     skipNonPointTasks: boolean
     accountDelay: ConfigDelay
+    legacyFallback?: ConfigLegacyFallback
     workers: ConfigWorkers
     activities: ConfigActivities
     searchOnBingLocalQueries: boolean
@@ -18,6 +19,12 @@ export interface Config {
     proxy: ConfigProxy
     consoleLogFilter: LogFilter
     webhook: ConfigWebhook
+}
+
+export interface ConfigLegacyFallback {
+    enabled: boolean
+    minDelay: number | string
+    maxDelay: number | string
 }
 
 export type QueryEngine = 'google' | 'wikipedia' | 'wikirandom' | 'hackernews' | 'reddit' | 'local'

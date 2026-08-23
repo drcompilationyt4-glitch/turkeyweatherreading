@@ -1,6 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import cluster, { Worker } from 'cluster'
 import type { BrowserContext, Cookie, Page } from 'patchright'
+import fs from 'fs'
+import path from 'path'
+import { spawn } from 'child_process'
 import pkg from '../package.json'
 
 import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
@@ -114,6 +117,7 @@ export class MicrosoftRewardsBot {
 
     private activeWorkers: number
     private exitedWorkers: number[]
+    private legacyFallbackRunning = false
     private browserFactory: Browser = new Browser(this)
     private accounts: Account[]
     public workers: Workers
@@ -475,6 +479,8 @@ export class MicrosoftRewardsBot {
                         success: false,
                         error: 'Flow failed'
                     })
+
+                    await this.runLegacyFallback(account, 'flow-failed')
                 }
             } catch (error) {
                 const durationSeconds = ((Date.now() - accountStartTime) / 1000).toFixed(1)
@@ -493,6 +499,8 @@ export class MicrosoftRewardsBot {
                     success: false,
                     error: error instanceof Error ? error.message : String(error)
                 })
+
+                await this.runLegacyFallback(account, 'account-error')
             }
         }
 
@@ -534,6 +542,124 @@ export class MicrosoftRewardsBot {
             }`
         )
         await this.utils.wait(delayMs)
+    }
+
+    /**
+     * Fallback when the modern (exp) flow fails for an account:
+     *  1. Logs the fallback
+     *  2. Waits a random delay (default 1-2 hours; configurable)
+     *  3. Runs the old reliable build (distv2) via a child process for that account
+     */
+    private async runLegacyFallback(account: Account, reason: string): Promise<void> {
+        const cfg = this.config.legacyFallback ?? { enabled: true, minDelay: '1hr', maxDelay: '2hr' }
+        const enabled = cfg.enabled !== false
+        const projectRoot = process.cwd()
+        const distv2Index = path.join(projectRoot, 'distv2', 'index.js')
+
+        if (this.legacyFallbackRunning) {
+            this.logger.warn(
+                'main',
+                'LEGACY-FALLBACK',
+                `Legacy fallback already in progress - skipping duplicate retry for ${account.email} | reason=${reason}`
+            )
+            return
+        }
+        this.legacyFallbackRunning = true
+
+        try {
+
+        if (!enabled) {
+            this.logger.warn(
+                'main',
+                'LEGACY-FALLBACK',
+                `Legacy fallback disabled - skipping distv2 retry for ${account.email} | reason=${reason}`
+            )
+            return
+        }
+
+        if (!fs.existsSync(distv2Index)) {
+            this.logger.warn(
+                'main',
+                'LEGACY-FALLBACK',
+                `distv2 build not found at ${distv2Index} - skipping legacy retry for ${account.email} | reason=${reason}`
+            )
+            return
+        }
+
+        const minMs =
+            typeof cfg.minDelay === 'number'
+                ? cfg.minDelay
+                : cfg.minDelay
+                  ? this.utils.stringToNumber(cfg.minDelay)
+                  : this.utils.stringToNumber('1hr')
+        const maxMs =
+            typeof cfg.maxDelay === 'number'
+                ? cfg.maxDelay
+                : cfg.maxDelay
+                  ? this.utils.stringToNumber(cfg.maxDelay)
+                  : this.utils.stringToNumber('2hr')
+
+        if (minMs < 0 || maxMs < 0 || maxMs < minMs) {
+            throw new Error('legacyFallback delay must be non-negative with max >= min')
+        }
+
+        const delayMs = this.utils.randomNumber(Math.ceil(minMs), Math.floor(maxMs))
+        this.logger.warn(
+            'main',
+            'LEGACY-FALLBACK',
+            `Legacy fallback triggered for ${account.email} | reason=${reason} | waiting ${(delayMs / 60000).toFixed(1)} minutes before retrying with the reliable (distv2) build`
+        )
+        await this.utils.wait(delayMs)
+
+        // Back up and swap in a single-account file so distv2 only processes this account
+        const distv2Accounts = path.join(projectRoot, 'distv2', 'accounts.json')
+        const originalAccounts = fs.existsSync(distv2Accounts) ? fs.readFileSync(distv2Accounts, 'utf8') : null
+        fs.writeFileSync(distv2Accounts, JSON.stringify([account], null, 2))
+
+        this.logger.info(
+            'main',
+            'LEGACY-FALLBACK',
+            `Starting reliable (distv2) retry for ${account.email} | distv2=${distv2Index}`
+        )
+
+        try {
+            await new Promise<void>(resolve => {
+                const child = spawn(process.execPath, [distv2Index], {
+                    cwd: projectRoot,
+                    env: { ...process.env },
+                    stdio: 'inherit'
+                })
+                child.on('exit', code => {
+                    this.logger.info(
+                        'main',
+                        'LEGACY-FALLBACK',
+                        `Reliable (distv2) retry finished for ${account.email} | exitCode=${code ?? 'n/a'}`
+                    )
+                    resolve()
+                })
+                child.on('error', err => {
+                    this.logger.error(
+                        'main',
+                        'LEGACY-FALLBACK',
+                        `Failed to spawn distv2 for ${account.email} | ${err instanceof Error ? err.message : String(err)}`
+                    )
+                    resolve()
+                })
+            })
+        } finally {
+            // Restore the original accounts file so future runs use the full list
+            if (originalAccounts !== null) {
+                fs.writeFileSync(distv2Accounts, originalAccounts)
+            } else {
+                try {
+                    fs.unlinkSync(distv2Accounts)
+                } catch { /* ignore */ }
+            }
+        }
+        } finally {
+            // Always reset the guard so later account failures can still trigger a fallback
+            this.legacyFallbackRunning = false
+        }
     }
 
     async createDesktopSession(account: Account): Promise<BrowserSession> {

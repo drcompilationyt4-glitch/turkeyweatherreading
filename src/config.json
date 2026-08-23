@@ -1,6 +1,6 @@
 {
     "sessionPath": "sessions",
-    "headless": true,
+    "headless": false,
     "clusters": 3,
     "errorDiagnostics": false,
     "ensureStreakProtection": true,
@@ -9,6 +9,11 @@
     "accountDelay": {
         "min": "10min",
         "max": "30min"
+    },
+    "legacyFallback": {
+        "enabled": true,
+        "minDelay": "1hr",
+        "maxDelay": "2hr"
     },
     "workers": {
         "doDailySet": true,
