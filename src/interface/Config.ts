@@ -25,6 +25,8 @@ export interface ConfigLegacyFallback {
     enabled: boolean
     minDelay: number | string
     maxDelay: number | string
+    /** Day alternation: Sun=src, Mon=srcv2, Tue=src, ... (default true) */
+    alternate?: boolean
 }
 
 export type QueryEngine = 'google' | 'wikipedia' | 'wikirandom' | 'hackernews' | 'reddit' | 'local'

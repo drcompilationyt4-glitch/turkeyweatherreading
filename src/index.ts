@@ -263,11 +263,21 @@ export class MicrosoftRewardsBot {
         const totalAccounts = this.accounts.length
         const runStartTime = Date.now()
 
+        const legacyToday = this.shouldRunLegacyToday()
         this.logger.info(
             'main',
             'RUN-START',
-            `Starting Microsoft Rewards Script | v${pkg.version} | Accounts: ${totalAccounts} | Clusters: ${this.config.clusters}`
+            `Starting Microsoft Rewards Script | v${pkg.version} | Accounts: ${totalAccounts} | Clusters: ${this.config.clusters} | Engine: ${legacyToday ? 'legacy (srcv2)' : 'modern (src)'}`
         )
+
+        // Whole-run alternation: on legacy days the reliable srcv2/distv2 engine handles
+        // all accounts. Only the primary (or single) process spawns it - workers stand down.
+        if (legacyToday) {
+            if (this.config.clusters <= 1 || cluster.isPrimary) {
+                await this.runLegacyEngineForAll()
+            }
+            return
+        }
 
         if (this.config.clusters > 1) {
             if (cluster.isPrimary) {
@@ -278,6 +288,65 @@ export class MicrosoftRewardsBot {
         } else {
             await this.runTasks(this.accounts, runStartTime)
         }
+    }
+
+    /**
+     * Daily engine alternation:
+     *   Sunday   -> modern (src)
+     *   Monday   -> legacy (srcv2)
+     *   Tuesday  -> modern (src)
+     *   Wednesday-> legacy (srcv2)
+     *   ...alternates, repeating every Sunday with modern (src).
+     * Disable with config `legacyFallback.alternate: false`.
+     */
+    private shouldRunLegacyToday(): boolean {
+        const cfg = this.config.legacyFallback
+        if (cfg && cfg.alternate === false) return false
+        const day = new Date().getDay() // 0 = Sunday
+        return day % 2 === 1
+    }
+
+    /**
+     * Runs the whole day's accounts through the reliable legacy engine (distv2).
+     * Falls back to the modern flow if the distv2 build is missing.
+     */
+    private async runLegacyEngineForAll(): Promise<void> {
+        const projectRoot = process.cwd()
+        const distv2Index = path.join(projectRoot, 'distv2', 'index.js')
+
+        if (!fs.existsSync(distv2Index)) {
+            this.logger.warn(
+                'main',
+                'LEGACY-DAY',
+                `Today is a legacy (srcv2) day but distv2 build not found at ${distv2Index} - falling back to modern (src) flow`
+            )
+            return
+        }
+
+        this.logger.warn('main', 'LEGACY-DAY', `Running the reliable legacy (srcv2) engine for all accounts today`)
+
+        await new Promise<void>(resolve => {
+            const child = spawn(process.execPath, [distv2Index], {
+                cwd: projectRoot,
+                env: { ...process.env },
+                stdio: 'inherit'
+            })
+            child.on('exit', code => {
+                this.logger.info('main', 'LEGACY-DAY', `Legacy (srcv2) run finished | exitCode=${code ?? 'n/a'}`)
+                resolve()
+            })
+            child.on('error', err => {
+                this.logger.error(
+                    'main',
+                    'LEGACY-DAY',
+                    `Failed to spawn distv2 | ${err instanceof Error ? err.message : String(err)}`
+                )
+                resolve()
+            })
+        })
+
+        await flushAllWebhooks()
+        process.exit(0)
     }
 
     private async runMaster(runStartTime: number): Promise<void> {

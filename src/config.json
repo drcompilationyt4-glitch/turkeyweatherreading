@@ -1,7 +1,7 @@
 {
     "sessionPath": "sessions",
     "headless": false,
-    "clusters": 3,
+    "clusters": 1,
     "errorDiagnostics": false,
     "ensureStreakProtection": true,
     "autoClaimPunchcardRewards": false,
@@ -13,7 +13,8 @@
     "legacyFallback": {
         "enabled": true,
         "minDelay": "1hr",
-        "maxDelay": "2hr"
+        "maxDelay": "2hr",
+        "alternate": true
     },
     "workers": {
         "doDailySet": true,
