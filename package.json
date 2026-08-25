@@ -8,9 +8,10 @@
         "node": ">=24.0.0"
     },
     "scripts": {
-        "pre-build": "npm i && rimraf dist && npx patchright install chromium",
+        "pre-build": "npm i && npx patchright install chromium && npm run build",
         "install:browser": "npx patchright install chromium",
-        "build": "rimraf dist && tsc && node ./scripts/main/copyAssets.js",
+        "build": "rimraf dist distv2 && tsc -p tsconfig.json && tsc -p tsconfig.v2.json && node ./scripts/main/copyAssets.js",
+        "build:v2": "rimraf distv2 && tsc -p tsconfig.v2.json",
         "start": "node ./dist/index.js",
         "start:log": "node ./dist/index.js 2>&1 | tee logs/bot-$(date +%Y%m%d-%H%M%S).log",
         "ts-start": "ts-node ./src/index.ts",
@@ -51,6 +52,7 @@
     "dependencies": {
         "axios": "^1.19.0",
         "chalk": "^4.1.2",
+        "cheerio": "^1.0.0",
         "fast-xml-parser": "^5.9.3",
         "fingerprint-generator": "^2.1.88",
         "fingerprint-injector": "^2.1.88",
