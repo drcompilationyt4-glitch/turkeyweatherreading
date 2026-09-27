@@ -30,6 +30,8 @@ type LoginState =
     | 'OTP_CODE_ENTRY'
     | 'UNKNOWN'
     | 'CHROMEWEBDATA_ERROR'
+    | 'INTERRUPT'
+    | 'SESSION_ERROR'
 
 export class Login {
     emailLogin: EmailLogin
@@ -66,6 +68,8 @@ export class Login {
         otpInput: 'div[data-testid="codeEntry"]'
     } as const
 
+    private readonly loginUrl = 'https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin'
+
     constructor(private bot: MicrosoftRewardsBot) {
         this.emailLogin = new EmailLogin(this.bot)
         this.passwordlessLogin = new PasswordlessLogin(this.bot)
@@ -79,7 +83,7 @@ export class Login {
             this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Starting login process')
 
             await page
-                .goto('https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin', {
+                .goto(this.loginUrl, {
                     waitUntil: 'domcontentloaded'
                 })
                 .catch(() => {})
@@ -116,9 +120,9 @@ export class Login {
                         this.bot.logger.warn(
                             this.bot.isMobile,
                             'LOGIN',
-                            `Stuck in state "${state}" for 4 loops, refreshing page`
+                            `Stuck in state "${state}" for 4 loops, returning to Rewards`
                         )
-                        await page.reload({ waitUntil: 'domcontentloaded' })
+                        await page.goto(this.loginUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
                         await this.bot.utils.wait(3000)
                         sameStateCount = 0
                         previousState = 'UNKNOWN'
@@ -223,7 +227,11 @@ export class Login {
             this.checkSelector(page, this.selectors.passwordEntry)
         ])
 
-        if (identityBanner && primaryButton && !passwordEntry && !results.includes('2FA_TOTP')) {
+        const onSignInPage =
+            (url.hostname === 'login.live.com' || url.hostname === 'login.microsoft.com') &&
+            !this.isPasskeyEnrollment(url)
+
+        if (onSignInPage && identityBanner && primaryButton && !passwordEntry && !results.includes('2FA_TOTP')) {
             const codeState = account?.password ? 'GET_A_CODE' : 'GET_A_CODE_2'
             this.bot.logger.debug(
                 this.bot.isMobile,
@@ -237,7 +245,7 @@ export class Login {
 
         if (foundStates.length === 0) {
             this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', 'No matching states found')
-            return 'UNKNOWN'
+            return this.fallbackState(url)
         }
 
         if (foundStates.includes('ERROR_ALERT')) {
@@ -278,8 +286,46 @@ export class Login {
             }
         }
 
+        if (foundStates.length === 0) return this.fallbackState(url)
+
         this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Returning first found state: ${foundStates[0]}`)
         return foundStates[0] as LoginState
+    }
+
+    private isPasskeyEnrollment(url: URL): boolean {
+        return url.pathname.toLowerCase().includes('/fido/create')
+    }
+
+    // Post-password pages (terms update, passkey setup, security prompts) that sit between sign-in and Rewards
+    private fallbackState(url: URL): LoginState {
+        if (url.hostname === 'account.live.com') {
+            return url.pathname.toLowerCase().includes('error') ? 'SESSION_ERROR' : 'INTERRUPT'
+        }
+        if (this.isPasskeyEnrollment(url)) return 'INTERRUPT'
+        return 'UNKNOWN'
+    }
+
+    private async clickInterruptButton(page: Page): Promise<string | null> {
+        const skip = /^\s*(skip( for now)?|cancel|not now|no thanks|maybe later|remind me later|close)\s*$/i
+        const proceed = /^\s*(next|continue|accept|i accept|agree|i agree|yes|ok|got it|done)\s*$/i
+        const candidates = [
+            page.getByRole('button', { name: skip }),
+            page.getByRole('link', { name: skip }),
+            page.getByRole('button', { name: proceed })
+        ]
+
+        for (const candidate of candidates) {
+            const el = candidate.first()
+            if (!(await el.isVisible().catch(() => false))) continue
+
+            const label =
+                (await el.innerText().catch(() => '')).trim() ||
+                ((await el.getAttribute('value').catch(() => null)) ?? 'button')
+            await el.click({ timeout: 5000 }).catch(() => {})
+            await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+            return label
+        }
+        return null
     }
 
     private async checkSelector(page: Page, selector: string): Promise<boolean> {
@@ -564,6 +610,40 @@ export class Login {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after OTP navigation')
                 })
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Navigated back from OTP entry page')
+                return true
+            }
+
+            case 'INTERRUPT': {
+                const url = new URL(page.url())
+                const heading = (
+                    await page.locator('h1').first().innerText({ timeout: 1000 }).catch(() => '')
+                ).trim()
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'LOGIN',
+                    `Interrupt page at ${url.hostname}${url.pathname}${heading ? ` ("${heading}")` : ''}`
+                )
+
+                const clicked = await this.clickInterruptButton(page)
+                if (clicked) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Clicked "${clicked}" on interrupt page`)
+                    return true
+                }
+
+                this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'No dismiss button found, returning to Rewards')
+                await page.goto(this.loginUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+                return true
+            }
+
+            case 'SESSION_ERROR': {
+                const url = new URL(page.url())
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'LOGIN',
+                    `Microsoft error page at ${url.hostname}${url.pathname}, returning to Rewards`
+                )
+                await page.goto(this.loginUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+                await this.bot.utils.wait(2000)
                 return true
             }
 
