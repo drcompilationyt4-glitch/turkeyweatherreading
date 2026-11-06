@@ -11,6 +11,8 @@ import type { SearchTracker } from '../../../interface/Search'
 import type { MissingSearchPoints } from '../../../interface/Points'
 import type { MicrosoftRewardsBot } from '../../../index'
 import type { GoogleSearch, GoogleTrendsResponse } from '../../../interface/Search'
+import { pickModel, resolveFreeModels } from '../../../util/OpenRouterModels'
+import { fetchGoogleTrendsRss } from '../../../util/GoogleTrendsRss'
 
 const REFRESH_EVERY = 10
 const MAX_QUERY_ATTEMPTS = 5
@@ -18,7 +20,8 @@ const MAX_QUERY_ATTEMPTS = 5
 const POINTS_MAX_SEARCHES = 100
 const POINTS_STAGNANT_LIMIT = 10
 
-const SEARCH_BOX = '#sb_form_q'
+// Bing now renders two #sb_form_q boxes; target the visible one or strict mode refuses
+const SEARCH_BOX = '#sb_form_q >> visible=true >> nth=0'
 const RESULT_LINK = '#b_results .b_algo h2'
 
 type Mode = 'balanced' | 'relaxed' | 'study' | 'food' | 'gaming' | 'news'
@@ -481,6 +484,22 @@ export class Search extends Workers {
         const queryTerms: GoogleSearch[] = []
         const mobile = this.bot.isMobile
         this.bot.logger.debug(mobile, 'SEARCH-GOOGLE-TRENDS', `Generating search queries | GeoLocale: ${geoLocale}`)
+
+        // Public RSS feed first - the internal batchexecute endpoint below changes format without notice
+        try {
+            const rss = await fetchGoogleTrendsRss(geoLocale)
+            if (rss.length > 0) {
+                this.bot.logger.debug(mobile, 'SEARCH-GOOGLE-TRENDS', `Trends RSS returned ${rss.length} topics for ${geoLocale}`)
+                return rss
+            }
+        } catch (error) {
+            this.bot.logger.debug(
+                mobile,
+                'SEARCH-GOOGLE-TRENDS',
+                `Trends RSS failed, trying batchexecute | ${error instanceof Error ? error.message : String(error)}`
+            )
+        }
+
         try {
             const request: AxiosRequestConfig = {
                 url: 'https://trends.google.com/_/TrendsUi/data/batchexecute',
@@ -629,8 +648,12 @@ export class Search extends Workers {
             throw new Error('OpenRouter/OpenAI API key not configured')
         }
 
-        const selectedModel = this.selectRandomModel()
-        const fallbackModel = 'nvidia/nemotron-3-ultra-550b-a55b:free'
+        // Free slugs come and go on OpenRouter - try only models that are free right now, configured ones first
+        const freeModels = await resolveFreeModels(
+            this.modelConfig.map(m => m.name),
+            message => this.bot.logger.debug(mobile, 'SEARCH-LLM', message)
+        )
+        const selectedModel = { name: pickModel(freeModels, this.modelConfig), supportsReasoning: false }
         const categoryWeights = this.getTimeBasedCategoryWeights()
         const { systemPrompt, userPrompt } = this.generateCategoryPrompt(categoryWeights, geoLocale)
 
@@ -919,8 +942,10 @@ export class Search extends Workers {
             }
         }
 
-        // Phase 2: try other models
-        const otherModels = this.modelConfig.filter((m: any) => m.name !== selectedModel.name)
+        // Phase 2: try the other currently-free models
+        const otherModels = freeModels
+            .filter(name => name !== selectedModel.name)
+            .map(name => ({ name, supportsReasoning: false }))
         for (const model of otherModels) {
             for (const key of keys) {
                 try {
@@ -932,19 +957,6 @@ export class Search extends Workers {
                     lastErr = err
                     this.bot.logger.debug(mobile, 'SEARCH-LLM', `Alternative model ${model.name} failed: ${err instanceof Error ? err.message : String(err)}`)
                 }
-            }
-        }
-
-        // Phase 3: fallback model
-        for (const key of keys) {
-            try {
-                this.bot.logger.debug(mobile, 'SEARCH-LLM', `Trying fallback model ${fallbackModel}`)
-                const content = await sendOnce(key, fallbackModel, false)
-                const normalized = tryNormalizeWithFallbacks(content)
-                if (normalized.length > 0) return normalized
-            } catch (err) {
-                lastErr = err
-                this.bot.logger.debug(mobile, 'SEARCH-LLM', `Fallback model failed: ${err instanceof Error ? err.message : String(err)}`)
             }
         }
 
@@ -1384,18 +1396,6 @@ export class Search extends Workers {
         const topQueries = (weekday === 0 || weekday === 6) ? ['YouTube', 'Netflix', 'games', 'food delivery', 'weekend plans'] : ['how to', 'best way to', 'tutorial', 'assignment help', 'campus resources']
         const contextNotes = `Auto mode: ${mode}. Day: ${dayNames[weekday]}. Example top query: ${topQueries[Math.floor(rng() * topQueries.length)]}`
         return { mode, diversityLevel, contextNotes, modesPool }
-    }
-
-    private selectRandomModel(): { name: string, supportsReasoning: boolean } {
-        const random = randomInt(0, 1000000) / 1000000
-        let cumulativeWeight = 0
-        for (const model of this.modelConfig) {
-            cumulativeWeight += model.weight
-            if (random <= cumulativeWeight) {
-                return { name: model.name, supportsReasoning: model.supportsReasoning }
-            }
-        }
-        return this.modelConfig[0]!
     }
 
     private getTimeBasedCategoryWeights(): CategoryWeights {

@@ -6,6 +6,7 @@ import path from 'path'
 
 import { Workers } from '../../Workers'
 import { QueryCore } from '../../QueryEngine'
+import { pickModel, resolveFreeModels } from '../../../util/OpenRouterModels'
 
 import type { BasePromotion } from '../../../interface/DashboardData'
 
@@ -262,7 +263,10 @@ export class SearchOnBing extends Workers {
                 timeout: 20000
             })
 
-            const selectedModel = this.selectRandomModel()
+            // Only currently-free models; a few in a row so one retired slug doesn't lose the query
+            const freeModels = await resolveFreeModels(this.modelConfig.map(m => m.name))
+            const first = pickModel(freeModels, this.modelConfig)
+            const tryOrder = [first, ...freeModels.filter(model => model !== first)].slice(0, 3)
 
             const prompt = `
 Generate a natural Bing search query.
@@ -276,17 +280,23 @@ Improve it to sound human.
 Return ONLY the query.
 `
 
-            const res = await client.post('/chat/completions', {
-                model: selectedModel.name,
-                messages: [{ role: 'user', content: prompt }],
-                temperature: 0.3,
-                max_tokens: 50
-            })
+            for (const model of tryOrder) {
+                try {
+                    const res = await client.post('/chat/completions', {
+                        model,
+                        messages: [{ role: 'user', content: prompt }],
+                        temperature: 0.3,
+                        max_tokens: 50
+                    })
 
-            const text = res.data?.choices?.[0]?.message?.content?.trim()
-            if (!text) return null
+                    const text = res.data?.choices?.[0]?.message?.content?.trim()
+                    if (text) return text.split('\n')[0].trim()
+                } catch (err) {
+                    this.bot.logger.debug(this.bot.isMobile, 'LLM', `Model ${model} failed: ${err}`)
+                }
+            }
 
-            return text.split('\n')[0].trim()
+            return null
 
         } catch (err) {
             this.bot.logger.warn(

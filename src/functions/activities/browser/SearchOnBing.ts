@@ -5,6 +5,9 @@ import { URLs } from '../../../constants/urls'
 
 import type { BasePromotion } from '../../../interface/DashboardData'
 
+// Bing now renders two #sb_form_q boxes; target the visible one or strict mode refuses
+const SEARCH_BOX = '#sb_form_q >> visible=true >> nth=0'
+
 export class SearchOnBing extends Workers {
     private gainedPoints = 0
     private success = false
@@ -145,7 +148,7 @@ export class SearchOnBing extends Workers {
     }
 
     private async ensureSearchReady(page: Page) {
-        const searchBox = page.locator('#sb_form_q')
+        const searchBox = page.locator(SEARCH_BOX)
         if (await searchBox.isVisible().catch(() => false)) return
 
         await page.goto(URLs.bing.origin)
@@ -156,7 +159,7 @@ export class SearchOnBing extends Workers {
     private async typeSearch(page: Page, query: string) {
         await this.ensureSearchReady(page)
 
-        const selector = '#sb_form_q'
+        const selector = SEARCH_BOX
         const searchBox = page.locator(selector)
         await searchBox.waitFor({ state: 'visible', timeout: 15000 })
 

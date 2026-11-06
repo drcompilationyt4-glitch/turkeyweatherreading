@@ -1,9 +1,9 @@
 import * as fs from 'fs'
 import path from 'path'
 import axios from 'axios'
-import { randomInt } from 'crypto'
 
 import { URLs } from '../../constants/urls'
+import { pickModel, resolveFreeModels } from '../../util/OpenRouterModels'
 import type { BasePromotion, Dashboard } from '../../interface/DashboardData'
 import type { MicrosoftRewardsBot } from '../../index'
 
@@ -21,18 +21,6 @@ const LLM_MODELS = [
     { name: 'openai/gpt-oss-20b:free', weight: 1 / 5 },
     { name: 'poolside/laguna-s-2.1:free', weight: 1 / 5 },
 ]
-
-function selectRandomLLMModel(): string {
-    const random = randomInt(0, 1000000) / 1000000
-    let cumulativeWeight = 0
-    for (const model of LLM_MODELS) {
-        cumulativeWeight += model.weight
-        if (random <= cumulativeWeight) {
-            return model.name
-        }
-    }
-    return LLM_MODELS[0]!.name
-}
 
 async function callLLMQueryGenerator(bot: MicrosoftRewardsBot, promotion: BasePromotion): Promise<string | null> {
     const apiKey = (process.env.OPENROUTER_API_KEY || (bot.config as any)?.openRouterApiKey || '').toString().trim()
@@ -60,10 +48,14 @@ Improve it to sound human.
 Return ONLY the query.
 `
 
-    // Weighted-random primary choice, then fall through the whole model list so a
-    // broken/rate-limited/unavailable model never blocks query generation.
-    const primary = selectRandomLLMModel()
-    const tryOrder = [primary, ...LLM_MODELS.filter(m => m.name !== primary).map(m => m.name)]
+    // Weighted-random primary among models free right now, then the rest, so a retired
+    // ':free' slug or a rate-limited model never blocks query generation.
+    const freeModels = await resolveFreeModels(
+        LLM_MODELS.map(m => m.name),
+        message => bot.logger.debug(bot.isMobile, 'SEARCH-ON-BING-LLM', message)
+    )
+    const primary = pickModel(freeModels, LLM_MODELS)
+    const tryOrder = [primary, ...freeModels.filter(name => name !== primary)].slice(0, 4)
 
     let lastError: unknown = null
     for (const model of tryOrder) {
