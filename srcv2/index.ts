@@ -577,7 +577,9 @@ export class MicrosoftRewardsBot {
                                 ? availableQueues 
                                 : activityQueues.filter(q => !q.completed && q.tasks.length > 0)
                             
-                            const selectedQueue = selectableQueues[this.utils.randomNumber(0, selectableQueues.length)]!
+                            // randomNumber includes its upper bound, so the last valid index is length - 1
+                            const selectedQueue = selectableQueues[this.utils.randomNumber(0, selectableQueues.length - 1)]
+                            if (!selectedQueue) break
                             lastActivityType = selectedQueue.name
 
                             // ✅ Do 2-5 tasks EXCLUSIVELY from this activity type

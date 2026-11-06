@@ -153,9 +153,22 @@ export default class BrowserFunc {
         }
     }
 
+    // The dashboard API sometimes answers without userStatus (seen alongside 502s on Microsoft's side).
+    // Retry briefly, then fall back to empty counters instead of crashing the whole account flow.
     async getSearchPoints(): Promise<Counters> {
-        const dashboardData = await this.getDashboardData()
-        return dashboardData.userStatus.counters
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const dashboardData = await this.getDashboardData().catch(() => null)
+            const counters = dashboardData?.userStatus?.counters
+            if (counters) return counters
+
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'GET-SEARCH-POINTS',
+                `Dashboard data had no search counters (attempt ${attempt}/3)`
+            )
+            if (attempt < 3) await this.bot.utils.wait(5000 * attempt)
+        }
+        return { pcSearch: [], mobileSearch: [], activityAndQuiz: [], dailyPoint: [] }
     }
 
     missingSearchPoints(counters: Counters, isMobile: boolean): MissingSearchPoints {
