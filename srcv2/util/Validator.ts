@@ -85,7 +85,8 @@ export const ConfigSchema = z.object({
 // Account
 export const AccountSchema = z.object({
     email: z.string(),
-    password: z.string(),
+    // Blank/missing for passwordless accounts; login then skips the password method
+    password: z.string().default(''),
     totpSecret: z.string().optional(),
     emailCode: z
         .object({

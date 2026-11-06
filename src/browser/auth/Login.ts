@@ -89,6 +89,9 @@ export class Login {
     private passwordlessMethodSelected = false
     // Set once the authenticator-code tile is chosen, so the following code screen is filled from totpSecret
     private totpMethodSelected = false
+    // Set when the password page was skipped for lack of a password, so "Other ways to sign in" (which may lead
+    // straight back to that page) isn't clicked again in an endless loop
+    private passwordPageSkipped = false
 
     private readonly loginUrl = 'https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin'
 
@@ -120,6 +123,7 @@ export class Login {
             let sameStateCount = 0
             this.passwordlessMethodSelected = false
             this.totpMethodSelected = false
+            this.passwordPageSkipped = false
 
             while (iteration < maxIterations) {
                 if (page.isClosed()) throw new Error('Page closed unexpectedly')
@@ -598,8 +602,22 @@ export class Login {
                     this.bot.logger.info(
                         this.bot.isMobile,
                         'LOGIN',
-                        'Password page shown but no password configured; returning to sign-in methods'
+                        'Password page shown but no password configured; looking for another sign-in method'
                     )
+                    this.passwordPageSkipped = true
+
+                    // Only the "other ways" link - never "Forgot password", which starts account recovery
+                    const otherWays = page
+                        .locator(this.selectors.footerAction)
+                        .filter({ hasText: /other ways|another way|different way/i })
+                        .first()
+                    if (await otherWays.isVisible().catch(() => false)) {
+                        await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+                        await otherWays.click({ timeout: 5000 }).catch(() => {})
+                        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                        return true
+                    }
+
                     if (await this.checkSelector(page, this.selectors.backButton)) {
                         await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
                         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
@@ -622,6 +640,24 @@ export class Login {
 
             // "Get a code" page with a generic "Other ways to sign in" footer - open the method picker
             case 'FOOTER_ACTION': {
+                // "Other ways" already led to a password page we can't fill - don't go round again
+                if (!account.password && this.passwordPageSkipped) {
+                    if (!this.canReceiveEmailCode(account)) {
+                        this.bot.logger.error(
+                            this.bot.isMobile,
+                            'LOGIN',
+                            'Account has no password configured and only password/email-code sign-in is offered - add its password to the accounts file'
+                        )
+                        return false
+                    }
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'No password configured; requesting email code')
+                    const codeRequestedAt = Date.now()
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.primaryButton)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    await this.codeLogin.handle(page, account, codeRequestedAt)
+                    return true
+                }
+
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Opening "Other ways to sign in"')
                 await this.bot.utils.wait(this.bot.utils.humanClickDelay())
                 if (!(await this.bot.browser.utils.ghostClick(page, this.selectors.footerAction))) {
