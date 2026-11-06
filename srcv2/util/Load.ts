@@ -50,9 +50,8 @@ export function loadAccounts(): Account[] {
         }
 
         const accounts = fs.readFileSync(accountFile, 'utf-8')
-        const accountsData = JSON.parse(accounts)
-
-        validateAccounts(accountsData)
+        // Use the validated result so schema defaults (saveFingerprint, geoLocale, langCode, proxy) are applied
+        const accountsData = validateAccounts(JSON.parse(accounts))
 
         // ✅ Shuffle accounts (Fisher-Yates)
         for (let i = accountsData.length - 1; i > 0; i--) {
