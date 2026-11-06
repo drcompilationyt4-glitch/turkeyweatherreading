@@ -1,11 +1,16 @@
 import type { Page } from 'patchright'
 import type { MicrosoftRewardsBot } from '../../../index'
+import type { Account } from '../../../interface/Account'
+import { EmailCodeFetcher } from '../../../util/EmailCodeFetcher'
 import { canPromptForInput, getErrorMessage, getSubtitleMessage, promptInput } from './LoginUtils'
 
 export class CodeLogin {
+    private readonly maxAutoCodes = 3
+    private readonly resendPattern = /resend|send (a )?new code|send again|didn.t (get|receive)/i
     private readonly textInputSelector = '[data-testid="codeInputWrapper"]'
-    private readonly secondairyInputSelector = 'input[id="otc-confirmation-input"], input[name="otc"]'
-    private readonly emailInputSelector = '[data-testid="proof-confirmation"]'
+    private readonly secondairyInputSelector = 'input[id="otc-confirmation-input"], input[name="otc"], #iOttText'
+    // Old wrapper and the new Fluent "Verify your email" input
+    private readonly emailInputSelector = '[data-testid="proof-confirmation"], input#proof-confirmation-email-input'
     private readonly maxManualSeconds = 60
     private readonly maxManualAttempts = 5
 
@@ -18,7 +23,7 @@ export class CodeLogin {
                 .catch(() => null)
 
             if (visibleInput) {
-                await page.keyboard.type(code, { delay: 50 })
+                await this.bot.utils.typeLikeHuman(page, code, 'code')
                 const stilOnPage = await page
                     .waitForSelector(this.textInputSelector, { state: 'visible', timeout: 750 })
                     .then(() => true)
@@ -32,7 +37,8 @@ export class CodeLogin {
 
             const secondairyInput = await page.$(this.secondairyInputSelector)
             if (secondairyInput) {
-                await page.keyboard.type(code, { delay: 50 })
+                await secondairyInput.click().catch(() => {})
+                await this.bot.utils.typeLikeHuman(page, code, 'code')
 
                 const stilOnPage = await page
                     .waitForSelector(this.secondairyInputSelector, { state: 'visible', timeout: 750 })
@@ -65,7 +71,14 @@ export class CodeLogin {
                 .catch(() => null)
 
             if (visibleInput) {
-                await page.keyboard.type(email, { delay: 50 })
+                // Focus the actual text box (the wrapper match may not be the input itself)
+                const input = page.locator('input#proof-confirmation-email-input, [data-testid="proof-confirmation"] input')
+                await (
+                    (await input.first().isVisible().catch(() => false)) ? input.first() : visibleInput
+                )
+                    .click()
+                    .catch(() => {})
+                await this.bot.utils.typeLikeHuman(page, email, 'text')
                 await page.keyboard.press('Enter')
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Submitted verification email')
                 return true
@@ -83,13 +96,118 @@ export class CodeLogin {
         }
     }
 
-    async handle(page: Page): Promise<void> {
+    private async clearCodeInput(page: Page): Promise<void> {
+        const inputToClear = await page.$(`${this.textInputSelector} input, ${this.secondairyInputSelector}`).catch(() => null)
+        if (inputToClear) {
+            await inputToClear.click().catch(() => {})
+            await page.keyboard.press('Control+A')
+            await page.keyboard.press('Backspace')
+        }
+    }
+
+    private async clickResend(page: Page): Promise<void> {
+        for (const role of ['button', 'link'] as const) {
+            const el = page.getByRole(role, { name: this.resendPattern }).first()
+            if (await el.isVisible().catch(() => false)) {
+                await el.click({ timeout: 5000 }).catch(() => {})
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'No code email yet, clicked "resend code"')
+                return
+            }
+        }
+        this.bot.logger.debug(this.bot.isMobile, 'LOGIN-CODE', 'No code email yet and no resend option found')
+    }
+
+    private createFetcher(account?: Account): EmailCodeFetcher | null {
+        if (!account || account.emailCode?.enabled === false) return null
+
+        const passwords = [account.emailCode?.appPassword, account.password].filter((p): p is string => !!p)
+        if (!passwords.length) return null
+
+        return new EmailCodeFetcher({
+            user: account.emailCode?.user || account.email,
+            passwords,
+            host: account.emailCode?.imapHost,
+            port: account.emailCode?.imapPort,
+            targetHint: account.email,
+            log: (level, message) => this.bot.logger[level](this.bot.isMobile, 'LOGIN-CODE-EMAIL', message)
+        })
+    }
+
+    // Reads the code from the mailbox; returns true when the page accepted one
+    private async autoFillCode(page: Page, account: Account | undefined, requestedAt: number): Promise<boolean> {
+        const fetcher = this.createFetcher(account)
+        if (!fetcher) return false
+
+        const timeoutMs = (account?.emailCode?.timeoutSeconds ?? 180) * 1000
+        const rejected = new Set<string>()
+
+        try {
+            for (let attempt = 1; attempt <= this.maxAutoCodes; attempt++) {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'LOGIN-CODE',
+                    `Waiting for code email (attempt ${attempt}/${this.maxAutoCodes}, up to ${timeoutMs / 1000}s)`
+                )
+
+                const found = await fetcher.waitForCode({
+                    notBefore: requestedAt,
+                    timeoutMs,
+                    exclude: rejected,
+                    onStall: () => this.clickResend(page)
+                })
+
+                if (!found) {
+                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN-CODE', 'No code email arrived in time')
+                    return false
+                }
+
+                // A person needs a moment to switch to the inbox and read the code
+                await this.bot.utils.wait(this.bot.utils.randomNumber(2500, 6000))
+                if (!(await this.fillCode(page, found.code))) return false
+
+                await this.bot.utils.wait(500)
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+
+                const errorMessage = await getErrorMessage(page)
+                if (!errorMessage) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Code from email accepted')
+                    return true
+                }
+
+                // Stale or superseded code - remember it and wait for a newer one
+                this.bot.logger.warn(this.bot.isMobile, 'LOGIN-CODE', `Code from email rejected: ${errorMessage}`)
+                rejected.add(found.code)
+                await this.clearCodeInput(page)
+            }
+            return false
+        } catch (error) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'LOGIN-CODE',
+                `Automatic email code failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+            return false
+        } finally {
+            await fetcher.close()
+        }
+    }
+
+    // Picks the full address matching a masked hint like "da*****@gmail.com"
+    private resolveProofEmail(maskedHint: string | undefined, account?: Account): string | null {
+        if (!account) return null
+        const candidates = [account.recoveryEmail, account.emailCode?.user, account.email].filter(
+            (e): e is string => !!e
+        )
+        if (!maskedHint) return candidates.length === 1 ? (candidates[0] as string) : null
+
+        const [prefix = '', suffix = ''] = maskedHint.toLowerCase().split(/\*+/)
+        return candidates.find(e => e.toLowerCase().startsWith(prefix) && e.toLowerCase().endsWith(suffix)) ?? null
+    }
+
+    // requestedAt: when the code email was triggered, so older mails are ignored
+    async handle(page: Page, account?: Account, requestedAt: number = Date.now()): Promise<void> {
         try {
             this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Code login authentication requested')
-
-            if (!canPromptForInput()) {
-                throw new Error('Email-code authentication requires interactive stdin; unavailable in background mode')
-            }
 
             const emailMessage = await getSubtitleMessage(page)
             if (emailMessage) {
@@ -111,13 +229,32 @@ export class CodeLogin {
                 )
 
                 let emailVerified = false
-                for (let attempt = 1; attempt <= this.maxManualAttempts; attempt++) {
+
+                const autoEmail = this.resolveProofEmail(maskedHint, account)
+                if (autoEmail && (await this.fillEmail(page, autoEmail))) {
+                    await this.bot.utils.wait(500)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    const emailError = await getErrorMessage(page)
+                    if (emailError) {
+                        this.bot.logger.warn(this.bot.isMobile, 'LOGIN-CODE', `Configured email rejected: ${emailError}`)
+                    } else {
+                        this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Email accepted, verification code sent')
+                        emailVerified = true
+                    }
+                }
+
+                if (!emailVerified && !canPromptForInput()) {
+                    throw new Error('Email verification requires interactive stdin; unavailable in background mode')
+                }
+
+                for (let attempt = 1; !emailVerified && attempt <= this.maxManualAttempts; attempt++) {
                     const email = await promptInput({
                         question: maskedHint
                             ? `Enter the full email address for "${maskedHint}" to send the code to (waiting ${this.maxManualSeconds}s): `
                             : `Enter the email address to send the code to (waiting ${this.maxManualSeconds}s): `,
                         timeoutSeconds: this.maxManualSeconds,
-                        validate: value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+                        validate: value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value),
+                        label: account?.email
                     })
 
                     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -180,14 +317,24 @@ export class CodeLogin {
                     throw new Error('Email verification failed')
                 }
 
+                // The code mail is only sent now
+                requestedAt = Date.now()
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
             }
+
+            if (await this.autoFillCode(page, account, requestedAt)) return
+
+            if (!canPromptForInput()) {
+                throw new Error('Email-code authentication requires interactive stdin; unavailable in background mode')
+            }
+            this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Falling back to manual code entry')
 
             for (let attempt = 1; attempt <= this.maxManualAttempts; attempt++) {
                 const code = await promptInput({
                     question: `Enter the 6-digit code (waiting ${this.maxManualSeconds}s): `,
                     timeoutSeconds: this.maxManualSeconds,
-                    validate: code => /^\d{6}$/.test(code)
+                    validate: code => /^\d{6}$/.test(code),
+                    label: account?.email
                 })
 
                 if (!code || !/^\d{6}$/.test(code)) {

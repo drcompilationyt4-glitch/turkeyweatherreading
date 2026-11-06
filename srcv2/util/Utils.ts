@@ -181,4 +181,35 @@ export default class Util {
             await page.keyboard.type(char, { delay: this.humanTypingDelay() })
         }
     }
+
+    // Realistic keystrokes for login fields: short key holds, uneven gaps, small pauses after @ . _ -
+    // 'code' types a 6-digit code in two chunks like someone reading it off another screen
+    // Only 'text' gets the occasional corrected typo - passwords and codes never do
+    async typeLikeHuman(page: any, text: string, kind: 'text' | 'secret' | 'code' = 'text'): Promise<void> {
+        const chars = [...text]
+
+        for (let i = 0; i < chars.length; i++) {
+            const char = chars[i] as string
+
+            if (kind === 'text' && /[a-y]/.test(char) && this.cryptoRandom() < 0.02) {
+                await page.keyboard.type(String.fromCharCode(char.charCodeAt(0) + 1), {
+                    delay: this.randomNumber(40, 110)
+                })
+                await this.wait(this.randomNumber(250, 650))
+                await page.keyboard.press('Backspace', { delay: this.randomNumber(40, 100) })
+                await this.wait(this.randomNumber(150, 350))
+            }
+
+            // delay here is the key hold time (keydown -> keyup), not the gap between keys
+            await page.keyboard.type(char, { delay: this.randomNumber(35, 110) })
+            if (i === chars.length - 1) break
+
+            let gap = this.randomNumber(70, 220)
+            if (kind === 'secret') gap += this.randomNumber(30, 120)
+            if ('@._-'.includes(char)) gap += this.randomNumber(120, 400)
+            if (kind === 'code' && chars.length === 6 && i === 2) gap += this.randomNumber(500, 1300)
+            if (this.cryptoRandom() < 0.05) gap += this.randomNumber(300, 900)
+            await this.wait(gap)
+        }
+    }
 }

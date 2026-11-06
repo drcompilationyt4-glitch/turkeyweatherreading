@@ -247,14 +247,27 @@ export const AccountSchema = z.object({
     email: z.string(),
     password: z.string(),
     totpSecret: z.string().optional(),
-    recoveryEmail: z.string(),
-    geoLocale: AccountCountrySchema,
-    langCode: AccountLanguageSchema,
-    proxy: AccountProxySchema,
-    saveFingerprint: z.object({
-        mobile: z.boolean(),
-        desktop: z.boolean()
-    })
+    emailCode: z
+        .object({
+            appPassword: z.string().optional(),
+            user: z.string().optional(),
+            imapHost: z.string().optional(),
+            imapPort: z.number().optional(),
+            timeoutSeconds: z.number().optional(),
+            enabled: z.boolean().optional()
+        })
+        .optional(),
+    recoveryEmail: z.string().default(''),
+    // Optional with sensible defaults so partial account files still load
+    geoLocale: AccountCountrySchema.default('auto'),
+    langCode: AccountLanguageSchema.default('en'),
+    proxy: AccountProxySchema.default({ proxyAxios: false, url: '', port: 0, username: '', password: '' }),
+    saveFingerprint: z
+        .object({
+            mobile: z.boolean(),
+            desktop: z.boolean()
+        })
+        .default({ mobile: false, desktop: false })
 })
 
 const defaultConfig: Config = {

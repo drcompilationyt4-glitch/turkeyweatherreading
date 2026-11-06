@@ -48,12 +48,17 @@ class Browser {
     async createBrowser(account: Account): Promise<BrowserCreationResult> {
         const headless = this.bot.config.headless
 
-        const hasProxy = Boolean(account.proxy.url)
+        // --no-proxy ignores the account proxy (e.g. a server-only socks5://localhost tunnel) for local one-off runs
+        const noProxy = process.argv.includes('--no-proxy')
+        if (noProxy && account.proxy.url) {
+            this.bot.logger.warn(this.bot.isMobile, 'BROWSER', '--no-proxy set: connecting directly, ignoring account proxy')
+        }
+        const hasProxy = Boolean(account.proxy.url) && !noProxy
         const ignoreCertificateErrors = hasProxy && this.bot.config.proxy.ignoreCertificateErrors
 
         let browser: rebrowser.Browser
         try {
-            const proxyConfig = account.proxy.url
+            const proxyConfig = hasProxy
                 ? {
                       server: formatBrowserProxyServer(account.proxy.url, account.proxy.port),
                       ...(account.proxy.username &&

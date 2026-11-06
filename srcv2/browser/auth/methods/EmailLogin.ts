@@ -6,6 +6,28 @@ export class EmailLogin {
 
     constructor(private bot: MicrosoftRewardsBot) {}
 
+    // Click into the field, clear it and type like a person; falls back to fill if keystrokes got lost
+    private async typeIntoField(page: Page, selector: string, value: string, kind: 'text' | 'secret') {
+        const clicked = await this.bot.browser.utils.ghostClick(page, selector)
+        if (!clicked) await page.focus(selector).catch(() => {})
+        await this.bot.utils.wait(this.bot.utils.randomNumber(300, 900))
+
+        if (await page.inputValue(selector).catch(() => '')) {
+            await page.keyboard.press('Control+A')
+            await this.bot.utils.wait(this.bot.utils.randomNumber(80, 200))
+            await page.keyboard.press('Backspace')
+            await this.bot.utils.wait(this.bot.utils.randomNumber(200, 500))
+        }
+
+        await this.bot.utils.typeLikeHuman(page, value, kind)
+
+        if ((await page.inputValue(selector).catch(() => value)) !== value) {
+            this.bot.logger.debug(this.bot.isMobile, 'LOGIN-TYPE', 'Typed value mismatch, refilling field')
+            await page.fill(selector, value).catch(() => {})
+        }
+        await this.bot.utils.wait(this.bot.utils.randomNumber(600, 1500))
+    }
+
     async enterEmail(page: Page, email: string): Promise<'ok' | 'error'> {
         try {
             const emailInputSelector = 'input[type="email"]'
@@ -23,10 +45,7 @@ export class EmailLogin {
                 .waitForSelector('#userDisplayName', { state: 'visible', timeout: 1000 })
                 .catch(() => {})
             if (!prefilledEmail) {
-                await page.fill(emailInputSelector, '').catch(() => {})
-                await this.bot.utils.wait(500)
-                await page.fill(emailInputSelector, email).catch(() => {})
-                await this.bot.utils.wait(1000)
+                await this.typeIntoField(page, emailInputSelector, email, 'text')
             } else {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN-ENTER-EMAIL', 'Email prefilled')
             }
@@ -59,16 +78,7 @@ export class EmailLogin {
             }
 
             await this.bot.utils.wait(1000)
-            await page.fill(passwordInputSelector, '').catch(() => {})
-            await this.bot.utils.wait(500)
-            await page.fill(passwordInputSelector, password).catch(() => {})
-            
-            // Wait for slow typing to complete - calculate expected time based on password length
-            // Using max delay of 500ms per character for slow typing
-            const expectedTypingTime = password.length * 500
-            const minWaitTime = Math.max(2000, expectedTypingTime) // At least 2 seconds
-            this.bot.logger.debug(this.bot.isMobile, 'LOGIN-ENTER-PASSWORD', `Waiting ${minWaitTime}ms for slow typing to complete (${password.length} chars)`)
-            await this.bot.utils.wait(minWaitTime)
+            await this.typeIntoField(page, passwordInputSelector, password, 'secret')
 
             // Verify password is fully entered before clicking submit
             let passwordVerified = false

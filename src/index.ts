@@ -33,6 +33,7 @@ import type { Account } from './interface/Account'
 import HttpClient from './util/Http'
 import AxiosClient from './util/Axios'
 import { sendDiscord, flushDiscordQueue } from './logging/Discord'
+import { TotpSetup } from './functions/TotpSetup'
 import { sendNtfy, flushNtfyQueue } from './logging/Ntfy'
 import { sendTelegram, flushTelegramQueue } from './logging/Telegram'
 import type { DashboardData } from './interface/DashboardData'
@@ -745,6 +746,53 @@ export class MicrosoftRewardsBot {
         return session
     }
 
+    // One-off mode (-setup-totp): adds an authenticator app to every account without totpSecret.
+    // Sequential on purpose - it rewrites accounts.json and each account may need an email code.
+    async setupTotp(dryRun: boolean): Promise<void> {
+        // MR_TOTP_ONLY=<email> restricts the run to one account (used while validating the flow)
+        const only = process.env.MR_TOTP_ONLY?.toLowerCase()
+        const pending = this.accounts.filter(a => !a.totpSecret && (!only || a.email.toLowerCase() === only))
+        const skipped = this.accounts.length - pending.length
+        this.logger.info(
+            'main',
+            'TOTP-SETUP',
+            `${pending.length} account(s) need TOTP, ${skipped} already have it${dryRun ? ' | DRY RUN' : ''}`
+        )
+
+        const totpSetup = new TotpSetup(this)
+        const results: string[] = []
+
+        // Setup runs locally; the account proxy is usually a server-only tunnel, so --no-proxy forces direct
+        const noProxy = process.argv.includes('--no-proxy')
+
+        for (const [index, account] of pending.entries()) {
+            if (noProxy) account.proxy = { proxyAxios: false, url: '', port: 0, username: '', password: '' }
+            await executionContext.run({ isMobile: false, account }, async () => {
+                let session: BrowserSession | null = null
+                let ok = false
+                try {
+                    session = await this.createDesktopSession(account)
+                    const secret = await totpSetup.enable(this.mainDesktopPage, account, dryRun)
+                    if (secret && !dryRun) totpSetup.saveSecret(account.email, secret)
+                    ok = !!secret
+                } catch (error) {
+                    this.logger.error(
+                        'main',
+                        'TOTP-SETUP',
+                        `${account.email}: ${error instanceof Error ? error.message : String(error)}`
+                    )
+                } finally {
+                    if (session) await this.browser.func.closeBrowser(session.context, account.email).catch(() => {})
+                }
+                results.push(`${account.email}: ${ok ? (dryRun ? 'secret found (dry run)' : 'TOTP enabled') : 'FAILED'}`)
+            })
+
+            if (index < pending.length - 1) await this.utils.wait(this.utils.randomNumber(45_000, 120_000))
+        }
+
+        this.logger.info('main', 'TOTP-SETUP', `Done:\n${results.join('\n') || 'nothing to do'}`)
+    }
+
     async Main(account: Account): Promise<{ initialPoints: number; collectedPoints: number }> {
         const accountEmail = account.email
         this.logger.info('main', 'FLOW', `Starting session for ${accountEmail}`)
@@ -1098,7 +1146,11 @@ async function main(): Promise<void> {
 
     try {
         await rewardsBot.initialize()
-        await rewardsBot.run()
+        if (process.argv.includes('-setup-totp')) {
+            await rewardsBot.setupTotp(process.argv.includes('-dry'))
+        } else {
+            await rewardsBot.run()
+        }
     } catch (error) {
         rewardsBot.logger.error('main', 'MAIN-ERROR', error as Error)
     }

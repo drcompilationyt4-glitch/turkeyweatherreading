@@ -83,6 +83,26 @@ function resolveProjectFile(filename: string): string | undefined {
     return candidates.find(p => fs.existsSync(p))
 }
 
+// --accounts <path> overrides which account file is loaded (used to run one repo-set at a time)
+export function getAccountsFileOverride(): string | undefined {
+    const i = process.argv.indexOf('--accounts')
+    const value = i !== -1 ? process.argv[i + 1] : undefined
+    if (!value) return undefined
+    return path.isAbsolute(value) ? value : path.join(process.cwd(), value)
+}
+
+// Tolerate // and /* */ comments so hand-maintained account files still load
+function parseAccountsJson(text: string): unknown {
+    try {
+        return JSON.parse(text)
+    } catch {
+        const stripped = text
+            .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n\r]*|\/\*[\s\S]*?\*\//g, (_m, str) => str || '')
+            .replace(/,(\s*[}\]])/g, '$1')
+        return JSON.parse(stripped)
+    }
+}
+
 export function loadAccounts(): Account[] {
     try {
         ensureEnvLoaded()
@@ -93,22 +113,25 @@ export function loadAccounts(): Account[] {
             file = 'accounts.dev.json'
         }
 
-        const accountFile = resolveProjectFile(file)
-        if (!accountFile) {
+        const override = getAccountsFileOverride()
+        const accountFile = override ?? resolveProjectFile(file)
+        if (!accountFile || !fs.existsSync(accountFile)) {
             throw new Error(
-                `accounts.json not found - place it in the project root (dist/ and src/ are also searched as fallbacks)`
+                override
+                    ? `--accounts file not found: ${override}`
+                    : `accounts.json not found - place it in the project root (dist/ and src/ are also searched as fallbacks)`
             )
         }
 
         const accounts = fs.readFileSync(accountFile, 'utf-8')
-        const accountsData = JSON.parse(accounts)
-
-        validateAccounts(accountsData)
+        const accountsData = validateAccounts(parseAccountsJson(accounts))
 
         // ✅ Shuffle accounts (Fisher-Yates)
         for (let i = accountsData.length - 1; i > 0; i--) {
             const j = randomInt(0, i + 1)
-            ;[accountsData[i], accountsData[j]] = [accountsData[j], accountsData[i]]
+            const tmp = accountsData[i] as Account
+            accountsData[i] = accountsData[j] as Account
+            accountsData[j] = tmp
         }
 
         return accountsData

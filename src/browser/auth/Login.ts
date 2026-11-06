@@ -8,14 +8,17 @@ import { PasswordlessLogin } from './methods/PasswordlessLogin'
 import { TotpLogin } from './methods/Totp2FALogin'
 import { CodeLogin } from './methods/GetACodeLogin'
 import { RecoveryLogin } from './methods/RecoveryEmailLogin'
+import { canPromptForInput } from './methods/LoginUtils'
 
 import type { Account } from '../../interface/Account'
 
 type LoginState =
     | 'EMAIL_INPUT'
     | 'PASSWORD_INPUT'
-    | 'SIGN_IN_ANOTHER_WAY'
-    | 'SIGN_IN_ANOTHER_WAY_EMAIL'
+    | 'FOOTER_ACTION'
+    | 'SIGN_IN_METHOD_PICKER'
+    | 'PASSWORDLESS_SEND_CODE'
+    | 'EMAIL_VERIFICATION_INPUT'
     | 'PASSKEY_ERROR'
     | 'PASSKEY_VIDEO'
     | 'KMSI_PROMPT'
@@ -25,13 +28,53 @@ type LoginState =
     | 'ERROR_ALERT'
     | '2FA_TOTP'
     | 'LOGIN_PASSWORDLESS'
-    | 'GET_A_CODE'
-    | 'GET_A_CODE_2'
     | 'OTP_CODE_ENTRY'
+    | 'PAGE_TRANSITION'
     | 'UNKNOWN'
     | 'CHROMEWEBDATA_ERROR'
     | 'INTERRUPT'
     | 'SESSION_ERROR'
+
+// The URL is kept with the state so a handler can skip work if the page moved on after detection
+type LoginStateSnapshot = { state: LoginState; url: string }
+
+type SignInMethodType = 'PASSWORD' | 'TOTP' | 'EMAIL' | 'AUTHENTICATOR' | 'PASSKEY' | 'UNKNOWN'
+
+interface SignInMethodOption {
+    index: number
+    label: string
+    signature: string
+}
+
+const LOGIN_SELECTORS = {
+    primaryButton: 'button[data-testid="primaryButton"]',
+    secondaryButton: 'button[data-testid="secondaryButton"]',
+    footerAction: '[data-testid="viewFooter"] [role="button"]',
+    signInTile: '[data-testid="tile"]',
+    emailIconOld: 'img[data-testid="accessibleImg"][src*="picker_verify_email"]',
+    passwordlessOptionOld: 'img[data-testid="accessibleImg"][src*="picker_remote_ngc"]',
+    recoveryEmail: '[data-testid="proof-confirmation"]',
+    emailVerificationInput: 'input#proof-confirmation-email-input',
+    accountLocked: '#serviceAbuseLandingTitle',
+    errorAlert: 'div[role="alert"]',
+    passwordEntry: '[data-testid="passwordEntry"]',
+    emailEntry: 'input#usernameEntry',
+    kmsiVideo: '[data-testid="kmsiVideo"]',
+    passKeyVideo: '[data-testid="biometricVideo"]',
+    passKeyError: '[data-testid="registrationImg"]',
+    passwordlessCheck: '[data-testid="deviceShieldCheckmarkVideo"]',
+    passwordlessNumber: '[data-testid="displaySign"]',
+    totpInput: 'input[name="otc"]',
+    totpInputOld: 'form[name="OneTimeCodeViewForm"]',
+    identityBanner: '[data-testid="identityBanner"]',
+    otpCodeEntry: '[data-testid="codeEntry"]',
+    backButton: '#back-button',
+    bingProfile: '#id_n',
+    otpInput: 'div[data-testid="codeEntry"]'
+} as const
+
+// Whole login (all states) gives up after this, so a wedged page can't hold a worker forever
+const LOGIN_DEADLINE_MS = 10 * 60 * 1000
 
 export class Login {
     emailLogin: EmailLogin
@@ -40,31 +83,12 @@ export class Login {
     codeLogin: CodeLogin
     recoveryLogin: RecoveryLogin
 
-    private readonly selectors = {
-        primaryButton: 'button[data-testid="primaryButton"]',
-        secondaryButton: 'button[data-testid="secondaryButton"]',
-        emailIcon: '[data-testid="tile"]:has(svg path[d*="M5.25 4h13.5a3.25"])',
-        emailIconOld: 'img[data-testid="accessibleImg"][src*="picker_verify_email"]',
-        recoveryEmail: '[data-testid="proof-confirmation"]',
-        passwordIcon: '[data-testid="tile"]:has(svg path[d*="M11.78 10.22a.75.75"])',
-        accountLocked: '#serviceAbuseLandingTitle',
-        errorAlert: 'div[role="alert"]',
-        passwordEntry: '[data-testid="passwordEntry"]',
-        emailEntry: 'input#usernameEntry',
-        kmsiVideo: '[data-testid="kmsiVideo"]',
-        passKeyVideo: '[data-testid="biometricVideo"]',
-        passKeyError: '[data-testid="registrationImg"]',
-        passwordlessCheck: '[data-testid="deviceShieldCheckmarkVideo"]',
-        totpInput: 'input[name="otc"]',
-        totpInputOld: 'form[name="OneTimeCodeViewForm"]',
-        identityBanner: '[data-testid="identityBanner"]',
-        viewFooter: '[data-testid="viewFooter"] >> [role="button"]',
-        otherWaysToSignIn: '[data-testid="viewFooter"] span[role="button"]',
-        otpCodeEntry: '[data-testid="codeEntry"]',
-        backButton: '#back-button',
-        bingProfile: '#id_n',
-        otpInput: 'div[data-testid="codeEntry"]'
-    } as const
+    private readonly selectors = LOGIN_SELECTORS
+
+    // Set once the Authenticator push method is chosen, so its landing page isn't mistaken for a code-send page
+    private passwordlessMethodSelected = false
+    // Set once the authenticator-code tile is chosen, so the following code screen is filled from totpSecret
+    private totpMethodSelected = false
 
     private readonly loginUrl = 'https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin'
 
@@ -90,18 +114,30 @@ export class Login {
             await this.bot.browser.utils.disableFido(page)
 
             const maxIterations = 25
+            const deadline = Date.now() + LOGIN_DEADLINE_MS
             let iteration = 0
             let previousState: LoginState = 'UNKNOWN'
             let sameStateCount = 0
+            this.passwordlessMethodSelected = false
+            this.totpMethodSelected = false
 
             while (iteration < maxIterations) {
                 if (page.isClosed()) throw new Error('Page closed unexpectedly')
+                if (Date.now() > deadline) throw new Error('Login timeout: exceeded 10 minute deadline')
 
                 iteration++
                 this.bot.logger.debug(this.bot.isMobile, 'LOGIN', `State check iteration ${iteration}/${maxIterations}`)
 
-                const state = await this.detectCurrentState(page, account)
+                const snapshot = await this.detectCurrentState(page, account)
+                const state = snapshot.state
                 this.bot.logger.debug(this.bot.isMobile, 'LOGIN', `Current state: ${state}`)
+
+                // A mid-redirect read is not a real state - wait it out without spending an iteration
+                if (state === 'PAGE_TRANSITION') {
+                    iteration--
+                    await this.bot.utils.wait(500)
+                    continue
+                }
 
                 if (state !== previousState && previousState !== 'UNKNOWN') {
                     this.bot.logger.info(this.bot.isMobile, 'LOGIN', `State transition: ${previousState} → ${state}`)
@@ -136,7 +172,7 @@ export class Login {
                     break
                 }
 
-                const shouldContinue = await this.handleState(state, page, account)
+                const shouldContinue = await this.handleState(snapshot, page, account)
                 if (!shouldContinue) {
                     throw new Error(`Login failed or aborted at state: ${state}`)
                 }
@@ -159,84 +195,145 @@ export class Login {
         }
     }
 
-    private async detectCurrentState(page: Page, account?: Account): Promise<LoginState> {
+    // Polls briefly: a page torn down mid-read (redirect) becomes PAGE_TRANSITION instead of a crash or a wrong state
+    private async detectCurrentState(page: Page, account?: Account): Promise<LoginStateSnapshot> {
         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
 
-        const pageContent = await page.innerText('body').catch(() => '')
-        if (
-            pageContent.toLowerCase().includes('too many requests') ||
-            pageContent.toLowerCase().includes('banyak permintaan')
-        ) {
-            return 'ERROR_ALERT'
-        }
+        const deadline = Date.now() + 3000
+        do {
+            const url = page.url()
+            let state: LoginState
+            try {
+                state = await this.detectPageState(page, new URL(url), account)
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                if (page.isClosed() || !/Execution context was destroyed|Cannot find context with specified id/i.test(message)) {
+                    throw error
+                }
+                state = 'PAGE_TRANSITION'
+            }
 
-        const url = new URL(page.url())
-        this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Current URL: ${url.hostname}${url.pathname}`)
+            if (page.url() === url && state !== 'UNKNOWN' && state !== 'PAGE_TRANSITION') {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'DETECT-STATE',
+                    `${state} at ${new URL(url).hostname}${new URL(url).pathname}`
+                )
+                return { state, url }
+            }
+            await this.bot.utils.wait(150)
+        } while (Date.now() < deadline)
 
+        return { state: 'UNKNOWN', url: page.url() }
+    }
+
+    private async detectPageState(page: Page, url: URL, account?: Account): Promise<LoginState> {
         if (url.hostname === 'chromewebdata') {
             this.bot.logger.warn(this.bot.isMobile, 'DETECT-STATE', 'Detected chromewebdata error page')
             return 'CHROMEWEBDATA_ERROR'
         }
 
-        const isLocked = await this.checkSelector(page, this.selectors.accountLocked)
-        if (isLocked) {
-            this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', 'Account locked selector found')
-            return 'ACCOUNT_LOCKED'
-        }
+        // One in-page pass reads every selector together instead of a round-trip per selector
+        const controls = await page.evaluate(selectors => {
+            const visible: Record<string, boolean> = {}
+            let footerText = ''
+            for (const [name, selector] of Object.entries(selectors)) {
+                const element = document.querySelector<HTMLElement>(selector)
+                const style = element ? getComputedStyle(element) : null
+                visible[name] = Boolean(
+                    element &&
+                        style?.visibility !== 'hidden' &&
+                        style?.display !== 'none' &&
+                        element.getClientRects().length
+                )
+                if (name === 'footerAction') footerText = element?.innerText ?? ''
+            }
+            const description = Array.from(
+                document.querySelectorAll<HTMLElement>(
+                    '[data-testid="subtitle"], [data-testid="description"], #oneTimeCodeDescription'
+                )
+            )
+                .map(element => element.innerText)
+                .join(' ')
+            const bodyText = (document.body?.innerText ?? '').slice(0, 5000).toLowerCase()
+            return {
+                visible,
+                footerText,
+                description,
+                tooManyRequests: bodyText.includes('too many requests') || bodyText.includes('banyak permintaan')
+            }
+        }, LOGIN_SELECTORS)
+
+        if (page.url() !== url.href) return 'PAGE_TRANSITION'
+        if (controls.tooManyRequests) return 'ERROR_ALERT'
+        if (controls.visible.accountLocked) return 'ACCOUNT_LOCKED'
 
         if (url.hostname === 'rewards.bing.com' || url.hostname === 'account.microsoft.com') {
-            this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', 'On rewards/account page, assuming logged in')
             return 'LOGGED_IN'
         }
 
-        const stateChecks: Array<[string, LoginState]> = [
-            [this.selectors.errorAlert, 'ERROR_ALERT'],
-            [this.selectors.passwordEntry, 'PASSWORD_INPUT'],
-            [this.selectors.emailEntry, 'EMAIL_INPUT'],
-            [this.selectors.recoveryEmail, 'RECOVERY_EMAIL_INPUT'],
-            [this.selectors.kmsiVideo, 'KMSI_PROMPT'],
-            [this.selectors.passKeyVideo, 'PASSKEY_VIDEO'],
-            [this.selectors.passKeyError, 'PASSKEY_ERROR'],
-            [this.selectors.passwordIcon, 'SIGN_IN_ANOTHER_WAY'],
-            [this.selectors.emailIcon, 'SIGN_IN_ANOTHER_WAY_EMAIL'],
-            [this.selectors.emailIconOld, 'SIGN_IN_ANOTHER_WAY_EMAIL'],
-            [this.selectors.passwordlessCheck, 'LOGIN_PASSWORDLESS'],
-            [this.selectors.totpInput, '2FA_TOTP'],
-            [this.selectors.totpInputOld, '2FA_TOTP'],
-            [this.selectors.otpCodeEntry, 'OTP_CODE_ENTRY'], // PR 450
-            [this.selectors.otpInput, 'OTP_CODE_ENTRY'] // My Fix
+        const stateChecks: Array<[keyof typeof LOGIN_SELECTORS, LoginState]> = [
+            ['errorAlert', 'ERROR_ALERT'],
+            ['passwordEntry', 'PASSWORD_INPUT'],
+            ['emailEntry', 'EMAIL_INPUT'],
+            ['recoveryEmail', 'RECOVERY_EMAIL_INPUT'],
+            ['emailVerificationInput', 'EMAIL_VERIFICATION_INPUT'],
+            ['kmsiVideo', 'KMSI_PROMPT'],
+            ['passKeyVideo', 'PASSKEY_VIDEO'],
+            ['passKeyError', 'PASSKEY_ERROR'],
+            ['signInTile', 'SIGN_IN_METHOD_PICKER'],
+            ['passwordlessOptionOld', 'SIGN_IN_METHOD_PICKER'],
+            ['emailIconOld', 'SIGN_IN_METHOD_PICKER'],
+            ['passwordlessCheck', 'LOGIN_PASSWORDLESS'],
+            ['passwordlessNumber', 'LOGIN_PASSWORDLESS'],
+            ['totpInput', '2FA_TOTP'],
+            ['totpInputOld', '2FA_TOTP'],
+            ['otpCodeEntry', 'OTP_CODE_ENTRY'],
+            ['otpInput', 'OTP_CODE_ENTRY']
         ]
-
-        const results = await Promise.all(
-            stateChecks.map(async ([sel, state]) => {
-                const visible = await this.checkSelector(page, sel)
-                return visible ? state : null
-            })
+        const results: Array<LoginState | null> = stateChecks.map(([name, state]) =>
+            controls.visible[name] ? state : null
         )
 
-        const visibleStates = results.filter((s): s is LoginState => s !== null)
-        if (visibleStates.length > 0) {
-            this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Visible states: [${visibleStates.join(', ')}]`)
+        // An authenticator-code screen reuses the code-entry component; fill it from totpSecret rather than escape it
+        const description = controls.description
+        const looksLikeAuthenticatorCode =
+            /authenticator|verification app|authentication app/i.test(description) && !/@/.test(description)
+        if (
+            account?.totpSecret &&
+            results.includes('OTP_CODE_ENTRY') &&
+            (this.totpMethodSelected || looksLikeAuthenticatorCode)
+        ) {
+            for (let index = 0; index < results.length; index++) {
+                if (results[index] === 'OTP_CODE_ENTRY') results[index] = '2FA_TOTP'
+            }
         }
-
-        const [identityBanner, primaryButton, passwordEntry] = await Promise.all([
-            this.checkSelector(page, this.selectors.identityBanner),
-            this.checkSelector(page, this.selectors.primaryButton),
-            this.checkSelector(page, this.selectors.passwordEntry)
-        ])
 
         const onSignInPage =
             (url.hostname === 'login.live.com' || url.hostname === 'login.microsoft.com') &&
             !this.isPasskeyEnrollment(url)
+        const { identityBanner, primaryButton, passwordEntry, footerAction } = controls.visible
 
-        if (onSignInPage && identityBanner && primaryButton && !passwordEntry && !results.includes('2FA_TOTP')) {
-            const codeState = account?.password ? 'GET_A_CODE' : 'GET_A_CODE_2'
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'DETECT-STATE',
-                `Get code state detected: ${codeState} (has password: ${!!account?.password})`
+        // "Get a code" page - tell a generic "other ways" footer apart from a footer that names a specific proof
+        if (
+            onSignInPage &&
+            identityBanner &&
+            primaryButton &&
+            !passwordEntry &&
+            !results.includes('2FA_TOTP') &&
+            !results.includes('RECOVERY_EMAIL_INPUT') &&
+            !results.includes('EMAIL_VERIFICATION_INPUT')
+        ) {
+            const footer = controls.footerText.replace(/\s+/g, ' ').trim()
+            const footerTargetsSpecificProof =
+                /[\w.+*-]+@[\w.*-]+\.[a-z]{2,}/i.test(footer) ||
+                /(?:\+?\d|[*xX])(?:[\d\s().*xX-]{4,})(?:\d|[*xX])/.test(footer)
+
+            results.push(
+                footerAction && !footerTargetsSpecificProof && !this.passwordlessMethodSelected
+                    ? 'FOOTER_ACTION'
+                    : 'PASSWORDLESS_SEND_CODE'
             )
-            results.push(codeState)
         }
 
         let foundStates = results.filter((s): s is LoginState => s !== null)
@@ -247,47 +344,36 @@ export class Login {
         }
 
         if (foundStates.includes('ERROR_ALERT')) {
-            this.bot.logger.debug(
-                this.bot.isMobile,
-                'DETECT-STATE',
-                `ERROR_ALERT found - hostname: ${url.hostname}, has 2FA: ${foundStates.includes('2FA_TOTP')}`
-            )
-            if (url.hostname !== 'login.live.com') {
-                foundStates = foundStates.filter(s => s !== 'ERROR_ALERT')
-            }
-            if (foundStates.includes('2FA_TOTP')) {
+            if (url.hostname !== 'login.live.com' || foundStates.includes('2FA_TOTP')) {
                 foundStates = foundStates.filter(s => s !== 'ERROR_ALERT')
             }
             if (foundStates.includes('ERROR_ALERT')) return 'ERROR_ALERT'
         }
+
+        if (foundStates.length === 0) return this.fallbackState(url)
 
         const priorities: LoginState[] = [
             'ACCOUNT_LOCKED',
             'PASSKEY_VIDEO',
             'PASSKEY_ERROR',
             'KMSI_PROMPT',
+            'LOGIN_PASSWORDLESS',
             'PASSWORD_INPUT',
             'EMAIL_INPUT',
-            'SIGN_IN_ANOTHER_WAY', // Prefer password option over email code
-            'SIGN_IN_ANOTHER_WAY_EMAIL',
+            'EMAIL_VERIFICATION_INPUT',
+            'RECOVERY_EMAIL_INPUT',
+            'SIGN_IN_METHOD_PICKER',
             'OTP_CODE_ENTRY',
-            'GET_A_CODE',
-            'GET_A_CODE_2',
-            'LOGIN_PASSWORDLESS',
+            'FOOTER_ACTION',
+            'PASSWORDLESS_SEND_CODE',
             '2FA_TOTP'
         ]
 
         for (const priority of priorities) {
-            if (foundStates.includes(priority)) {
-                this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Selected state by priority: ${priority}`)
-                return priority
-            }
+            if (foundStates.includes(priority)) return priority
         }
 
-        if (foundStates.length === 0) return this.fallbackState(url)
-
-        this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', `Returning first found state: ${foundStates[0]}`)
-        return foundStates[0] as LoginState
+        return foundStates[0] ?? 'UNKNOWN'
     }
 
     private isPasskeyEnrollment(url: URL): boolean {
@@ -326,6 +412,111 @@ export class Login {
         return null
     }
 
+    // Reads each visible method tile: its text plus structural attributes (ids, img src, svg path data)
+    private async getSignInMethodOptions(page: Page): Promise<SignInMethodOption[]> {
+        const tiles = page.locator(this.selectors.signInTile)
+        const count = await tiles.count().catch(() => 0)
+        const options = await Promise.all(
+            Array.from({ length: count }, async (_, index): Promise<SignInMethodOption | null> => {
+                const tile = tiles.nth(index)
+                if (!(await tile.isVisible().catch(() => false))) return null
+
+                const metadata = await tile
+                    .evaluate(element => {
+                        const nodes = [element, ...Array.from(element.querySelectorAll('*'))]
+                        const structural = new Set(['id', 'name', 'src', 'data-testid', 'data-value', 'data-bind', 'd'])
+                        const accessibleText = nodes
+                            .flatMap(node => ['aria-label', 'title', 'alt'].map(name => node.getAttribute(name) ?? ''))
+                            .filter(Boolean)
+                            .join(' ')
+                        const attributes = nodes
+                            .flatMap(node =>
+                                Array.from(node.attributes)
+                                    .filter(attribute => structural.has(attribute.name))
+                                    .map(attribute => `${attribute.name}=${attribute.value}`)
+                            )
+                            .join(' ')
+                        return { text: element.textContent ?? '', accessibleText, attributes }
+                    })
+                    .catch(() => null)
+                if (!metadata) return null
+
+                return {
+                    index,
+                    label: `${metadata.text} ${metadata.accessibleText}`.replace(/\s+/g, ' ').trim(),
+                    signature: metadata.attributes.replace(/\s+/g, ' ').trim().toLowerCase()
+                }
+            })
+        )
+        return options.filter((option): option is SignInMethodOption => option !== null)
+    }
+
+    // Classify by icon/attribute signature (language-independent), with a label fallback for the code tile
+    private classifySignInMethod(option: SignInMethodOption): SignInMethodType {
+        const { signature, label } = option
+
+        if (signature.includes('m5.25 4h13.5a3.25') || signature.includes('picker_verify_email')) return 'EMAIL'
+        if (signature.includes('m11.78 10.22a.75')) return 'PASSWORD'
+        if (/picker_fido|passkey|fido|m18 16\.66a3\.51/.test(signature)) return 'PASSKEY'
+        if (/phone[\s_-]*app[\s_-]*otp|\btotp\b/.test(signature)) return 'TOTP'
+        // "Use a verification code" - push approval and email/SMS tiles are excluded
+        if (
+            /verification code|code from (an|your|the) (authenticator )?app|authenticator app code/i.test(label) &&
+            !/@|approve|request|text|sms/i.test(label)
+        ) {
+            return 'TOTP'
+        }
+        if (
+            /remote[\s_-]*ngc|picker_remote_ngc|phone[\s_-]*app[\s_-]*notification|push[\s_-]*notification|m15\.75 2c16\.99 2 18 3/.test(
+                signature
+            )
+        ) {
+            return 'AUTHENTICATOR'
+        }
+        return 'UNKNOWN'
+    }
+
+    private async clickSignInMethodOption(page: Page, option: SignInMethodOption): Promise<boolean> {
+        await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+        if (await this.bot.browser.utils.ghostClick(page, `${this.selectors.signInTile} >> nth=${option.index}`)) {
+            return true
+        }
+        return page
+            .locator(this.selectors.signInTile)
+            .nth(option.index)
+            .click({ timeout: 5000 })
+            .then(() => true)
+            .catch(() => false)
+    }
+
+    // Labels can contain the masked email/phone - redact before logging
+    private describeSignInMethods(options: SignInMethodOption[]): string {
+        return options
+            .map(option =>
+                `${this.classifySignInMethod(option)}:"${option.label
+                    .replace(/[\w.+*-]+@[\w.-]+\.[a-z]{2,}/gi, '<email>')
+                    .replace(/\+?\d[\d\s().*-]{5,}\d/g, '<phone>')
+                    .slice(0, 40)}"`
+            )
+            .join(' | ')
+    }
+
+    // Waits until detection settles on a state the caller accepts, or gives up after the timeout
+    private async waitForState(
+        page: Page,
+        account: Account,
+        accept: (state: LoginState) => boolean,
+        timeoutMs = 15000
+    ): Promise<LoginState | null> {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+            const detected = await this.detectCurrentState(page, account)
+            if (page.url() === detected.url && accept(detected.state)) return detected.state
+            await this.bot.utils.wait(300)
+        }
+        return null
+    }
+
     private async checkSelector(page: Page, selector: string): Promise<boolean> {
         return page
             .waitForSelector(selector, { state: 'visible', timeout: 200 })
@@ -333,7 +524,30 @@ export class Login {
             .catch(() => false)
     }
 
-    private async handleState(state: LoginState, page: Page, account: Account): Promise<boolean> {
+    // On a server nobody can read an emailed code - only request one when something here can (IMAP, terminal, relay)
+    private canReceiveEmailCode(account: Account): boolean {
+        const imap = !!account.emailCode?.appPassword && account.emailCode?.enabled !== false
+        if (imap || canPromptForInput()) return true
+
+        this.bot.logger.error(
+            this.bot.isMobile,
+            'LOGIN',
+            'Microsoft wants an email code but nothing on this machine can read it - not requesting one. ' +
+                'Add a totpSecret (npm run setup-totp) or emailCode.appPassword for this account.'
+        )
+        return false
+    }
+
+    private async handleState(
+        { state, url: detectedUrl }: LoginStateSnapshot,
+        page: Page,
+        account: Account
+    ): Promise<boolean> {
+        // The page moved on after detection - re-detect instead of acting on a stale state
+        if (page.url() !== detectedUrl) {
+            this.bot.logger.debug(this.bot.isMobile, 'HANDLE-STATE', 'Page changed after state detection; checking again')
+            return true
+        }
         this.bot.logger.debug(this.bot.isMobile, 'HANDLE-STATE', `Processing state: ${state}`)
 
         switch (state) {
@@ -380,6 +594,21 @@ export class Login {
             }
 
             case 'PASSWORD_INPUT': {
+                if (!account.password) {
+                    this.bot.logger.info(
+                        this.bot.isMobile,
+                        'LOGIN',
+                        'Password page shown but no password configured; returning to sign-in methods'
+                    )
+                    if (await this.checkSelector(page, this.selectors.backButton)) {
+                        await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
+                        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                        return true
+                    }
+                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'No way back to sign-in methods')
+                    return false
+                }
+
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Entering password')
                 await this.bot.utils.wait(this.bot.utils.humanFormInputDelay())
                 await this.emailLogin.enterPassword(page, account.password)
@@ -391,101 +620,147 @@ export class Login {
                 return true
             }
 
-            case 'GET_A_CODE': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Attempting to bypass "Get code" page')
-
-                // Try to find "Other ways to sign in" link
-                const otherWaysLink = await page
-                    .waitForSelector(this.selectors.otherWaysToSignIn, { state: 'visible', timeout: 3000 })
-                    .catch(() => null)
-
-                if (otherWaysLink) {
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Found "Other ways to sign in" link')
-                    await this.bot.browser.utils.ghostClick(page, this.selectors.otherWaysToSignIn)
-                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                        this.bot.logger.debug(
-                            this.bot.isMobile,
-                            'LOGIN',
-                            'Network idle timeout after clicking other ways'
-                        )
-                    })
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', '"Other ways to sign in" clicked')
-                    return true
-                }
-
-                // Fallback: try the generic viewFooter selector
-                const footerLink = await page
-                    .waitForSelector(this.selectors.viewFooter, { state: 'visible', timeout: 2000 })
-                    .catch(() => null)
-
-                if (footerLink) {
-                    await this.bot.browser.utils.ghostClick(page, this.selectors.viewFooter)
-                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                        this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after footer click')
-                    })
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Footer link clicked')
-                    return true
-                }
-
-                // If no links found, try clicking back button
-                const backBtn = await page
-                    .waitForSelector(this.selectors.backButton, { state: 'visible', timeout: 2000 })
-                    .catch(() => null)
-
-                if (backBtn) {
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'No sign in options found, clicking back button')
-                    await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
-                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                        this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after back button')
-                    })
-                    return true
-                }
-
-                this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'Could not find way to bypass Get Code page')
-                return true
-            }
-
-            case 'GET_A_CODE_2': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Handling "Get a code" flow')
-                await this.bot.browser.utils.ghostClick(page, this.selectors.primaryButton)
-                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after primary button click')
-                })
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Initiating code login handler')
-                await this.codeLogin.handle(page)
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Code login handler completed successfully')
-                return true
-            }
-
-            case 'SIGN_IN_ANOTHER_WAY_EMAIL': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting "Send a code to email"')
-
-                const emailSelector = await Promise.race([
-                    this.checkSelector(page, this.selectors.emailIcon).then(found =>
-                        found ? this.selectors.emailIcon : null
-                    ),
-                    this.checkSelector(page, this.selectors.emailIconOld).then(found =>
-                        found ? this.selectors.emailIconOld : null
-                    )
-                ])
-
-                if (!emailSelector) {
-                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'Email icon not found')
+            // "Get a code" page with a generic "Other ways to sign in" footer - open the method picker
+            case 'FOOTER_ACTION': {
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Opening "Other ways to sign in"')
+                await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+                if (!(await this.bot.browser.utils.ghostClick(page, this.selectors.footerAction))) {
+                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'Could not open alternative sign-in methods')
                     return false
                 }
+                this.passwordlessMethodSelected = false
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                return true
+            }
 
-                this.bot.logger.info(
-                    this.bot.isMobile,
-                    'LOGIN',
-                    `Using ${emailSelector === this.selectors.emailIcon ? 'new' : 'old'} email icon selector`
-                )
-                await this.bot.browser.utils.ghostClick(page, emailSelector)
-                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after email icon click')
-                })
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Initiating code login handler')
-                await this.codeLogin.handle(page)
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Code login handler completed successfully')
+            // "Get a code" page whose only action sends a code (or an Authenticator request we already chose)
+            case 'PASSWORDLESS_SEND_CODE': {
+                if (this.passwordlessMethodSelected) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Sending Microsoft Authenticator request')
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.primaryButton)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    return true
+                }
+
+                // With a password there is a better route than burning an email code - go back to the methods
+                if (account.password && (await this.checkSelector(page, this.selectors.backButton))) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Skipping "Send code"; returning to sign-in methods')
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    return true
+                }
+
+                if (!this.canReceiveEmailCode(account)) return false
+
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Requesting email code')
+                const codeRequestedAt = Date.now()
+                await this.bot.browser.utils.ghostClick(page, this.selectors.primaryButton)
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                await this.codeLogin.handle(page, account, codeRequestedAt)
+                return true
+            }
+
+            // "Sign in another way" - password, then authenticator code, then email code, then push approval
+            case 'SIGN_IN_METHOD_PICKER': {
+                const options = await this.getSignInMethodOptions(page)
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Sign-in methods: ${this.describeSignInMethods(options)}`)
+
+                const pick = (type: SignInMethodType) =>
+                    options.find(option => this.classifySignInMethod(option) === type)
+                const passwordOption = pick('PASSWORD')
+                const totpOption = pick('TOTP')
+                const emailOption = pick('EMAIL')
+                const authenticatorOption = pick('AUTHENTICATOR')
+
+                if (account.password && passwordOption) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting "Use your password"')
+                    this.passwordlessMethodSelected = false
+                    if (!(await this.clickSignInMethodOption(page, passwordOption))) return false
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    return true
+                }
+
+                // An authenticator code needs no mailbox and no one to approve anything
+                if (account.totpSecret && totpOption) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting "Use a verification code" (authenticator)')
+                    this.totpMethodSelected = true
+                    if (!(await this.clickSignInMethodOption(page, totpOption))) return false
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    return true
+                }
+
+                const emailIconOldFound = await this.checkSelector(page, this.selectors.emailIconOld)
+                if ((emailOption || emailIconOldFound) && this.canReceiveEmailCode(account)) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting "Send a code to email"')
+                    this.passwordlessMethodSelected = false
+                    const codeRequestedAt = Date.now()
+                    const clicked = emailOption
+                        ? await this.clickSignInMethodOption(page, emailOption)
+                        : await this.bot.browser.utils.ghostClick(page, this.selectors.emailIconOld)
+                    if (!clicked) return false
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    await this.codeLogin.handle(page, account, codeRequestedAt)
+                    return true
+                }
+
+                // Push approval needs a person with the phone, so it is the last resort
+                const passwordlessOptionOldFound = await this.checkSelector(page, this.selectors.passwordlessOptionOld)
+                if (authenticatorOption || passwordlessOptionOldFound) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting Microsoft Authenticator approval')
+                    this.passwordlessMethodSelected = true
+                    const clicked = authenticatorOption
+                        ? await this.clickSignInMethodOption(page, authenticatorOption)
+                        : await this.bot.browser.utils.ghostClick(page, this.selectors.passwordlessOptionOld)
+                    if (!clicked) {
+                        this.passwordlessMethodSelected = false
+                        return false
+                    }
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    return true
+                }
+
+                this.bot.logger.error(this.bot.isMobile, 'LOGIN', 'No supported sign-in method on the picker')
+                return false
+            }
+
+            // "Verify your email" - with a password, try the footer alternatives before spending an email code
+            case 'EMAIL_VERIFICATION_INPUT': {
+                if (account.password) {
+                    const footerSelector = `${this.selectors.footerAction}:visible`
+                    const footerCount = await page
+                        .locator(footerSelector)
+                        .count()
+                        .catch(() => 0)
+
+                    for (let index = 0; index < footerCount; index++) {
+                        await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+                        if (!(await this.bot.browser.utils.ghostClick(page, `${footerSelector} >> nth=${index}`))) {
+                            continue
+                        }
+
+                        const nextState = await this.waitForState(
+                            page,
+                            account,
+                            next => next !== 'EMAIL_VERIFICATION_INPUT' && next !== 'UNKNOWN' && next !== 'PAGE_TRANSITION'
+                        )
+                        if (!nextState) continue
+
+                        // Anything but another code screen is progress - let the main loop take it from here
+                        if (nextState !== 'OTP_CODE_ENTRY') {
+                            this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Email verification bypassed via ${nextState}`)
+                            return true
+                        }
+
+                        if (!(await this.checkSelector(page, this.selectors.backButton))) break
+                        await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
+                        if (!(await this.waitForState(page, account, next => next === 'EMAIL_VERIFICATION_INPUT'))) break
+                    }
+                }
+
+                if (!this.canReceiveEmailCode(account)) return false
+
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Verifying by email code')
+                await this.codeLogin.handle(page, account, Date.now())
                 return true
             }
 
@@ -502,45 +777,33 @@ export class Login {
 
             case 'CHROMEWEBDATA_ERROR': {
                 this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'chromewebdata error detected, attempting recovery')
-                try {
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Navigating to ${this.bot.config.baseURL}`)
-                    await page
-                        .goto(this.bot.config.baseURL, {
-                            waitUntil: 'domcontentloaded',
-                            timeout: 10000
-                        })
-                        .catch(() => {})
+                // Try Rewards first, then login.live.com - and only call it recovered if we left the error page
+                for (const target of [this.bot.config.baseURL, 'https://login.live.com/']) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', `Navigating to ${target}`)
+                    const response = await page
+                        .goto(target, { waitUntil: 'domcontentloaded', timeout: 10000 })
+                        .catch(() => null)
                     await this.bot.utils.wait(3000)
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Recovery navigation successful')
-                    return true
-                } catch {
-                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'Fallback to login.live.com')
-                    await page
-                        .goto('https://login.live.com/', {
-                            waitUntil: 'domcontentloaded',
-                            timeout: 10000
-                        })
-                        .catch(() => {})
-                    await this.bot.utils.wait(3000)
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Fallback navigation successful')
-                    return true
+
+                    const stillBroken =
+                        page.url().startsWith('chrome-error:') ||
+                        new URL(page.url()).hostname === 'chromewebdata' ||
+                        (response !== null && !response.ok() && response.status() >= 500)
+                    if (!stillBroken) {
+                        this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Recovery navigation successful')
+                        return true
+                    }
+                    this.bot.logger.warn(this.bot.isMobile, 'LOGIN', `Recovery via ${target} failed`)
                 }
+                // Let the loop retry; the stuck-state guard / deadline stop it if the network is really down
+                return true
             }
 
             case '2FA_TOTP': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'TOTP 2FA authentication required')
                 await this.totp2FALogin.handle(page, account.totpSecret)
+                this.totpMethodSelected = false
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'TOTP 2FA handler completed successfully')
-                return true
-            }
-
-            case 'SIGN_IN_ANOTHER_WAY': {
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting "Use my password"')
-                await this.bot.browser.utils.ghostClick(page, this.selectors.passwordIcon)
-                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after password icon click')
-                })
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Password option selected')
                 return true
             }
 
@@ -568,6 +831,7 @@ export class Login {
             case 'LOGIN_PASSWORDLESS': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Handling passwordless authentication')
                 await this.passwordlessLogin.handle(page)
+                this.passwordlessMethodSelected = false
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after passwordless auth')
                 })
@@ -575,41 +839,42 @@ export class Login {
                 return true
             }
 
+            // An email-code screen we did not ask for - try the alternate-method footer, then Back, so no code is spent
             case 'OTP_CODE_ENTRY': {
-                this.bot.logger.info(
-                    this.bot.isMobile,
-                    'LOGIN',
-                    'OTP code entry page detected, attempting to find password option'
-                )
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Code entry page detected; looking for another sign-in method')
 
-                // My Fix: Click "Use your password" footer
-                const footerLink = await page
-                    .waitForSelector(this.selectors.viewFooter, { state: 'visible', timeout: 2000 })
-                    .catch(() => null)
+                if (await this.checkSelector(page, this.selectors.footerAction)) {
+                    await this.bot.utils.wait(this.bot.utils.humanClickDelay())
+                    if (await this.bot.browser.utils.ghostClick(page, this.selectors.footerAction)) {
+                        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
 
-                if (footerLink) {
-                    await this.bot.browser.utils.ghostClick(page, this.selectors.viewFooter)
-                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Footer link clicked')
-                } else {
-                    // PR 450 Fix: Click Back Button if footer not found
-                    const backButton = await page
-                        .waitForSelector(this.selectors.backButton, { state: 'visible', timeout: 2000 })
-                        .catch(() => null)
-
-                    if (backButton) {
-                        await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
-                        this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Back button clicked')
-                    } else {
-                        this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'No navigation option found on OTP page')
+                        // Only count it as escaped if the code page is actually gone
+                        if (!(await this.checkSelector(page, this.selectors.otpCodeEntry))) {
+                            this.passwordlessMethodSelected =
+                                (await this.checkSelector(page, this.selectors.passwordlessCheck)) ||
+                                (await this.checkSelector(page, this.selectors.passwordlessNumber))
+                            this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Left the code entry page')
+                            return true
+                        }
+                        this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Footer did not leave the code page; trying Back')
                     }
                 }
 
-                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after OTP navigation')
-                })
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Navigated back from OTP entry page')
-                return true
+                this.passwordlessMethodSelected = false
+                if (await this.checkSelector(page, this.selectors.backButton)) {
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.backButton)
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Back button clicked')
+                    return true
+                }
+
+                this.bot.logger.warn(this.bot.isMobile, 'LOGIN', 'No way off the code entry page')
+                return false
             }
+
+            case 'PAGE_TRANSITION':
+                this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Redirect still in progress, waiting')
+                return true
 
             case 'INTERRUPT': {
                 const url = new URL(page.url())
@@ -705,7 +970,7 @@ export class Login {
 
                 this.bot.logger.debug(this.bot.isMobile, 'LOGIN-BING', `Verification loop ${i + 1}/${loopMax}`)
 
-                const state = await this.detectCurrentState(page)
+                const { state } = await this.detectCurrentState(page)
                 if (state === 'PASSKEY_ERROR') {
                     this.bot.logger.info(this.bot.isMobile, 'LOGIN-BING', 'Dismissing Passkey error state')
                     await this.bot.browser.utils.ghostClick(page, this.selectors.secondaryButton)
@@ -722,12 +987,26 @@ export class Login {
                 if (atBingHome) {
                     await this.bot.browser.utils.tryDismissAllMessages(page).catch(() => {})
 
-                    const signedIn = await page
-                        .waitForSelector(this.selectors.bingProfile, { timeout: 3000 })
-                        .then(() => true)
+                    // Bing's page model names the signed-in user; the profile element is the fallback (and mobile lacks it)
+                    const modelSignedIn = await page
+                        .evaluate(() => {
+                            const model = (window as unknown as { _model?: { UserType?: string; UserEmail?: string } })
+                                ._model
+                            return model?.UserType === 'msa' || Boolean(model?.UserEmail)
+                        })
                         .catch(() => false)
+                    const signedIn =
+                        modelSignedIn ||
+                        (await page
+                            .waitForSelector(this.selectors.bingProfile, { timeout: 3000 })
+                            .then(() => true)
+                            .catch(() => false))
 
-                    this.bot.logger.debug(this.bot.isMobile, 'LOGIN-BING', `Profile element found: ${signedIn}`)
+                    this.bot.logger.debug(
+                        this.bot.isMobile,
+                        'LOGIN-BING',
+                        `Signed in: ${signedIn} (page model: ${modelSignedIn})`
+                    )
 
                     if (signedIn || this.bot.isMobile) {
                         this.bot.logger.info(this.bot.isMobile, 'LOGIN-BING', 'Bing session verified successfully')

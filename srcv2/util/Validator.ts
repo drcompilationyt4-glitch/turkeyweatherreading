@@ -87,20 +87,34 @@ export const AccountSchema = z.object({
     email: z.string(),
     password: z.string(),
     totpSecret: z.string().optional(),
-    recoveryEmail: z.string(),
-    geoLocale: z.string(),
-    langCode: z.string(),
-    proxy: z.object({
-        proxyAxios: z.boolean(),
-        url: z.string(),
-        port: z.number(),
-        password: z.string(),
-        username: z.string()
-    }),
-    saveFingerprint: z.object({
-        mobile: z.boolean(),
-        desktop: z.boolean()
-    })
+    emailCode: z
+        .object({
+            appPassword: z.string().optional(),
+            user: z.string().optional(),
+            imapHost: z.string().optional(),
+            imapPort: z.number().optional(),
+            timeoutSeconds: z.number().optional(),
+            enabled: z.boolean().optional()
+        })
+        .optional(),
+    recoveryEmail: z.string().default(''),
+    geoLocale: z.string().default('auto'),
+    langCode: z.string().default('en'),
+    proxy: z
+        .object({
+            proxyAxios: z.boolean(),
+            url: z.string(),
+            port: z.number(),
+            password: z.string(),
+            username: z.string()
+        })
+        .default({ proxyAxios: false, url: '', port: 0, password: '', username: '' }),
+    saveFingerprint: z
+        .object({
+            mobile: z.boolean(),
+            desktop: z.boolean()
+        })
+        .default({ mobile: false, desktop: false })
 })
 
 export function validateConfig(data: unknown): Config {
