@@ -25,7 +25,7 @@ export interface ConfigLegacyFallback {
     enabled: boolean
     minDelay: number | string
     maxDelay: number | string
-    /** Day alternation: Sun=src, Mon=srcv2, Tue=src, ... (default true) */
+    /** Ignored: whole-day legacy (srcv2) runs were removed; legacy only retries a failed account */
     alternate?: boolean
 }
 

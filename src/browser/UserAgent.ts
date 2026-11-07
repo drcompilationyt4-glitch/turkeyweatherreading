@@ -109,13 +109,14 @@ export class UserAgentManager {
         private readonly request: typeof httpRequest = httpRequest
     ) {}
 
-    private static pickMobileModel(): string {
+    private static pickMobileModel(rng: () => number): string {
         const pool = UserAgentManager.MOBILE_MODELS
-        return pool[Math.floor(Math.random() * pool.length)] ?? 'Pixel 8'
+        return pool[Math.floor(rng() * pool.length)] ?? 'Pixel 8'
     }
 
-    async getUserAgent(isMobile: boolean) {
-        const androidVersion = isMobile ? 10 + Math.floor(Math.random() * 6) : 0 // Android 10-15
+    // `rng` picks the phone model / OS version; a seeded one keeps an account on the same device every run
+    async getUserAgent(isMobile: boolean, rng: () => number = Math.random) {
+        const androidVersion = isMobile ? 10 + Math.floor(rng() * 6) : 0 // Android 10-15
         const system = this.getSystemComponents(isMobile, androidVersion)
         const app = await this.getAppComponents(isMobile)
 
@@ -123,13 +124,13 @@ export class UserAgentManager {
             ? `Mozilla/5.0 (${system}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${app.chrome_reduced_version} Mobile Safari/537.36 EdgA/${app.edge_version}`
             : `Mozilla/5.0 (${system}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${app.chrome_reduced_version} Safari/537.36 Edg/${app.edge_version}`
 
-        const platformVersion = isMobile ? `${androidVersion}.0.0` : `${Math.floor(Math.random() * 15) + 1}.0.0`
+        const platformVersion = isMobile ? `${androidVersion}.0.0` : `${Math.floor(rng() * 15) + 1}.0.0`
 
         // Keep the UA-CH platform aligned with the UA string's OS token
         const desktopPlatform =
             process.platform === 'darwin' ? 'macOS' : process.platform === 'linux' ? 'Linux' : 'Windows'
 
-        const model = isMobile ? UserAgentManager.pickMobileModel() : ''
+        const model = isMobile ? UserAgentManager.pickMobileModel(rng) : ''
 
         const uaMetadata = {
             isMobile,
@@ -273,10 +274,11 @@ export class UserAgentManager {
 
     async updateFingerprintUserAgent(
         fingerprint: BrowserFingerprintWithHeaders,
-        isMobile: boolean
+        isMobile: boolean,
+        rng: () => number = Math.random
     ): Promise<BrowserFingerprintWithHeaders> {
         try {
-            const userAgentData = await this.getUserAgent(isMobile)
+            const userAgentData = await this.getUserAgent(isMobile, rng)
             const componentData = await this.getAppComponents(isMobile)
             const meta = userAgentData.userAgentMetadata
 

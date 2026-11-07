@@ -281,7 +281,7 @@ const defaultConfig: Config = {
     autoClaimPunchcardRewards: false,
     skipNonPointTasks: true,
     accountDelay: { min: '1min', max: '3min' },
-    legacyFallback: { enabled: true, minDelay: '1hr', maxDelay: '2hr', alternate: true },
+    legacyFallback: { enabled: true, minDelay: '1hr', maxDelay: '2hr', alternate: false },
     workers: {
         doDailySet: true,
         doMorePromotions: true,

@@ -1,4 +1,4 @@
-import rebrowser, { BrowserContext } from 'patchright'
+import rebrowser, { BrowserContext, type LaunchOptions } from 'patchright'
 import { newInjectedContext } from 'fingerprint-injector'
 import { BrowserFingerprintWithHeaders, FingerprintGenerator } from 'fingerprint-generator'
 
@@ -6,6 +6,8 @@ import type { MicrosoftRewardsBot } from '../index'
 import { loadSession, saveFingerprint } from '../util/SessionStore'
 import { fingerprintMatchesLocale } from '../util/Locale'
 import { formatBrowserProxyServer } from '../util/Proxy'
+import { resolveExitTimezone, timezoneOffsetMinutes } from '../util/ExitTimezone'
+import { seededRandom, withMathRandom } from '../util/SeededRandom'
 import { UserAgentManager } from './UserAgent'
 
 import type { Account } from '../interface/Account'
@@ -91,7 +93,7 @@ class Browser {
                 `Launching bundled patched Chromium (Edge UA) | headless=${headless} | platform=${process.platform} | proxy=${hasProxy ? 'yes' : 'no'} | tls=${ignoreCertificateErrors ? 'verification-disabled' : 'verified'} | sandbox=${sandboxDisabled ? 'disabled-root' : 'enabled'}`
             )
 
-            browser = await rebrowser.chromium.launch({
+            browser = await this.launch({
                 headless,
                 ...(proxyConfig && { proxy: proxyConfig }),
                 args: [...Browser.BROWSER_ARGS, ...sandboxArgs, ...certArgs]
@@ -136,8 +138,24 @@ class Browser {
                 )
             }
 
+            // Same account -> same device every run, instead of a brand-new one each day
+            const deviceSeed = `${account.email.trim().toLowerCase()}|${this.bot.isMobile ? 'mobile' : 'desktop'}`
             const fingerprint =
-                (reuseFingerprint && savedFingerprint) || (await this.generateFingerprint(this.bot.isMobile))
+                (reuseFingerprint && savedFingerprint) ||
+                (await this.generateFingerprint(this.bot.isMobile, deviceSeed))
+
+            // The browser clock follows the exit IP, not the server (GitHub runners are UTC)
+            const proxyKey = hasProxy ? formatBrowserProxyServer(account.proxy.url, account.proxy.port) : 'direct'
+            const timezoneId = await resolveExitTimezone(browser, proxyKey)
+            if (timezoneId) {
+                this.bot.userData.timezoneOffset = String(timezoneOffsetMinutes(timezoneId))
+            } else {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'BROWSER',
+                    'Could not look up the exit IP timezone - keeping the host clock'
+                )
+            }
 
             const screen = fingerprint.fingerprint.screen
 
@@ -147,6 +165,7 @@ class Browser {
                 newContextOptions: {
                     permissions: [],
                     ignoreHTTPSErrors: ignoreCertificateErrors,
+                    ...(timezoneId ? { timezoneId } : {}),
                     // Restore cookies
                     ...(session?.storageState ? { storageState: session.storageState } : {}),
                     ...(this.bot.isMobile
@@ -194,7 +213,7 @@ class Browser {
             this.bot.logger.info(
                 this.bot.isMobile,
                 'BROWSER',
-                `Created context | locale=${this.bot.accountLocale.locale} | Accept-Language="${this.bot.accountLocale.acceptLanguage}" | User-Agent: "${fingerprint.fingerprint.navigator.userAgent}"`
+                `Created context | locale=${this.bot.accountLocale.locale} | timezone=${timezoneId ?? 'host'} | Accept-Language="${this.bot.accountLocale.acceptLanguage}" | User-Agent: "${fingerprint.fingerprint.navigator.userAgent}"`
             )
             this.bot.logger.debug(this.bot.isMobile, 'BROWSER-FINGERPRINT', JSON.stringify(fingerprint))
 
@@ -227,19 +246,48 @@ class Browser {
         )
     }
 
-    async generateFingerprint(isMobile: boolean): Promise<BrowserFingerprintWithHeaders> {
+    // headless:true on its own runs chromium-headless-shell, the old headless build that bot checks
+    // single out easily. The full Chromium build in new headless mode looks like a normal browser.
+    private async launch(options: LaunchOptions): Promise<rebrowser.Browser> {
+        if (!options.headless) return rebrowser.chromium.launch(options)
+        try {
+            return await rebrowser.chromium.launch({ ...options, channel: 'chromium' })
+        } catch (error) {
+            const reason = error instanceof Error ? (error.message.split('\n')[0] ?? error.message) : String(error)
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'BROWSER',
+                `Full Chromium not available for new headless mode - using the headless shell | ${reason}`
+            )
+            return rebrowser.chromium.launch(options)
+        }
+    }
+
+    /**
+     * With a `seed` the result is the same device every time (hardware, screen, phone model, OS
+     * version); only the browser version follows real Edge releases. Without one it is random.
+     */
+    async generateFingerprint(isMobile: boolean, seed?: string): Promise<BrowserFingerprintWithHeaders> {
         const hostOs: 'windows' | 'macos' | 'linux' =
             process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : 'windows'
 
-        const fingerPrintData = new FingerprintGenerator().getFingerprint({
-            devices: isMobile ? ['mobile'] : ['desktop'],
-            operatingSystems: isMobile ? ['android'] : [hostOs],
-            browsers: [{ name: 'edge' }],
-            locales: this.bot.accountLocale.acceptedLocales
-        })
+        const generate = () =>
+            new FingerprintGenerator().getFingerprint({
+                devices: isMobile ? ['mobile'] : ['desktop'],
+                operatingSystems: isMobile ? ['android'] : [hostOs],
+                browsers: [{ name: 'edge' }],
+                locales: this.bot.accountLocale.acceptedLocales
+            })
+
+        // fingerprint-generator takes no seed, so its Math.random is swapped for the call (it is synchronous)
+        const fingerPrintData = seed ? withMathRandom(seededRandom(`${seed}|fingerprint`), generate) : generate()
 
         const userAgentManager = new UserAgentManager(this.bot)
-        return await userAgentManager.updateFingerprintUserAgent(fingerPrintData, isMobile)
+        return await userAgentManager.updateFingerprintUserAgent(
+            fingerPrintData,
+            isMobile,
+            seed ? seededRandom(`${seed}|user-agent`) : Math.random
+        )
     }
 }
 
