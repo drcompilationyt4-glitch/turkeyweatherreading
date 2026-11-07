@@ -709,6 +709,14 @@ export class MicrosoftRewardsBot {
                     await doMobileActivities()
                 }
 
+                // Today's activity points can land in "Ready to claim" - collect them now, while the
+                // mobile page is still open (the searches below close it)
+                try {
+                    await this.workers.claimReadyPoints(this.mainMobilePage)
+                } catch (claimError) {
+                    this.logger.debug(this.isMobile, 'CLAIM-POINTS', `Claim points handler skipped: ${claimError instanceof Error ? claimError.message : String(claimError)}`)
+                }
+
                 const searchPoints = await this.browser.func.getSearchPoints()
                 const missingSearchPoints = this.browser.func.missingSearchPoints(searchPoints, true)
 

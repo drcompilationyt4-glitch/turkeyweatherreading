@@ -288,7 +288,11 @@ export class Search extends Workers {
                     'SEARCH-BING',
                     `Search attempt ${attempt}/${MAX_QUERY_ATTEMPTS} failed | query="${query}" | ${error instanceof Error ? error.message : String(error)}`
                 )
+                // Retrying on the same page fails the same way once an overlay or redirect hides the search
+                // box - start the next attempt from a fresh Bing home page
                 await this.bot.utils.wait(2000)
+                await page.goto(URLs.bing.origin, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {})
+                await this.bot.browser.utils.tryDismissAllMessages(page).catch(() => {})
             }
         }
     }

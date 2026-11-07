@@ -1,6 +1,7 @@
 import type { Page } from 'patchright'
 import type { MicrosoftRewardsBot } from '../index'
 import type { DashboardData, PunchCard } from '../interface/DashboardData'
+import { REWARDS_DASHBOARD_URL, readPointClaim } from '../util/PointClaim'
 
 export class Workers {
     protected bot: MicrosoftRewardsBot
@@ -903,61 +904,102 @@ export class Workers {
             )
         }
     }
-public async claimReadyPoints(page: Page): Promise<void> {
-  try {
-    this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Opening claim panel')
+    /**
+     * 1. Read the dashboard's "Ready to claim" amount - nothing to do when it is 0
+     * 2. Open the dashboard, click "Ready to claim" -> "Claim points"
+     * 3. Confirm by the ready amount dropping to 0, then return the page to where it was
+     */
+    public async claimReadyPoints(page: Page): Promise<void> {
+        const previousUrl = page.url()
+        try {
+            let claimableBefore: number | null = null
+            try {
+                claimableBefore = (await readPointClaim(page)).claimable
+            } catch (error) {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'CLAIM-POINTS',
+                    `Could not read the dashboard claim state | ${error instanceof Error ? error.message : String(error)}`
+                )
+            }
 
-    // 1. Open the "Ready to claim" card (strict but case-insensitive)
-    const readyCard = page.getByText(/ready to claim/i).first()
+            if (claimableBefore === 0) {
+                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Nothing to claim | readyToClaim=0')
+                return
+            }
 
-    if (!(await readyCard.isVisible().catch(() => false))) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'No claim card found')
-      return
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'CLAIM-POINTS',
+                `Opening the dashboard to claim | readyToClaim=${claimableBefore ?? 'unknown'}`
+            )
+            await page.goto(REWARDS_DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 20000 })
+            await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {})
+            await this.bot.browser.utils.tryDismissAllMessages(page)
+            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+
+            // Open the "Ready to claim" card, then use the claim button in its panel (or on the page)
+            const readyCard = page.getByText(/ready to claim/i).first()
+            if (await readyCard.isVisible().catch(() => false)) {
+                await readyCard.click()
+                await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+            }
+
+            const dialog = page.getByRole('dialog')
+            if (await dialog.getByText(/no points to claim/i).isVisible().catch(() => false)) {
+                this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Dashboard says there are no points to claim')
+                return
+            }
+
+            const claimBtn = dialog
+                .getByRole('button', { name: /claim points|claim all|claim/i })
+                .or(page.getByRole('button', { name: /claim points|claim all/i }))
+                .first()
+            if (!(await claimBtn.isVisible().catch(() => false))) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'CLAIM-POINTS',
+                    `Points are ready (${claimableBefore ?? 'unknown'}) but no claim button was found on the dashboard`
+                )
+                return
+            }
+
+            await claimBtn.click()
+            await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const claimableAfter = await readPointClaim(page)
+                    .then(state => state.claimable)
+                    .catch(() => null)
+                if (claimableAfter === 0) {
+                    this.bot.logger.info(
+                        this.bot.isMobile,
+                        'CLAIM-POINTS',
+                        `Claimed bonus points | claimed=${claimableBefore ?? 'unknown'}`,
+                        'green'
+                    )
+                    return
+                }
+                await this.bot.utils.wait(2000 * attempt)
+            }
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'CLAIM-POINTS',
+                'Claim button clicked but the points still show as ready to claim'
+            )
+        } catch (error) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'CLAIM-POINTS',
+                `Claim skipped: ${error instanceof Error ? error.message : String(error)}`
+            )
+        } finally {
+            // Later activities expect the page where it was before the claim detour
+            if (previousUrl.startsWith('http') && page.url() !== previousUrl && !page.isClosed()) {
+                await page.goto(previousUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {})
+            }
+        }
     }
-
-    await readyCard.click()
-    await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-    // 2. Scope everything to the modal/dialog
-    const dialog = page.getByRole('dialog')
-
-    // 3. Detect "nothing to claim"
-    if (await dialog.getByText(/no points to claim/i).isVisible().catch(() => false)) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Nothing to claim')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    // Optional stricter numeric check
-    const pointsText = await dialog.locator('text=/^\\d+$/').first().textContent().catch(() => null)
-    if (pointsText && parseInt(pointsText) === 0) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Points = 0')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    // 4. Click the bottom "Claim points" button (role-based = fast)
-    const claimBtn = dialog.getByRole('button', { name: /claim points/i })
-
-    if (!(await claimBtn.isVisible().catch(() => false))) {
-      this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Claim button not found')
-      await page.goBack().catch(() => {})
-      return
-    }
-
-    await claimBtn.click()
-    await this.bot.utils.wait(this.bot.utils.humanActivityDelay())
-
-    this.bot.logger.info(this.bot.isMobile, 'CLAIM-POINTS', 'Claim successful', 'green')
-
-  } catch (error) {
-    this.bot.logger.debug(
-      this.bot.isMobile,
-      'CLAIM-POINTS',
-      `Claim skipped: ${error instanceof Error ? error.message : String(error)}`
-    )
-  }
-}
     private async completeActivity(activity: any, page: Page): Promise<boolean> {
         const offerId = activity.offerId
 
